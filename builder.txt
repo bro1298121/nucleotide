@@ -1,0 +1,2 @@
+$env:Path = 'D:\Tools\zig-0.15.2\zig-x86_64-windows-0.15.2;' + $env:Path
+$env:GHOSTTY_SOURCE_DIR = 'D:\helixperience\nucleotide\target\release\build\libghostty-vt-sys-324c71d8f43b2f2a\out\ghostty-src'

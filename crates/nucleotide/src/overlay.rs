@@ -1,10 +1,9 @@
 use crate::types::RegexSelectionAction;
 use gpui::{
     App, AppContext, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render, Styled,
-    Window, div, px,
+    Focusable, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render,
+    Styled, Window, div, px,
 };
-use helix_stdx::rope::RopeSliceExt;
 use nucleotide_terminal::TerminalBounds;
 use nucleotide_ui::ThemedContext as UIThemedContext;
 use nucleotide_ui::completion_v2::CompletionView;
@@ -1385,18 +1384,17 @@ impl OverlayView {
                                             use gpui::{HighlightStyle, TextStyle};
 
                                             let full = String::from(slice);
-                                            let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
 
-                                            let mut current_char = 0usize;
+                                            // Collect the syntax highlighter events as
+                                            // (byte offset, color in effect after the event) pairs.
+                                            // The byte-range arithmetic lives in
+                                            // `preview_highlight_ranges` so it can be unit-tested
+                                            // without going through the GPUI paint path.
+                                            let mut events: Vec<(u32, Hsla)> = Vec::new();
                                             let mut current_color = default_text;
 
                                             while hl.next_event_offset() != u32::MAX {
-                                                let next_byte: u32 = hl.next_event_offset();
-                                                let next_char = slice.byte_to_char(slice.ceil_char_boundary(next_byte as usize));
-
-                                                if next_char > current_char && current_color != default_text {
-                                                    highlights.push((current_char..next_char, HighlightStyle::color(current_color)));
-                                                }
+                                                let event_offset = hl.next_event_offset();
 
                                                 // Advance style stack
                                                 let (event, iter) = hl.advance();
@@ -1413,13 +1411,21 @@ impl OverlayView {
                                                         }
                                                     }
                                                 }
-                                                current_char = next_char;
+
+                                                events.push((event_offset, current_color));
                                             }
 
-                                            // Tail
-                                            if current_char < slice.len_chars() && current_color != default_text {
-                                                highlights.push((current_char..slice.len_chars(), HighlightStyle::color(current_color)));
-                                            }
+                                            // `StyledText` highlight ranges and GPUI `TextRun::len`
+                                            // are measured in UTF-8 bytes, so the ranges must be
+                                            // byte-based. Converting the highlighter's byte offsets
+                                            // to character indices split multi-byte characters
+                                            // (e.g. CJK comments) and panicked inside the
+                                            // Windows DirectWrite backend.
+                                            let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> =
+                                                preview_highlight_ranges(&full, &events, default_text)
+                                                    .into_iter()
+                                                    .map(|(range, color)| (range, HighlightStyle::color(color)))
+                                                    .collect();
 
                                             let default_style = TextStyle {
                                                 font_family: cx
@@ -2477,5 +2483,163 @@ impl Render for OverlayView {
         // Empty overlay using design tokens
         nucleotide_logging::debug!("DIAG: Render overlay branch: none");
         div().size_0().into_any_element()
+    }
+}
+
+/// Convert syntax highlighter events into highlight ranges for GPUI `StyledText`.
+///
+/// `StyledText` highlight ranges and `TextRun::len` are measured in UTF-8 bytes, so every
+/// boundary produced here is a byte offset snapped up to the next character boundary.
+///
+/// The syntax highlighter reports byte offsets; converting them to character indices before
+/// handing them to GPUI split multi-byte characters (for example in CJK comments) and panicked
+/// inside the Windows DirectWrite backend with `end byte index N is not a char boundary`.
+///
+/// `events` contains the byte offset of each highlighter event together with the color that is in
+/// effect *after* that event is applied. A range is emitted for the span between two consecutive
+/// events whenever the color in effect differs from `default_color`.
+fn preview_highlight_ranges(
+    text: &str,
+    events: &[(u32, Hsla)],
+    default_color: Hsla,
+) -> Vec<(std::ops::Range<usize>, Hsla)> {
+    let mut ranges = Vec::new();
+    let mut current_byte = 0usize;
+    let mut current_color = default_color;
+
+    for &(event_offset, color) in events {
+        let next_byte = next_char_boundary(text, event_offset as usize);
+        if next_byte > current_byte && current_color != default_color {
+            ranges.push((current_byte..next_byte, current_color));
+        }
+        current_color = color;
+        current_byte = next_byte;
+    }
+
+    // Tail: the final event does not produce an end boundary on its own.
+    let text_len = text.len();
+    if current_byte < text_len && current_color != default_color {
+        ranges.push((current_byte..text_len, current_color));
+    }
+
+    ranges
+}
+
+/// Snap a byte index up to the next UTF-8 character boundary, clamped to `text.len()`.
+fn next_char_boundary(text: &str, byte_index: usize) -> usize {
+    let mut index = byte_index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_char_boundary, preview_highlight_ranges};
+    use gpui::Hsla;
+
+    fn color(rgb: u32) -> Hsla {
+        gpui::rgb(rgb).into()
+    }
+
+    #[test]
+    fn preview_highlight_ranges_are_utf8_byte_aligned_for_cjk_text() {
+        // `# ---- ccache（保留原语义）----` has 24 chars but 38 UTF-8 bytes, and the
+        // character `原` occupies bytes 22..25. Character-index arithmetic produced a
+        // first run of length 24, which is not a char boundary and panicked inside the
+        // Windows DirectWrite backend.
+        let text = "# ---- ccache（保留原语义）----\n";
+        let default_color = color(0x00_00_00);
+        let comment_color = color(0x80_80_80);
+
+        assert_eq!(text.chars().count(), 25);
+        assert_eq!(text.len(), 39);
+        assert!(!text.is_char_boundary(24));
+
+        // A comment highlight covering the whole first line, then a reset at the newline.
+        let ranges = preview_highlight_ranges(
+            text,
+            &[(0, comment_color), (38, default_color)],
+            default_color,
+        );
+
+        assert_eq!(ranges, vec![(0..38, comment_color)]);
+
+        for (range, _) in &ranges {
+            assert!(text.is_char_boundary(range.start), "start of {range:?}");
+            assert!(text.is_char_boundary(range.end), "end of {range:?}");
+            assert!(range.end <= text.len());
+        }
+    }
+
+    #[test]
+    fn preview_highlight_ranges_snap_event_offsets_inside_multibyte_chars() {
+        let text = "a中b😀c";
+        let default_color = color(0x00_00_00);
+        let highlight_color = color(0xff_00_ff);
+
+        // Bytes: `a`=0..1, `中`=1..4, `b`=4..5, `😀`=5..9, `c`=9..10 (len 10).
+        // Event offsets 2 and 6 land inside `中` and `😀` and must snap up to 4 and 9.
+        let ranges = preview_highlight_ranges(
+            text,
+            &[
+                (0, highlight_color),
+                (2, default_color),
+                (6, highlight_color),
+                (10, default_color),
+            ],
+            default_color,
+        );
+
+        assert_eq!(
+            ranges,
+            vec![(0..4, highlight_color), (9..10, highlight_color)]
+        );
+
+        for (range, _) in &ranges {
+            assert!(text.is_char_boundary(range.start), "start of {range:?}");
+            assert!(text.is_char_boundary(range.end), "end of {range:?}");
+        }
+    }
+
+    #[test]
+    fn preview_highlight_ranges_emit_tail_span_and_handle_empty_input() {
+        let default_color = color(0x00_00_00);
+        let highlight_color = color(0x00_ff_00);
+
+        // No reset event, so the trailing span is emitted up to the end of the text.
+        let text = "fn main() {}\n";
+        assert_eq!(
+            preview_highlight_ranges(text, &[(0, highlight_color)], default_color),
+            vec![(0..text.len(), highlight_color)]
+        );
+
+        // Text that is only default-colored produces no ranges.
+        assert!(preview_highlight_ranges(text, &[(0, default_color)], default_color).is_empty());
+
+        // Empty text and out-of-range offsets must not panic.
+        assert!(preview_highlight_ranges("", &[(0, highlight_color)], default_color).is_empty());
+        assert_eq!(
+            preview_highlight_ranges(
+                text,
+                &[(0, highlight_color), (9_999, default_color)],
+                default_color
+            ),
+            vec![(0..text.len(), highlight_color)]
+        );
+    }
+
+    #[test]
+    fn next_char_boundary_clamps_and_snaps() {
+        let text = "a中b";
+        assert_eq!(next_char_boundary(text, 0), 0);
+        assert_eq!(next_char_boundary(text, 1), 1);
+        // Inside `中` (bytes 1..4).
+        assert_eq!(next_char_boundary(text, 2), 4);
+        assert_eq!(next_char_boundary(text, 3), 4);
+        assert_eq!(next_char_boundary(text, 4), 4);
+        // Past the end clamps to `text.len()`.
+        assert_eq!(next_char_boundary(text, 999), text.len());
     }
 }

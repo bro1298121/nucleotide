@@ -109,3 +109,6 @@ nucleotide-linux.tar.gz
 
 # Local packaging output
 /dist/
+
+# Local deepwork progress state
+.slim/deepwork/
