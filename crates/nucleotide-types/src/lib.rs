@@ -14,6 +14,8 @@ pub mod vcs;
 pub use completion::CompletionTrigger;
 pub use config::{FontConfig, FontWeight};
 pub use editor_types::{EditorStatus, Severity};
-pub use font_config::{EditorFontConfig, Font, FontSettings, FontStyle, UiFontConfig};
+pub use font_config::{
+    EditorFontConfig, Font, FontFeatureSettings, FontSettings, FontStyle, UiFontConfig,
+};
 pub use project_config::{ProjectMarker, ProjectMarkersConfig, RootStrategy};
 pub use vcs::{DiffChangeType, DiffHunkInfo, VcsStatus};

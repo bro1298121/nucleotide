@@ -23,6 +23,7 @@ use std::sync::Arc;
 #[cfg(target_os = "windows")]
 use std::sync::{LazyLock, Mutex};
 
+use gpui::FontWeight;
 #[cfg(target_os = "windows")]
 use gpui::MenuItem;
 use gpui::prelude::{FluentBuilder, StyledImage};
@@ -33,7 +34,6 @@ use gpui::{
     ScrollHandle, SharedString, Size, StatefulInteractiveElement, Styled, Subscription, TextStyle,
     Window, WindowAppearance, canvas, div, img, point, px, relative, svg,
 };
-use gpui::{FontFeatures, FontWeight};
 use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::{Position, Rope, RopeSlice, Selection, pos_at_coords};
 use helix_lsp::{OffsetEncoding, lsp};
@@ -1104,7 +1104,12 @@ pub struct Workspace {
     cached_text_color: gpui::Hsla,
     cached_border_color: gpui::Hsla,
     colors_dirty: bool,
-    cached_font_metrics_key: Option<(String, f32, nucleotide_types::FontWeight)>,
+    cached_font_metrics_key: Option<(
+        String,
+        f32,
+        nucleotide_types::FontWeight,
+        nucleotide_types::FontFeatureSettings,
+    )>,
     cached_char_width: Option<f32>,
     cached_line_height: Option<f32>,
     active_completion_session: Option<ActiveCompletionSession>,
@@ -9626,6 +9631,7 @@ impl Workspace {
         editor_font_config.size = editor_font.size;
         editor_font_config.weight = editor_font.weight;
         editor_font_config.line_height = editor_font.line_height;
+        editor_font_config.features = editor_font.features.clone();
 
         let ui_font_config = cx.global_mut::<crate::types::UiFontConfig>();
         ui_font_config.family = ui_font.family.clone();
@@ -9635,6 +9641,7 @@ impl Workspace {
         let font_settings = cx.global_mut::<crate::types::FontSettings>();
         font_settings.fixed_font.family = editor_font.family.clone();
         font_settings.fixed_font.weight = editor_font.weight;
+        font_settings.fixed_font.features = editor_font.features.clone();
         font_settings.var_font.family = ui_font.family.clone();
         font_settings.var_font.weight = ui_font.weight;
 
@@ -13754,7 +13761,7 @@ impl Workspace {
                     .family
                     .clone()
                     .into(),
-                font_features: FontFeatures::default(),
+                font_features: editor_font.features.to_gpui_font_features(),
                 font_fallbacks: None,
                 font_size: px(editor_font.size).into(),
                 line_height: gpui::phi(), // Use golden ratio for optimal line height
@@ -13884,6 +13891,7 @@ impl Workspace {
             editor_font.family.clone(),
             editor_font.size,
             editor_font.weight,
+            editor_font.features.clone(),
         );
 
         let need_recalc = match &self.cached_font_metrics_key {
@@ -13895,7 +13903,7 @@ impl Workspace {
         if need_recalc {
             let font = gpui::Font {
                 family: editor_font.family.clone().into(),
-                features: FontFeatures::default(),
+                features: editor_font.features.to_gpui_font_features(),
                 weight: editor_font.weight.into(),
                 style: gpui::FontStyle::Normal,
                 fallbacks: None,

@@ -5,7 +5,7 @@ use crate::file_tree::FileTreeDisplayDensity;
 use helix_loader::config_dir;
 use helix_term::config::Config as HelixConfig;
 use nucleotide_appearance::UiChromeStyle;
-use nucleotide_types::{FontConfig, FontWeight, ProjectMarkersConfig};
+use nucleotide_types::{FontConfig, FontFeatureSettings, FontWeight, ProjectMarkersConfig};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -49,6 +49,7 @@ fn default_ui_font() -> FontConfig {
         weight: FontWeight::Normal,
         size: default_ui_font_size(),
         line_height: DEFAULT_UI_FONT_LINE_HEIGHT,
+        features: FontFeatureSettings::default(),
     }
 }
 
@@ -82,6 +83,7 @@ struct PartialFontConfig {
     weight: Option<FontWeight>,
     size: Option<f32>,
     line_height: Option<f32>,
+    features: Option<FontFeatureSettings>,
 }
 
 fn merge_font_config(mut base: FontConfig, partial: PartialFontConfig) -> FontConfig {
@@ -96,6 +98,9 @@ fn merge_font_config(mut base: FontConfig, partial: PartialFontConfig) -> FontCo
     }
     if let Some(line_height) = partial.line_height {
         base.line_height = line_height;
+    }
+    if let Some(features) = partial.features {
+        base.features = features;
     }
     base
 }
@@ -2751,6 +2756,7 @@ priority = 70
             weight: FontWeight::Normal,
             size: 13.0,
             line_height: 1.5,
+            features: FontFeatureSettings::default(),
         });
 
         let config = Config {
@@ -2788,6 +2794,7 @@ priority = 70
             weight: FontWeight::Normal,
             size: 16.0,
             line_height: 1.4,
+            features: FontFeatureSettings::default(),
         });
         let config = Config {
             helix: HelixConfig::default(),
@@ -2853,6 +2860,107 @@ size = 18.0
         assert_eq!(editor_font.weight, default_editor_font.weight);
         assert_eq!(editor_font.size, 18.0);
         assert_eq!(editor_font.line_height, default_editor_font.line_height);
+    }
+
+    #[test]
+    fn editor_font_features_parse_ligature_tags() {
+        let gui_config: GuiConfig = toml::from_str(
+            r#"
+[editor.font]
+family = "FiraCode Nerd Font"
+size = 16.0
+features = { calt = true, liga = true, clig = true }
+"#,
+        )
+        .expect("editor font features should parse");
+
+        let config = Config {
+            helix: HelixConfig::default(),
+            gui: gui_config,
+        };
+
+        let editor_font = config.editor_font();
+        assert_eq!(editor_font.family, "FiraCode Nerd Font");
+        assert_eq!(editor_font.features.is_enabled("calt"), Some(true));
+        assert_eq!(editor_font.features.is_enabled("liga"), Some(true));
+        assert_eq!(editor_font.features.is_enabled("clig"), Some(true));
+    }
+
+    #[test]
+    fn editor_font_features_default_to_empty_and_allow_disabling() {
+        let gui_config: GuiConfig = toml::from_str(
+            r#"
+[editor.font]
+family = "Some Font"
+features = { calt = false }
+"#,
+        )
+        .expect("editor font features should parse");
+
+        let config = Config {
+            helix: HelixConfig::default(),
+            gui: gui_config,
+        };
+
+        let editor_font = config.editor_font();
+        assert_eq!(editor_font.features.is_enabled("calt"), Some(false));
+        // Unlisted tags stay unset so the platform default applies.
+        assert_eq!(editor_font.features.is_enabled("liga"), None);
+
+        // An omitted `features` key leaves the map empty.
+        let without_features: GuiConfig = toml::from_str(
+            r#"
+[editor.font]
+family = "Some Font"
+"#,
+        )
+        .expect("editor font without features should parse");
+        let config = Config {
+            helix: HelixConfig::default(),
+            gui: without_features,
+        };
+        assert!(config.editor_font().features.is_empty());
+    }
+
+    #[test]
+    fn editor_font_features_survive_serialization_roundtrip() {
+        let original = FontConfig {
+            family: "FiraCode Nerd Font".to_string(),
+            weight: FontWeight::Normal,
+            size: 16.0,
+            line_height: 1.5,
+            features: FontFeatureSettings::ligatures(),
+        };
+
+        let encoded = toml::to_string(&original).expect("font config should serialize");
+        let decoded: FontConfig =
+            toml::from_str(&encoded).expect("serialized font config should parse");
+
+        assert_eq!(decoded.features, original.features);
+        assert_eq!(decoded.features.is_enabled("calt"), Some(true));
+    }
+
+    #[test]
+    fn editor_font_features_drop_invalid_tags_before_reaching_gpu() {
+        let settings = FontFeatureSettings(
+            [
+                ("calt".to_string(), true),
+                ("toolongtag".to_string(), true),
+                ("li".to_string(), true),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let features = settings.to_gpui_font_features();
+        let tags: Vec<&str> = features
+            .tag_value_list()
+            .iter()
+            .map(|(tag, _)| tag.as_str())
+            .collect();
+
+        assert_eq!(tags, vec!["calt"]);
+        assert_eq!(features.is_calt_enabled(), Some(true));
     }
 
     #[test]

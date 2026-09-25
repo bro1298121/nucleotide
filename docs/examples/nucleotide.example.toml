@@ -106,6 +106,18 @@ look = "theme"
 # Line-height multiplier. Default: 1.5.
 # line_height = 1.5
 
+# OpenType features for the editor font, keyed by four-character feature tag.
+# Default: no overrides, so the font's own defaults apply.
+#
+# Enable programming ligatures (Fira Code implements most of its ligatures via
+# "calt", i.e. contextual alternates):
+# features = { calt = true, liga = true, clig = true }
+#
+# Set a tag to false to disable a feature the font enables by default, for
+# example "calt = false" if contextual alternates look wrong in your font.
+# Invalid tags (not exactly four ASCII alphanumeric characters) are ignored.
+# features = { calt = true, liga = true, clig = true }
+
 [tab_bar]
 # Show the tab bar. Default: true.
 show = true

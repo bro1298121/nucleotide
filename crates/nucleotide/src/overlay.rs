@@ -41,7 +41,12 @@ pub struct OverlayView {
     core: gpui::WeakEntity<crate::Core>,
     handle: tokio::runtime::Handle,
     // Cached terminal font metrics to avoid per-frame font measurement
-    cached_font_key: Option<(String, f32, nucleotide_types::FontWeight)>, // (family, size, weight)
+    cached_font_key: Option<(
+        String,
+        f32,
+        nucleotide_types::FontWeight,
+        nucleotide_types::FontFeatureSettings,
+    )>, // (family, size, weight, features)
     cached_char_width: Option<f32>,
     cached_line_height: Option<f32>,
 }
@@ -1335,6 +1340,7 @@ impl OverlayView {
                                     family: editor_cfg.family.clone(),
                                     weight: editor_cfg.weight,
                                     style: nucleotide_types::FontStyle::Normal,
+                                    features: editor_cfg.features.clone(),
                                 }
                                 .into();
                                 let editor_size = (editor_cfg.size * 0.9).max(8.0);
@@ -2050,6 +2056,7 @@ impl OverlayView {
             editor_font.family.clone(),
             editor_font.size,
             editor_font.weight,
+            editor_font.features.clone(),
         );
 
         let need_recalc = match &self.cached_font_key {
@@ -2061,7 +2068,7 @@ impl OverlayView {
             // Resolve font and measure advance for 'm'
             let font = gpui::Font {
                 family: editor_font.family.clone().into(),
-                features: gpui::FontFeatures::default(),
+                features: editor_font.features.to_gpui_font_features(),
                 weight: editor_font.weight.into(),
                 style: gpui::FontStyle::Normal,
                 fallbacks: None,

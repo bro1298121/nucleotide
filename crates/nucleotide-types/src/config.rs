@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::font_config::FontFeatureSettings;
+
 /// Font weight enumeration matching common font weights
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -51,6 +53,12 @@ pub struct FontConfig {
     /// Line height multiplier (e.g., 1.5 for 150% line height)
     #[serde(default = "default_line_height")]
     pub line_height: f32,
+    /// OpenType features applied to the font, keyed by four-character feature tag.
+    ///
+    /// `features = { calt = true, liga = true, clig = true }` enables the common
+    /// programming-ligature tags. Defaults to no overrides.
+    #[serde(default)]
+    pub features: FontFeatureSettings,
 }
 
 impl Default for FontConfig {
@@ -60,6 +68,7 @@ impl Default for FontConfig {
             weight: FontWeight::default(),
             size: default_font_size(),
             line_height: default_line_height(),
+            features: FontFeatureSettings::default(),
         }
     }
 }

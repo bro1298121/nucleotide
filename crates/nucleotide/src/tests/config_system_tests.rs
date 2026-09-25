@@ -345,6 +345,7 @@ dark_theme = "custom_dark"
             weight: FontWeight::Medium,
             size: 13.0,
             line_height: 1.5,
+            ..Default::default()
         });
 
         config.gui.editor.font = Some(FontConfig {
@@ -352,6 +353,7 @@ dark_theme = "custom_dark"
             weight: FontWeight::Normal,
             size: 14.0,
             line_height: 1.4,
+            ..Default::default()
         });
 
         // Test editor font retrieval
@@ -383,6 +385,7 @@ dark_theme = "custom_dark"
             weight: FontWeight::Normal,
             size: 13.0,
             line_height: 1.5,
+            ..Default::default()
         });
 
         let ui_font = config.ui_font();
@@ -407,6 +410,7 @@ dark_theme = "custom_dark"
             weight: FontWeight::SemiBold,
             size: 12.0,
             line_height: 1.3,
+            ..Default::default()
         });
 
         // Editor font should fall back to UI font
@@ -462,6 +466,7 @@ dark_theme = "custom_dark"
                     weight: FontWeight::Bold,
                     size: 15.0,
                     line_height: 1.6,
+                    ..Default::default()
                 }),
             },
             editor: EditorGuiConfig {
@@ -470,6 +475,7 @@ dark_theme = "custom_dark"
                     weight: FontWeight::SemiBold,
                     size: 16.0,
                     line_height: 1.5,
+                    ..Default::default()
                 }),
             },
             theme: ThemeConfig {
@@ -623,6 +629,7 @@ family = "Editor Font"
                 weight: FontWeight::Bold,
                 size: 16.0,
                 line_height: 1.4,
+                ..Default::default()
             });
 
             config.gui.ui.font = Some(FontConfig {
@@ -630,6 +637,7 @@ family = "Editor Font"
                 weight: FontWeight::Medium,
                 size: 12.0,
                 line_height: 1.5,
+                ..Default::default()
             });
 
             let editor_font = config.editor_font();
@@ -658,6 +666,7 @@ family = "Editor Font"
                 weight: FontWeight::SemiBold,
                 size: 14.0,
                 line_height: 1.3,
+                ..Default::default()
             });
             config.gui.editor.font = None;
 

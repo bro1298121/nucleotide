@@ -1199,11 +1199,13 @@ fn gui_main(
                     family: editor_font_config.family.clone(),
                     weight: editor_font_config.weight,
                     style: nucleotide_types::FontStyle::Normal,
+                    features: editor_font_config.features.clone(),
                 },
                 var_font: nucleotide_types::Font {
                     family: ui_font_config.family.clone(),
                     weight: ui_font_config.weight,
                     style: nucleotide_types::FontStyle::Normal,
+                    features: Default::default(),
                 },
             };
             cx.set_global(font_settings);
@@ -1214,6 +1216,7 @@ fn gui_main(
                 size: editor_font_config.size,
                 weight: editor_font_config.weight,
                 line_height: editor_font_config.line_height,
+                features: editor_font_config.features,
             });
 
             // Store UI font config for UI components
