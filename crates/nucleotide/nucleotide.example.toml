@@ -121,6 +121,17 @@ look = "theme"
 # Animate editor viewport scrolling (eased page/row jumps). Default: true.
 # smooth_scrolling = true
 
+# Add a short eased glide after a mouse-wheel gesture stops. Default: true.
+#
+# The wheel always tracks 1:1 and instantly, so the view never lags the input;
+# this only adds a small extra glide *after* the wheel goes quiet, proportional
+# to the travel the gesture accumulated. Horizontal wheel scrolling is 1:1 with
+# no glide. Setting this to false leaves the wheel behaviour exactly as it is
+# with no glide at all.
+#
+# A glide is an eased tween, so it also requires smooth_scrolling = true.
+# wheel_glide = true
+
 [tab_bar]
 # Show the tab bar. Default: true.
 show = true

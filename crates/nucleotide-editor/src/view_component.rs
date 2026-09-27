@@ -1,7 +1,7 @@
 // ABOUTME: Native GPUI editor view component shell
 // ABOUTME: Composes editor document painting with viewport input and scrollbars
 
-use std::rc::Rc;
+use std::{rc::Rc, time::Instant};
 
 use gpui::{
     App, Bounds, Component, EntityId, FocusHandle, Hsla, InteractiveElement as _, IntoElement,
@@ -217,7 +217,7 @@ where
             on_mouse_up,
         } = self;
 
-        // Drive the smooth-scroll tween from the render pass. Requesting a frame
+        // Drive the scroll motion from the render pass. Requesting a frame
         // notifies this view, which renders again and advances the animation, so
         // the loop is self-sustaining the same way `AnimationElement` drives
         // itself.
@@ -227,8 +227,18 @@ where
         // schedule the next one, otherwise a tween stalls mid-flight and never
         // completes. `cx.notify` is the load-bearing tick; `request_animation_frame`
         // is only vsync pacing, so it is safe to request unconditionally.
+        //
+        // Both halves of the scroll work happen inside this one `if`: the
+        // in-flight tween (a discrete jump, or a wheel glide) is sampled first,
+        // and only then is the pending wheel gesture given the chance to arm
+        // its glide. That order matters — the glide's target is the position
+        // left on screen by this frame. The same `if` is what keeps the frame
+        // loop from ever becoming a second loop: the loop runs exactly as long
+        // as `scroll_needs_frames()` says it should, and both terms of that
+        // predicate are deadlines.
         if editor_state.viewport().scroll_needs_frames() {
             editor_state.viewport().advance_scroll_animation();
+            editor_state.viewport().advance_wheel_glide(Instant::now());
             cx.notify(view_entity_id);
             window.request_animation_frame();
         }

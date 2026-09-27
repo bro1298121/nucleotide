@@ -9647,12 +9647,14 @@ impl Workspace {
         let editor_font = config.editor_font();
         let ui_font = config.ui_font();
         let editor_smooth_scrolling = config.editor_smooth_scrolling();
+        let editor_wheel_glide = config.editor_wheel_glide();
         let ui_chrome_style = config.ui_chrome_style();
         let previous_ui_chrome_style = cx.global::<crate::ThemeManager>().ui_chrome_style();
         let ui_chrome_style_changed = previous_ui_chrome_style != ui_chrome_style;
 
         let editor_scroll_config = cx.global_mut::<nucleotide_types::EditorScrollConfig>();
         editor_scroll_config.smooth_scrolling = editor_smooth_scrolling;
+        editor_scroll_config.wheel_glide = editor_wheel_glide;
 
         let editor_font_config = cx.global_mut::<crate::types::EditorFontConfig>();
         editor_font_config.family = editor_font.family.clone();

@@ -549,13 +549,23 @@ impl Render for DocumentView {
         // reduced-motion / animation toggles take effect without a config reload.
         // `animations_enabled` already ANDs `!enable_reduced_motion`, so the
         // reduced-motion check does not need to be repeated here.
-        let configured_smooth_scrolling = cx
-            .global::<nucleotide_types::EditorScrollConfig>()
-            .smooth_scrolling;
-        let smooth_scrolling = configured_smooth_scrolling && nucleotide_ui::animations_enabled(cx);
+        //
+        // The post-gesture wheel glide gets the same treatment, and for the same
+        // reason: toggling animations (or reduced motion) at runtime has to stop
+        // the glide immediately, with no config reload. It is *additional*
+        // motion tweened on top of the 1:1 wheel path, so it is gated on its own
+        // key and never on the wheel path itself, which is not animated at all.
+        let (configured_smooth_scrolling, configured_wheel_glide) = {
+            let scroll_config = cx.global::<nucleotide_types::EditorScrollConfig>();
+            (scroll_config.smooth_scrolling, scroll_config.wheel_glide)
+        };
+        let animations_enabled = nucleotide_ui::animations_enabled(cx);
         self.editor_state
             .viewport()
-            .set_smooth_scrolling(smooth_scrolling);
+            .set_smooth_scrolling(configured_smooth_scrolling && animations_enabled);
+        self.editor_state
+            .viewport()
+            .set_wheel_glide(configured_wheel_glide && animations_enabled);
 
         let markdown_document = markdown_document_info(&self.core, self.view_id, cx);
         let markdown_mode = markdown_document

@@ -4,12 +4,70 @@
 use gpui::{Pixels, Point, Size, point, px, size};
 use nucleotide_logging::trace;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     rc::Rc,
     time::{Duration, Instant},
 };
 
 use crate::scroll_animation::ScrollAnimation;
+
+/// Mouse-wheel glide feel, gathered into one block because these are the knobs
+/// to reach for first when the glide feels wrong.
+///
+/// The model is **not** the Firefox one, where every wheel pixel is animated
+/// and the view lags the input. It is 1:1 plus a tail:
+///
+///  - while the wheel is turning the viewport tracks it exactly and instantly,
+///    and that path is never tweened — precision during the gesture is the
+///    entire point,
+///  - once the wheel goes quiet, an *additional* eased glide proportional to
+///    what the gesture accumulated is tweened on top of the position the 1:1
+///    path already reached.
+///
+/// Only the tail animates, so `ease_out_quad` is the one curve that has to
+/// exist and no new curve is introduced here.
+mod wheel_glide {
+    use gpui::{Pixels, px};
+    use std::time::Duration;
+
+    /// Fraction of the gesture's accumulated vertical travel added as glide.
+    /// `0.25` means a 400px gesture glides a further 100px.
+    pub(crate) const RATIO: f32 = 0.25;
+    /// Per-glide cap in pixels, applied *after* `RATIO`, in both directions.
+    /// A hard wheel fling therefore cannot fling the viewport arbitrarily far.
+    pub(crate) const MAX_PX: Pixels = px(120.0);
+    /// How long the glide tween runs.
+    pub(crate) const GLIDE_MS: u64 = 140;
+    /// Accumulated travel a gesture needs before it is allowed to arm a glide.
+    pub(crate) const ARM_MIN_PX: f32 = 72.0;
+    /// Wheel events a gesture needs before it is allowed to arm a glide. One
+    /// deliberate notch is a precision movement, not a flick, and must not
+    /// glide: it would move the viewport further than the user asked for.
+    pub(crate) const ARM_MIN_EVENTS: u32 = 2;
+    /// Wheel silence that ends a gesture.
+    pub(crate) const GESTURE_IDLE_MS: u64 = 90;
+
+    pub(crate) const GLIDE_DURATION: Duration = Duration::from_millis(GLIDE_MS);
+    pub(crate) const GESTURE_IDLE: Duration = Duration::from_millis(GESTURE_IDLE_MS);
+}
+
+/// The vertical wheel gesture currently in progress, or "none".
+///
+/// Held in a `RefCell` because the wheel event that starts a gesture arrives
+/// on a `&self` path (`scroll_by_delta`) and must not require `&mut self`.
+#[derive(Debug, Clone, Default)]
+struct WheelGesture {
+    /// Signed accumulated vertical travel, in the same sign convention as the
+    /// incoming `delta.y` (negative is a downward wheel). Held as a plain
+    /// `f32` because it is only ever summed, compared and scaled — never
+    /// stored as the scroll position.
+    accumulated: f32,
+    /// How many wheel events are folded into `accumulated`.
+    events: u32,
+    /// Timestamp of the most recent wheel event. `None` means no gesture is
+    /// pending, which is what keeps the frame loop from spinning forever.
+    last_event: Option<Instant>,
+}
 
 /// Manages native scroll state for a document viewport.
 #[derive(Clone, Debug)]
@@ -29,6 +87,11 @@ pub struct ScrollManager {
     /// Track if native viewport scroll changed and needs sync to Helix
     pending_view_sync: Rc<Cell<bool>>,
     animation: ScrollAnimation,
+    /// Accumulated state of the wheel gesture in progress.
+    wheel_gesture: Rc<RefCell<WheelGesture>>,
+    /// Whether the post-gesture glide is allowed at all. When false no
+    /// gesture is recorded at all, so the whole feature is inert.
+    wheel_glide_enabled: Rc<Cell<bool>>,
 }
 
 impl ScrollManager {
@@ -45,6 +108,11 @@ impl ScrollManager {
             viewport_size: Rc::new(Cell::new(size(px(800.0), px(600.0)))),
             pending_view_sync: Rc::new(Cell::new(false)),
             animation: ScrollAnimation::new(),
+            wheel_gesture: Rc::new(RefCell::new(WheelGesture::default())),
+            // Defaults to on, matching `EditorScrollConfig`'s shipped default.
+            // The tween engine gate (`smooth_scrolling`) is separate: a glide
+            // cannot animate unless the engine is enabled either.
+            wheel_glide_enabled: Rc::new(Cell::new(true)),
         }
     }
 
@@ -189,10 +257,18 @@ impl ScrollManager {
     /// scroll position crossed. Wheel scrolling uses this to keep fractional
     /// pixel movement local while letting the GUI viewport decide when to sync
     /// the visible visual row back to Helix.
+    ///
+    /// The motion itself is applied 1:1 and instantly, exactly as before. All
+    /// this adds is the *recording* of the vertical gesture, which
+    /// [`Self::advance_wheel_glide`] later turns into a short eased glide once
+    /// the wheel stops. Nothing here waits on, or is blocked by, that glide.
     pub(crate) fn scroll_by_delta(&self, delta: Point<Pixels>) -> (bool, isize) {
         // A wheel gesture is a continuous user intent; it overrides an in-flight
-        // discrete tween rather than fighting it.
+        // discrete tween rather than fighting it. The same cancel kills an
+        // in-flight glide, so a new wheel event resumes 1:1 from wherever the
+        // glide had actually reached, rather than snapping to its target first.
         self.animation.cancel("wheel_scroll");
+        self.record_wheel_gesture(delta.y);
         let old_position = self.scroll_position.get();
         let old_line = self.pixels_to_anchor(old_position.y);
         let next_offset = self.scroll_offset() + delta;
@@ -207,6 +283,39 @@ impl ScrollManager {
         }
 
         (old_position != new_position, crossed_lines)
+    }
+
+    /// Fold one wheel event's vertical travel into the pending gesture.
+    ///
+    /// Only `delta.y` is accumulated. Horizontal wheel travel is 1:1 by design
+    /// and never glides, so it is not tracked, and an event with no vertical
+    /// component is not a vertical gesture event at all: it neither extends the
+    /// idle window nor contributes travel.
+    fn record_wheel_gesture(&self, delta_y: Pixels) {
+        if !self.wheel_glide_enabled.get() {
+            return;
+        }
+
+        let delta_y: f32 = delta_y.into();
+        if delta_y == 0.0 {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut gesture = self.wheel_gesture.borrow_mut();
+
+        // A direction flip restarts the accumulation rather than netting against
+        // it. A down-then-up flick that nets to nearly zero would otherwise
+        // produce either no glide or a glide in a direction the user did not
+        // end the gesture on.
+        if gesture.events > 0 && (delta_y > 0.0) != (gesture.accumulated > 0.0) {
+            gesture.accumulated = 0.0;
+            gesture.events = 0;
+        }
+
+        gesture.accumulated += delta_y;
+        gesture.events += 1;
+        gesture.last_event = Some(now);
     }
 
     /// Set the scroll position from an external view sync while retaining a
@@ -413,11 +522,23 @@ impl ScrollManager {
     /// This is deliberately a predicate of *desired* motion rather than of
     /// per-frame movement: a frame that produces no pixel change must still
     /// schedule the next one, otherwise a tween stalls and never completes.
-    /// Currently it covers the discrete scroll tween; a later phase extends it
-    /// to also cover a wheel momentum arming window, which is why it is its own
-    /// named predicate rather than an inlined `is_active()`.
+    /// It covers two things, both of which terminate on their own:
+    ///
+    ///  - the discrete scroll tween, and
+    ///  - a wheel gesture that has not yet gone idle, which needs the idle
+    ///    window to elapse before it can arm (or decline to arm) its glide.
+    ///
+    /// The second term is a *deadline*, not a stall: once `now - last_event`
+    /// passes the idle window [`Self::advance_wheel_glide`] clears the gesture
+    /// unconditionally, so a gesture that ends below the arming thresholds
+    /// leaves nothing pending here and the loop stops.
     pub(crate) fn scroll_needs_frames(&self) -> bool {
-        self.animation.is_active()
+        self.animation.is_active() || self.wheel_gesture_pending()
+    }
+
+    /// Whether a wheel gesture is still waiting for its idle window to elapse.
+    fn wheel_gesture_pending(&self) -> bool {
+        self.wheel_glide_enabled.get() && self.wheel_gesture.borrow().last_event.is_some()
     }
 
     pub(crate) fn scroll_animation_active(&self) -> bool {
@@ -431,14 +552,152 @@ impl ScrollManager {
 
     /// Tween the vertical scroll position toward `target` over `duration`.
     pub(crate) fn animate_scroll_to(&self, target: Point<Pixels>, duration: Duration) {
+        let Some((from, to)) = self.resolve_scroll_tween(target) else {
+            return;
+        };
+        self.animation.animate_to(from, to, duration);
+    }
+
+    /// The (from, to) legs of a vertical tween toward `target`, or `None` when
+    /// there is no distance to travel.
+    ///
+    /// The no-distance case cancels rather than arms, which is the pre-existing
+    /// behaviour of a scroll whose target is where it already is; keeping that
+    /// in one place is what lets [`Self::animate_scroll_to`] and
+    /// [`Self::animate_scroll_to_at`] differ only in the tween's origin. The
+    /// legs are the *live* position and the *clamped* target: a tween eases
+    /// away from the position that is actually on screen.
+    fn resolve_scroll_tween(&self, target: Point<Pixels>) -> Option<(Pixels, Pixels)> {
         let clamped = self.clamp_position(target);
         let from = self.scroll_position.get().y;
         if clamped.y == from {
             self.animation.cancel("scroll_target_already_reached");
+            return None;
+        }
+        Some((from, clamped.y))
+    }
+
+    /// Tween toward `target` over `duration`, starting at `start`.
+    ///
+    /// `animate_scroll_to` is this with the current clock. Taking the origin
+    /// explicitly is what makes the whole glide sequence — idle window
+    /// elapsing, glide arming, glide flight — reproducible from an injected
+    /// `Instant` in a test, with no dependence on how long the arming call
+    /// itself happened to take.
+    pub(crate) fn animate_scroll_to_at(
+        &self,
+        target: Point<Pixels>,
+        duration: Duration,
+        start: Instant,
+    ) {
+        let Some((from, to)) = self.resolve_scroll_tween(target) else {
             return;
+        };
+        self.animation.animate_to_at(from, to, duration, start);
+    }
+
+    /// Enable or disable the eased glide that follows a wheel gesture.
+    ///
+    /// Disabling drops any pending gesture, which is what makes the change take
+    /// effect at runtime with no config reload: an in-flight glide tween is left
+    /// to finish on its own (it is bounded by `GLIDE_MS` and cannot outlive the
+    /// frame loop), but a pending gesture is dropped immediately so the frame
+    /// loop stops on the next frame.
+    pub(crate) fn set_wheel_glide_enabled(&self, enabled: bool) {
+        self.wheel_glide_enabled.set(enabled);
+        if !enabled {
+            self.clear_wheel_gesture();
+        }
+    }
+
+    pub(crate) fn wheel_glide_enabled(&self) -> bool {
+        self.wheel_glide_enabled.get()
+    }
+
+    /// Forget the pending gesture entirely. After this no gesture is pending,
+    /// whatever the threshold arithmetic would have said.
+    fn clear_wheel_gesture(&self) {
+        *self.wheel_gesture.borrow_mut() = WheelGesture::default();
+    }
+
+    /// Advance the pending wheel gesture to `now`, arming its glide if the
+    /// gesture is over and was significant. Returns whether a glide was armed.
+    ///
+    /// Call this once per rendered frame, for as long as
+    /// [`Self::scroll_needs_frames`] is true. The three outcomes are:
+    ///
+    ///  - no gesture pending, or the wheel is still within the idle window:
+    ///    return false and change nothing. The caller keeps requesting frames,
+    ///    because the gesture is still going to need a decision.
+    ///  - the gesture is over but below the arming thresholds: clear it and
+    ///    return false. The clear is **unconditional** — a gesture that
+    ///    survives this point would keep `scroll_needs_frames()` true forever
+    ///    and the frame loop would never terminate. That is the single
+    ///    highest-risk failure in this feature, so the clear does not depend on
+    ///    the threshold outcome.
+    ///  - the gesture is over and significant: clear it, then tween a glide of
+    ///    `clamp(accumulated * RATIO, ±MAX_PX)` past the current position over
+    ///    `GLIDE_MS`, starting at `now` so the flight is anchored to the
+    ///    decision rather than to a clock read inside the tween.
+    pub(crate) fn advance_wheel_glide(&self, now: Instant) -> bool {
+        if !self.wheel_glide_enabled.get() {
+            return false;
         }
 
-        self.animation.animate_to(from, clamped.y, duration);
+        let (accumulated, events, last_event) = {
+            let gesture = self.wheel_gesture.borrow();
+            let Some(last_event) = gesture.last_event else {
+                return false;
+            };
+            (gesture.accumulated, gesture.events, last_event)
+        };
+
+        if now.saturating_duration_since(last_event) < wheel_glide::GESTURE_IDLE {
+            return false;
+        }
+
+        // The gesture is over. It is dropped before the thresholds are even
+        // consulted, so neither an insignificant gesture nor one with the
+        // feature switched off mid-gesture can leave a frame loop running.
+        self.clear_wheel_gesture();
+
+        let significant =
+            events >= wheel_glide::ARM_MIN_EVENTS && accumulated.abs() >= wheel_glide::ARM_MIN_PX;
+        if !significant {
+            return false;
+        }
+
+        // The glide is an eased tween, so it is subject to the same engine gate
+        // as every other tween: with the engine off there is nothing to tween
+        // with. Bailing out here rather than letting the arming call refuse is
+        // deliberate — refusing would also *cancel* whatever tween happened to
+        // be in flight (a discrete page jump armed during the idle window),
+        // turning a glide that cannot run into a jump that cannot finish.
+        if !self.scroll_animation_enabled() {
+            return false;
+        }
+
+        // Sign spaces. `accumulated` is the sum of raw GPUI `delta.y` values, where
+        // NEGATIVE means scrolling down. `scroll_position().y` is the opposite: a
+        // larger position means further down the document. The two must not be
+        // added together directly — doing so sends a downward glide upward. The
+        // negation converts the wheel's convention into the position's, so the
+        // glide always continues the direction the wheel was already travelling.
+        let glide = px(-accumulated * wheel_glide::RATIO)
+            .max(-wheel_glide::MAX_PX)
+            .min(wheel_glide::MAX_PX);
+        let current = self.scroll_position.get();
+        self.animate_scroll_to_at(
+            point(current.x, current.y + glide),
+            wheel_glide::GLIDE_DURATION,
+            now,
+        );
+        // Read liveness back rather than assuming the arming took: a glide at
+        // the very top or bottom of the document clamps onto the position the
+        // gesture already reached, which cancels instead of arming. The frame
+        // loop still ends either way — the gesture is already cleared and there
+        // is no tween to keep alive.
+        self.animation.is_active()
     }
 
     /// The animation destination while a tween is in flight, otherwise the live

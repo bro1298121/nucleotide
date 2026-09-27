@@ -248,6 +248,11 @@ pub struct EditorGuiConfig {
     /// Animate viewport scrolling (eased page/row jumps).
     #[serde(default = "default_true")]
     pub smooth_scrolling: bool,
+
+    /// Add an eased glide after a mouse-wheel gesture goes idle. The wheel
+    /// itself always tracks 1:1; this is only the extra glide on top of it.
+    #[serde(default = "default_true")]
+    pub wheel_glide: bool,
 }
 
 impl Default for EditorGuiConfig {
@@ -255,6 +260,7 @@ impl Default for EditorGuiConfig {
         Self {
             font: None,
             smooth_scrolling: true,
+            wheel_glide: true,
         }
     }
 }
@@ -1094,6 +1100,14 @@ impl Config {
     /// read site so runtime reduced-motion / animation toggles apply without a reload.
     pub fn editor_smooth_scrolling(&self) -> bool {
         self.gui.editor.smooth_scrolling
+    }
+
+    /// Whether a mouse-wheel gesture should add an eased glide when it ends.
+    ///
+    /// This is the raw configured preference; the effective value is resolved at the
+    /// read site so runtime reduced-motion / animation toggles apply without a reload.
+    pub fn editor_wheel_glide(&self) -> bool {
+        self.gui.editor.wheel_glide
     }
 
     /// Get the UI chrome style used by nucleotide-ui.

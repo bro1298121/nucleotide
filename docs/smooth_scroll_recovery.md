@@ -91,33 +91,100 @@ A third speculative fix would very likely also be locally correct and still wron
 the cause. So the engine is now instrumented: every tween kill is logged with a
 `reason` naming its cause, and only when it actually killed a live tween.
 
-## Phase 1 — Measured reproduction (current)
+## Phase 1 — Measured reproduction (DONE)
 
 Run the working configuration above, reproduce, and quit so the log flushes.
 
-Reproduction: open `Cargo.lock`, jump to the top, one `page_down`, let it settle, then
-repeated `j` until the cursor leaves the viewport.
+The log settled it. A `page_down` tween (0 -> 728px, 28 rows, 228ms) lived **2.85 ms**,
+was re-anchored twice, and was cancelled. 5/5 reproductions identical:
 
-Read the log and answer: which `reason` kills the tween; whether a tween is ever armed
-for the `j` presses; whether `clamp_target_no_room` fires; whether `reveal_visual_row`
-computes its band against a mid-tween row (`old_top_visual_row` vs
-`tween_destination_row`).
+```
+.340805 scroll_animation:168 tween armed from=0px to=728px duration_ms=228.0
+.341195 scroll_animation:206 tween sampled elapsed_ms=0.392 t=0.0017 position=2.501146px
+.343636 scroll_animation:246 re-anchored from=2.501146px to=728px remaining_ms=225.1683
+.343651 scroll_animation:246 re-anchored from=2.501146px to=728px remaining_ms=225.1502
+.343658 scroll_animation:119 tween cancelled reason="helix_view_sync"
+.343661 scroll_manager:243  view sync tween_active=true current_row=0 incoming_row=0 preserved_subrow=true resolved_y=2.501146px
+```
 
-Deliverable: a named killer with a call path, evidenced by the log rather than inferred.
+Correction to my own narration: the "2.5px of 728px" figure is the **re-anchored origin**,
+not eased travel. The tween was killed right after the first `retarget_from`, before it
+eased anywhere. The `duration_ms=225.15` against a requested 228ms is the fingerprint of
+`retarget_from` carrying the remaining budget forward.
 
-## Phase 2 — Fix the identified cause
+### The causal story I got wrong
 
-Scoped to whatever Phase 1 proves. Explicitly **not** bundled: the `last_reported_row`
-echo discriminator, the `reveal_visual_row` band-origin fix, or the
-double-`set_viewport_size` cleanup. Bundling makes a regression impossible to bisect,
-and two of the three already failed to be the cause when bundled with something else.
+I first wrote that Helix was echoing a **stale** row. That is backwards. Helix's stored
+row is never stale — the crossing-gated sync is precisely what keeps it correct, because
+if the top row did not change this frame then the row Helix holds IS the current top row.
+Row 0 is genuinely the top row. The tween's *destination* is simply unpublished by design.
 
-## Phase 3 — Cursor-follow easing and wheel glide
+A second correction I owed myself: the first instrumented run appeared to show "no tween
+was ever armed". That was an artefact of my own `RUST_LOG` filter — the arming, cancel,
+sampler and clamp traces all live in `scroll_animation.rs`, and I had only enabled the
+`scroll_manager` and `viewport` modules. I had treated evidence I filtered out myself as
+evidence of absence. The filter must name all three modules.
 
-Cursor-follow easing, then wheel glide. Cursor-follow is the higher-risk of the two: the
-reveal path fights the tween by design today, and if the discriminator is wrong the
-viewport fights its own cursor, which is worse than no animation. Safe fallback if it
-proves unstable: keep the discrete tween and ease only the short case.
+## Phase 2 — Fix the identified cause (DONE, user-verified)
+
+`set_scroll_position_from_view_sync_preserving_subrow_offset` now hoists `preserved_subrow`
+above the cancel and gates it on `!preserved_subrow`. Reason strings split into
+`helix_view_sync_row_change` / `helix_view_sync_same_row`.
+
+The invariant, local and decidable in one line: `preserved_subrow == true` implies the
+resolved `y` **is** `current.y`, so the call provably changes nothing vertically, so it has
+no justification for destroying the animation that would have moved it. The function was
+self-contradictory.
+
+An independent review rejected the `last_reported_view_row` echo discriminator I had
+proposed, for two reasons worth preserving:
+
+1. It is a **strict subset** of the trivial fix — its third conjunct
+   `incoming_line == current_line` *is* `preserved_subrow`, so it cannot catch anything the
+   simple fix lets through. Narrower, not safer.
+2. It has a **cold-start hole that fails the repro**. On a fresh file the field stays `None`
+   forever, because with the cursor at row 0 `has_pending_view_sync()` is false on every
+   paint, so the push function is never called and no write site inside it can ever fire.
+
+Not `page_down`-specific: a tween dies on the first frame in which it has not crossed a row,
+and at these durations the first sample is always sub-row. A 1-row `scroll_down` is
+20px/66ms and samples ~8.5px on frame 1. Every tween died on frame 1; `page_down` was just
+where it was most visible. Regression tests must not be gated on `page_down`.
+
+Blast radius: `scroll_manager.rs:214` has one production caller, which has two, which has one.
+
+Verified: `cargo +stable test --release -p nucleotide-editor` and
+`cargo +stable build --release -p nucleotide --bin nucl` both pass, and the user confirms
+smooth `page_down` scrolling in the running app. This is the first fix in this bug's history
+verified by felt experience rather than tests alone.
+
+## Phase 3a — Wheel glide (IN PROGRESS)
+
+User-selected feel model: **1:1 immediate response plus an extra eased glide after the wheel
+stops.** Not the Firefox model — the view must never lag the wheel, because editor scrolling
+is about precision. Vertical only; `h`/`l` stay 1:1.
+
+The Phase 2 fix is a hard prerequisite: a glide is sub-row on its first frame exactly like a
+fixed jump, so without the same-row cancel gate every glide would die on frame 1.
+
+Highest-risk failure mode: `scroll_needs_frames()` must include a pending gesture so the
+frame loop keeps ticking through the 90ms idle window, which means the gesture accumulator
+**must** be cleared unconditionally when a gesture ends. If a below-threshold gesture left
+the accumulator set, the frame loop would never terminate.
+
+Constants: `RATIO 0.25 / MAX_PX 120 / GLIDE_MS 140 / ARM_MIN_PX 72 / ARM_MIN_EVENTS 2 /
+GESTURE_IDLE_MS 90`. Gated behind its own config key, default true.
+
+## Phase 3b — Cursor-follow easing (not started)
+
+`h`/`j`/`k`/`l` are still instant. This is the higher-risk of the two remaining motions: the
+reveal path fights the tween by design, and a wrong discriminator makes the viewport fight
+its own cursor, which is worse than no animation. Safe fallback if it proves unstable: keep
+the discrete tween and ease only the short case.
+
+**If cursor-follow reads as "not obvious", do not lengthen the duration.** The likelier cause
+is that cursor moves never triggered a scroll at all, because reveal only fires when the
+cursor crosses the `scrolloff` margin. Diagnose before touching a constant.
 
 ## Phase 4 — Cleanup and validation
 
