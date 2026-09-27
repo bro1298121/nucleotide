@@ -5,8 +5,7 @@ use std::{rc::Rc, time::Instant};
 
 use gpui::{
     App, Bounds, Component, EntityId, FocusHandle, Hsla, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement as _, Pixels, RenderOnce, Size, Styled as _, TextStyle, Window,
-    div,
+    KeyDownEvent, ParentElement as _, Pixels, RenderOnce, Size, Styled as _, TextStyle, Window, div,
 };
 
 use crate::{
@@ -27,6 +26,13 @@ struct EditorSurfaceRerenderSnapshot {
     gutter_width: Pixels,
     viewport_size: Size<Pixels>,
     max_scroll_offset: gpui::Size<Pixels>,
+    /// Whether the paint currently being bracketed armed scroll motion.
+    ///
+    /// A per-paint *level* copied from the view state, but acted on as a
+    /// transition. A paint that only *finishes* an armed tween also reports
+    /// `true` — the level is rewritten on every layout sync — and scheduling
+    /// another frame for that would run the frame loop past its own deadline.
+    reveal_armed_motion: bool,
 }
 
 impl EditorSurfaceRerenderSnapshot {
@@ -35,6 +41,7 @@ impl EditorSurfaceRerenderSnapshot {
             gutter_width: state.layout_snapshot().gutter_width,
             viewport_size: state.viewport().viewport_bounds().size,
             max_scroll_offset: state.viewport().max_scroll_offset(),
+            reveal_armed_motion: state.cursor_reveal_armed_motion(),
         }
     }
 
@@ -42,6 +49,15 @@ impl EditorSurfaceRerenderSnapshot {
         self.gutter_width != next.gutter_width
             || self.viewport_size != next.viewport_size
             || self.max_scroll_offset != next.max_scroll_offset
+    }
+
+    /// Whether this paint turned scroll motion *on*.
+    ///
+    /// Split out from [`Self::requires_rerender_after`] because the two have
+    /// different reasons to act: one means the surface has to be rebuilt, the
+    /// other means the frame loop has to be restarted.
+    fn armed_scroll_motion(self, next: Self) -> bool {
+        !self.reveal_armed_motion && next.reveal_armed_motion
     }
 }
 
@@ -228,17 +244,19 @@ where
         // completes. `cx.notify` is the load-bearing tick; `request_animation_frame`
         // is only vsync pacing, so it is safe to request unconditionally.
         //
-        // Both halves of the scroll work happen inside this one `if`: the
-        // in-flight tween (a discrete jump, or a wheel glide) is sampled first,
-        // and only then is the pending wheel gesture given the chance to arm
-        // its glide. That order matters — the glide's target is the position
-        // left on screen by this frame. The same `if` is what keeps the frame
-        // loop from ever becoming a second loop: the loop runs exactly as long
-        // as `scroll_needs_frames()` says it should, and both terms of that
+        // All of the scroll work happens inside this one `if`: the in-flight
+        // tween (a discrete jump, a wheel glide, or the cursor-follow carry) is
+        // sampled first, and only then are the pending gestures given the chance
+        // to arm. That order matters — a new tween's target is the position left
+        // on screen by this frame, and `advance_scrolloff_inertia` refuses to arm
+        // while anything is in flight. The same `if` is what keeps the frame loop
+        // from ever becoming a second loop: the loop runs exactly as long as
+        // `scroll_needs_frames()` says it should, and all three terms of that
         // predicate are deadlines.
         if editor_state.viewport().scroll_needs_frames() {
             editor_state.viewport().advance_scroll_animation();
             editor_state.viewport().advance_wheel_glide(Instant::now());
+            editor_state.viewport().advance_scrolloff_inertia(Instant::now());
             cx.notify(view_entity_id);
             window.request_animation_frame();
         }
@@ -261,6 +279,35 @@ where
                     // Paint runs after the surface has already rendered from
                     // the old viewport. Schedule the owning view to render
                     // again after this frame unwinds.
+                    cx.defer(move |cx| {
+                        cx.notify(view_entity_id);
+                    });
+                }
+
+                if rerender_snapshot_before.armed_scroll_motion(rerender_snapshot_after) {
+                    // The frame driver at the top of `render` consults
+                    // `scroll_needs_frames()` *before* paint runs, and this
+                    // paint is where a cursor reveal is applied. On the frame
+                    // that arms a `Scrolloff` tween the predicate was already
+                    // false and the `request_animation_frame()` inside that
+                    // `if` never ran, so the tween would be armed with no frame
+                    // left to advance it and the view would sit still for good.
+                    //
+                    // `cx.notify` is the whole of the fix. It marks the view
+                    // dirty, GPUI re-renders it, and that render re-enters the
+                    // driver — where `scroll_needs_frames()` is now true and the
+                    // driver requests the animation frame itself.
+                    //
+                    // It must NOT also call `request_animation_frame` from here.
+                    // This defer runs inside `flush_effects`, outside the
+                    // `with_rendered_view` scope, and `request_animation_frame`
+                    // reaches `Window::current_view`, which unwraps
+                    // `rendered_entity_stack.last()` (gpui `window.rs:4315`).
+                    // That stack is empty at this point, so calling it from a
+                    // defer panics with "called `Option::unwrap()` on a `None`
+                    // value" the first time a cursor reveal eases. The driver's
+                    // own call is safe because it happens during `render`, with
+                    // the stack populated.
                     cx.defer(move |cx| {
                         cx.notify(view_entity_id);
                     });
@@ -370,11 +417,13 @@ mod tests {
             gutter_width: px(32.0),
             viewport_size: size(px(100.0), px(200.0)),
             max_scroll_offset: size(px(0.0), px(0.0)),
+            reveal_armed_motion: false,
         };
         let after = EditorSurfaceRerenderSnapshot {
             gutter_width: px(32.0),
             viewport_size: size(px(100.0), px(200.0)),
             max_scroll_offset: size(px(0.0), px(400.0)),
+            reveal_armed_motion: false,
         };
 
         assert!(before.requires_rerender_after(after));
@@ -386,11 +435,13 @@ mod tests {
             gutter_width: px(32.0),
             viewport_size: size(px(800.0), px(600.0)),
             max_scroll_offset: size(px(0.0), px(0.0)),
+            reveal_armed_motion: false,
         };
         let after = EditorSurfaceRerenderSnapshot {
             gutter_width: px(32.0),
             viewport_size: size(px(100.0), px(200.0)),
             max_scroll_offset: size(px(0.0), px(0.0)),
+            reveal_armed_motion: false,
         };
 
         assert!(before.requires_rerender_after(after));
@@ -402,9 +453,37 @@ mod tests {
             gutter_width: px(32.0),
             viewport_size: size(px(100.0), px(200.0)),
             max_scroll_offset: size(px(0.0), px(400.0)),
+            reveal_armed_motion: false,
         };
 
         assert!(!snapshot.requires_rerender_after(snapshot));
+    }
+
+    /// A reveal that arms a tween during paint is the only way scroll motion
+    /// starts after the frame driver's `scroll_needs_frames()` check has
+    /// already run for this frame, so it has to schedule a follow-up frame of
+    /// its own. This pins the half of that decision that lives here; the
+    /// viewport half — that the tween exists and reaches its target — is
+    /// pinned in `viewport.rs`.
+    #[test]
+    fn surface_rerender_snapshot_flags_a_paint_that_armed_scroll_motion() {
+        let idle = EditorSurfaceRerenderSnapshot {
+            gutter_width: px(32.0),
+            viewport_size: size(px(800.0), px(600.0)),
+            max_scroll_offset: size(px(0.0), px(4000.0)),
+            reveal_armed_motion: false,
+        };
+        let armed = EditorSurfaceRerenderSnapshot {
+            reveal_armed_motion: true,
+            ..idle
+        };
+
+        assert!(idle.armed_scroll_motion(armed));
+        // Only the transition counts. A later paint that still reports motion
+        // is a frame *finishing* the tween, and scheduling another frame for
+        // that would run the frame loop past its own deadline.
+        assert!(!armed.armed_scroll_motion(armed));
+        assert!(!armed.armed_scroll_motion(idle));
     }
 
     #[gpui::test]

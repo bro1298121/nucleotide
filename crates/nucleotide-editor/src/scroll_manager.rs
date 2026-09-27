@@ -79,6 +79,116 @@ mod wheel_glide {
     pub(crate) const GESTURE_IDLE: Duration = Duration::from_millis(GESTURE_IDLE_MS);
 }
 
+/// Keyboard "inertia" for the cursor-follow scroll, gathered into one block
+/// because these are the knobs to reach for first when the follow feels dead or
+/// too loose.
+///
+/// This is deliberately **not** the wheel's fling tail. A wheel emits a
+/// continuous delta stream, so when the hand stops there is a known distance
+/// left over to glide. A keypress moves the cursor exactly one row and the view
+/// has already eased onto it, so there is no leftover to glide — the only honest
+/// analogue of momentum is the *gesture*:
+///
+///  - a single deliberate `j`/`k` is a precision movement. It is one reveal, one
+///    row, and it must not overshoot at all. [`MIN_GESTURE_ROWS`] is what makes
+///    that true, and it is a row count rather than a pixel count precisely so a
+///    one-row press cannot reach it on any window size or line height,
+///  - reveals that arrive within [`GESTURE_IDLE_MS`] of each other are one
+///    gesture. When the keys go quiet the view eases a few rows *further along*
+///    the direction it was already travelling ([`OVERSHOOT_MS`]) and stops there.
+///    The carry scales with how far the gesture travelled ([`OVERSHOOT_RATIO`])
+///    and is capped ([`OVERSHOOT_MAX`]), so a long `j` hold cannot fling the
+///    viewport.
+///
+/// # One leg, and never a reversal
+///
+/// The carry is one-way: out, decelerating, done. That is structurally the wheel
+/// glide, and it is why this reads as inertia where a return leg did not — a
+/// fling that keeps going and stops, rather than one that goes and comes back.
+///
+/// A settle leg was here and was removed, and the reason is **not** the duration
+/// of either leg: any reversal in the direction of travel reads as a rebound, and
+/// duration was never the variable. Two pairs were shipped and measured — 50ms
+/// out against 60ms back, then 100ms out against 40ms back — and both read as a
+/// rebound, including the pair whose return was *shorter* than its throw. A
+/// reversal is noticed for existing, not for being fast, and the faster return
+/// made it more obvious rather than less.
+///
+/// So there is no settle constant to tune and no second phase to wait on. If you
+/// find yourself wanting one back, the thing to check first is not the timing: it
+/// is whether the carry is being derived from a stale row. See
+/// [`ScrollManager::arm_scrolloff_overshoot`], which is also where the derivation
+/// that stops the carry from ratcheting the `scrolloff` margin outward is spelled
+/// out.
+///
+/// The safety argument for the whole feature is one line, and it is the reason
+/// the carry is allowed to exist at all: it always moves the view *further along*
+/// the travel direction, which is the one direction in which the cursor retreats
+/// into the viewport rather than toward an edge.
+///
+/// Only *eased* `Scrolloff` reveals feed this. A reveal that snaps is a jump
+/// rather than a glide and resets the gesture instead of joining it.
+/// `Top`/`Center`/`Bottom`, the `apply_scroll_request` route and horizontal
+/// travel never reach it, and with the tween engine off the whole feature is
+/// inert.
+///
+/// The module is `pub(crate)` rather than private so the viewport tests can name
+/// the durations directly instead of hardcoding them: retuning the feel should
+/// not invalidate tests that are supposed to be pinning the mechanism. The
+/// durations are the tunable; the mechanism is not.
+pub(crate) mod key_inertia {
+    use gpui::{Pixels, px};
+    use std::time::Duration;
+
+    /// Key silence that ends a gesture.
+    ///
+    /// Longer than a one-row reveal's own `editor_jump_duration(1) = 66ms`, so
+    /// the last reveal of an ordinary gesture has *landed* on the exact margin
+    /// before the carry is decided. It is not longer than the longest eased
+    /// reveal — a 35-row reveal runs 270ms — which is exactly why the carry is
+    /// measured from the margin rather than from wherever the live position
+    /// happens to be when the window elapses.
+    pub(crate) const GESTURE_IDLE_MS: u64 = 120;
+    /// A gesture has to travel at least this many rows before it may overshoot.
+    ///
+    /// Below this, no carry at all. One deliberate `j` is one row, so it can
+    /// never qualify: precision on a single step outranks any feel effect.
+    pub(crate) const MIN_GESTURE_ROWS: f32 = 3.0;
+    /// Carry rows = gesture rows * this.
+    pub(crate) const OVERSHOOT_RATIO: f32 = 0.25;
+    /// Cap on the carry, in rows, applied *after* `OVERSHOOT_RATIO`.
+    ///
+    /// Reached at `2 / 0.25 = 8` rows, so an 8-row gesture carries the maximum
+    /// and a 12-row one carries the same 2 rows rather than 3. This cap is also
+    /// what bounds how far the carry can move the cursor *inside* the band, and
+    /// therefore what stops the `scrolloff` margin ratcheting outward gesture
+    /// after gesture; see [`ScrollManager::arm_scrolloff_overshoot`].
+    pub(crate) const OVERSHOOT_MAX: f32 = 2.0;
+    /// How long the carry runs. The only leg, so there is nothing to compare it
+    /// against — and nothing to compare it *to*, deliberately; see the module
+    /// doc for the measurement behind that.
+    ///
+    /// It has to be long enough that the deceleration reads as the tail of the
+    /// gesture rather than as a jump at the end of it, and that is its whole
+    /// job.
+    pub(crate) const OVERSHOOT_MS: u64 = 100;
+    /// How far the carry's landing may be from its recorded target and still
+    /// count as having landed.
+    ///
+    /// The engine returns `AnimState::to` verbatim at `t >= 1`, so a landing is
+    /// exact; the tolerance only keeps a future change to the sampler from
+    /// turning "landed" into a coin flip. It is compared against *positions*,
+    /// never against rows, so it cannot mask a whole-row error.
+    ///
+    /// With a single leg this decides nothing about the state any more — a
+    /// landed carry and an interrupted one both end the feature — so it is read
+    /// only to tell those two apart in the trace.
+    pub(crate) const LANDED_EPSILON: Pixels = px(0.01);
+
+    pub(crate) const GESTURE_IDLE: Duration = Duration::from_millis(GESTURE_IDLE_MS);
+    pub(crate) const OVERSHOOT_DURATION: Duration = Duration::from_millis(OVERSHOOT_MS);
+}
+
 /// The vertical wheel gesture currently in progress, or "none".
 ///
 /// Held in a `RefCell` because the wheel event that starts a gesture arrives
@@ -112,6 +222,76 @@ struct WheelGesture {
     target: Option<Pixels>,
 }
 
+/// Which part of the cursor-follow inertia, if any, is in progress.
+///
+/// Exactly one phase is "quiet": `Idle`. Every other phase gives
+/// [`ScrollManager::scroll_needs_frames`] a reason to ask for another frame, so
+/// every other phase carries a deadline that the driver is guaranteed to reach
+/// — either the gesture's idle window, or a tween the engine ends on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyInertiaPhase {
+    /// Nothing collected and no carry in flight. The only phase that asks for no
+    /// further frames.
+    Idle,
+    /// Eased reveals are being folded into a gesture and `last_reveal` is the
+    /// deadline that ends it.
+    Collecting,
+    /// The carry is flying towards `outward_target`.
+    Outward,
+}
+
+/// The cursor-follow inertia in progress, or "none".
+///
+/// Deliberately the same shape as [`WheelGesture`] — an accumulator, a timestamp
+/// that bounds it, and a `None`/`Idle` that is what stops the frame loop — for
+/// the same reasons, and with the same single leg the wheel glide has. The one
+/// difference is that the accumulator is in **visual rows** rather than pixels:
+/// rows are the unit the feature is specified in, and both thresholds are row
+/// counts, so a line-height change mid-gesture cannot corrupt the arithmetic the
+/// way a pixel accumulator's thresholds could.
+#[derive(Debug, Clone, Copy)]
+struct KeyInertia {
+    phase: KeyInertiaPhase,
+    /// Signed travel the gesture has accumulated, in visual rows, in the same
+    /// sign convention as a reveal's own `travel_rows`: **positive means the
+    /// gesture is travelling down the document**, i.e. towards a larger
+    /// `scroll_position().y`. Never a scroll position and never a pixel
+    /// distance, so a line-height change mid-gesture cannot corrupt it.
+    rows: isize,
+    /// Timestamp of the most recent eased reveal. `None` when no gesture is
+    /// collecting, which is what bounds it and what keeps
+    /// [`ScrollManager::scroll_needs_frames`] from being held open.
+    last_reveal: Option<Instant>,
+    /// The exact `scrolloff`-margin row the gesture's last reveal asked for.
+    /// The carry is measured from that row, not from the live position.
+    ///
+    /// This field is written only while `Collecting` and read only by
+    /// [`ScrollManager::step_key_inertia`] on the way to arming the carry; the
+    /// `Outward` phase has no use for it. That is the one place a field like
+    /// this is not speculative — it is the handoff between "a reveal told us the
+    /// margin" and "the window closed, so act on it", and the live position
+    /// cannot serve in its place, because a long eased reveal is still short of
+    /// the margin when the window elapses.
+    settle_row: usize,
+    /// Where the carry is actually flying, read back from the engine *after*
+    /// arming. A carry clipped by the top or bottom of the document lands on the
+    /// clamped value, not on the requested one, and "did it land" has to be asked
+    /// about the value it will really reach.
+    outward_target: Pixels,
+}
+
+impl Default for KeyInertia {
+    fn default() -> Self {
+        Self {
+            phase: KeyInertiaPhase::Idle,
+            rows: 0,
+            last_reveal: None,
+            settle_row: 0,
+            outward_target: px(0.0),
+        }
+    }
+}
+
 /// Manages native scroll state for a document viewport.
 #[derive(Clone, Debug)]
 pub struct ScrollManager {
@@ -135,6 +315,8 @@ pub struct ScrollManager {
     /// Whether the post-gesture glide is allowed at all. When false no
     /// gesture is recorded at all, so the whole feature is inert.
     wheel_glide_enabled: Rc<Cell<bool>>,
+    /// The cursor-follow inertia in progress.
+    key_inertia: Rc<RefCell<KeyInertia>>,
 }
 
 impl ScrollManager {
@@ -156,6 +338,10 @@ impl ScrollManager {
             // The tween engine gate (`smooth_scrolling`) is separate: a glide
             // cannot animate unless the engine is enabled either.
             wheel_glide_enabled: Rc::new(Cell::new(true)),
+            // No separate switch. The feature *is* a tween, so `smooth_scrolling`
+            // is the whole gate and gating it anywhere else could only let the
+            // two disagree.
+            key_inertia: Rc::new(RefCell::new(KeyInertia::default())),
         }
     }
 
@@ -472,6 +658,95 @@ impl ScrollManager {
         gesture.last_event = Some(now);
     }
 
+    /// Ease onto a `Scrolloff` reveal's target and, if the reveal really moved,
+    /// fold it into the pending cursor-follow gesture.
+    ///
+    /// Arming and recording are one call on purpose. Three outcomes have to be
+    /// told apart, and all three can be told apart only *after* the arming:
+    ///
+    ///  - moved: a real step, so it extends the gesture,
+    ///  - a zero-travel reveal — the cursor was already sitting on the margin.
+    ///    It is not a step at all, so it neither extends the idle window nor
+    ///    resets it, the same exclusion the wheel applies to an event with no
+    ///    vertical component,
+    ///  - a target that clamped onto the row the view is already on. That
+    ///    *cancels* rather than arms, nothing moved, so the gesture resets —
+    ///    and the cancel also killed whatever carry was in flight, which has to
+    ///    be cleared here or the driver would sit in `Outward` waiting for a
+    ///    tween that no longer exists.
+    ///
+    /// Deciding it here keeps the reveal in `viewport.rs` a single call on a
+    /// paint path that has to stay trivial.
+    pub(crate) fn ease_scrolloff_reveal_to(
+        &self,
+        target: Point<Pixels>,
+        travel_rows: isize,
+        settle_row: usize,
+        duration: Duration,
+    ) {
+        self.animate_scroll_to(target, duration);
+        if travel_rows != 0 && !self.scroll_animation_active() {
+            self.clear_scrolloff_inertia();
+        } else {
+            self.record_scrolloff_reveal(travel_rows, settle_row);
+        }
+    }
+
+    /// Fold one **eased** `Scrolloff` reveal into the pending key gesture.
+    ///
+    /// `travel_rows` is the reveal's own signed travel in visual rows and
+    /// `settle_row` the exact row it eases onto. Only the eased path calls this;
+    /// a reveal that snapped reaches [`Self::clear_scrolloff_inertia`] instead.
+    ///
+    /// A direction flip restarts the accumulation rather than netting against
+    /// it, for [`Self::record_wheel_gesture`]'s reason: a down-then-up gesture
+    /// that nets to nearly nothing would either not carry at all or carry in a
+    /// direction the user did not end on.
+    ///
+    /// Setting the phase to `Collecting` unconditionally is also how a reveal
+    /// that arrives while a carry is in flight drops that carry. The reveal arms
+    /// its own tween and the engine replaces whatever was flying, so the carry
+    /// can no longer reach its recorded target — and the new margin is the one
+    /// the next carry is measured from, which is exactly why the phase is put
+    /// back to `Collecting` rather than left at `Outward`.
+    pub(crate) fn record_scrolloff_reveal(&self, travel_rows: isize, settle_row: usize) {
+        // The gate is the tween engine, not a switch of its own: the carry is
+        // made of tweens, so with the engine off the feature is inert and must
+        // not touch any state.
+        if !self.scroll_animation_enabled() || travel_rows == 0 {
+            return;
+        }
+
+        let mut state = *self.key_inertia.borrow();
+        if state.rows != 0 && (travel_rows > 0) != (state.rows > 0) {
+            state.rows = 0;
+        }
+        state.rows += travel_rows;
+        state.settle_row = settle_row;
+        state.last_reveal = Some(Instant::now());
+        state.phase = KeyInertiaPhase::Collecting;
+        *self.key_inertia.borrow_mut() = state;
+    }
+
+    /// Forget every byte of cursor-follow inertia, carry included.
+    fn reset_key_inertia(&self) {
+        *self.key_inertia.borrow_mut() = KeyInertia::default();
+    }
+
+    /// Drop the cursor-follow inertia because something else has taken the view:
+    /// a reveal that snapped, or a carry whose tween was killed underneath it.
+    ///
+    /// A no-op while the tween engine is off, which is also the state
+    /// [`Self::set_scroll_animation_enabled`] leaves the feature in when it
+    /// turns the engine off, so the disabled configuration never writes this
+    /// cell at all.
+    pub(crate) fn clear_scrolloff_inertia(&self) {
+        if !self.scroll_animation_enabled() {
+            return;
+        }
+        self.reset_key_inertia();
+    }
+
     /// Set the scroll position from an external view sync while retaining a
     /// local sub-row pixel offset if both positions point at the same top row.
     ///
@@ -665,6 +940,13 @@ impl ScrollManager {
     /// Enable or disable smooth scrolling of discrete scroll requests.
     pub(crate) fn set_scroll_animation_enabled(&self, enabled: bool) {
         self.animation.set_enabled(enabled);
+        if !enabled {
+            // The cursor-follow inertia *is* a tween, so switching the engine off
+            // strands it. Dropping it here is what makes the frame loop stop on
+            // the next frame instead of waiting out a gesture window and then
+            // trying to arm a tween it can no longer run.
+            self.reset_key_inertia();
+        }
     }
 
     pub(crate) fn scroll_animation_enabled(&self) -> bool {
@@ -676,31 +958,49 @@ impl ScrollManager {
     /// This is deliberately a predicate of *desired* motion rather than of
     /// per-frame movement: a frame that produces no pixel change must still
     /// schedule the next one, otherwise a tween stalls and never completes.
-    /// It covers two things, both of which terminate on their own:
+    /// It covers three things, all of which terminate on their own:
     ///
     ///  - the scroll tween, which is the discrete jump, the in-gesture wheel
-    ///    tween onto the accumulated target, or the post-stop glide, and
+    ///    tween onto the accumulated target, the post-stop glide, or the
+    ///    cursor-follow carry,
     ///  - a wheel gesture that has not yet gone idle, which needs the idle
-    ///    window to elapse before it can arm (or decline to arm) its glide.
+    ///    window to elapse before it can arm (or decline to arm) its glide,
+    ///  - a cursor-follow gesture that has not yet gone idle, or the carry of one
+    ///    that has, which need the same window and the same engine deadline.
     ///
-    /// The second term is a *deadline*, not a stall: once `now - last_event`
-    /// passes the idle window [`Self::advance_wheel_glide`] clears the gesture
-    /// unconditionally, so a gesture that ends below the arming thresholds
-    /// leaves nothing pending here and the loop stops.
+    /// The second and third terms are *deadlines*, not stalls: once
+    /// `now - last_event` (or `now - last_reveal`) passes its idle window,
+    /// [`Self::advance_wheel_glide`] and [`Self::advance_scrolloff_inertia`]
+    /// clear the pending gesture unconditionally, so a gesture that ends below
+    /// its arming thresholds leaves nothing pending here and the loop stops.
     ///
     /// The first term terminates on its own schedule and is not re-armed by the
     /// frame loop: only input re-arms it. Each arming hands the tween a fresh
-    /// `TWEEN_DURATION` deadline, and `ScrollAnimation::advance` cancels it as
-    /// soon as a sample reaches `t = 1`, so a gesture cannot keep it alive
-    /// indefinitely. Nothing in the frame path calls back into `scroll_by_delta`
-    /// or any `animate_*`, so a tween is never extended by a frame.
+    /// full-duration deadline, and `ScrollAnimation::advance` cancels it as
+    /// soon as a sample reaches `t = 1`, so neither a gesture nor a carry can
+    /// keep it alive indefinitely. Nothing in the frame path calls back into a
+    /// reveal or any `animate_*`, so a tween is never extended by a frame.
     pub(crate) fn scroll_needs_frames(&self) -> bool {
-        self.animation.is_active() || self.wheel_gesture_pending()
+        self.animation.is_active()
+            || self.wheel_gesture_pending()
+            || self.key_inertia_pending()
     }
 
     /// Whether a wheel gesture is still waiting for its idle window to elapse.
     fn wheel_gesture_pending(&self) -> bool {
         self.wheel_glide_enabled.get() && self.wheel_gesture.borrow().last_event.is_some()
+    }
+
+    /// Whether a cursor-follow gesture is still collecting, or its carry is in
+    /// flight.
+    ///
+    /// Gated on the tween engine for the same reason
+    /// [`Self::wheel_gesture_pending`] is gated on the wheel switch: with
+    /// nothing to tween with, the whole feature is inert and must not hold the
+    /// frame loop open.
+    fn key_inertia_pending(&self) -> bool {
+        self.scroll_animation_enabled()
+            && self.key_inertia.borrow().phase != KeyInertiaPhase::Idle
     }
 
     pub(crate) fn scroll_animation_active(&self) -> bool {
@@ -860,6 +1160,223 @@ impl ScrollManager {
         // loop still ends either way — the gesture is already cleared and there
         // is no tween to keep alive.
         self.animation.is_active()
+    }
+
+    /// Advance the cursor-follow inertia to `now`, arming the carry if one is
+    /// due. Returns whether a carry was armed.
+    ///
+    /// Call this once per rendered frame, for as long as
+    /// [`Self::scroll_needs_frames`] is true. The phases and their outcomes:
+    ///
+    ///  - `Idle`: nothing to do.
+    ///  - `Collecting`, still inside the idle window: return false and change
+    ///    nothing. The caller keeps requesting frames, because the gesture is
+    ///    still going to need a decision.
+    ///  - `Collecting`, the window elapsed: **clear the gesture unconditionally**,
+    ///    above every threshold check, then arm the carry if the gesture travelled
+    ///    far enough. That clear is the termination guarantee — a gesture that
+    ///    survived this point would keep `scroll_needs_frames()` true forever and
+    ///    the frame loop would never terminate. It is the single highest-risk
+    ///    failure in the feature, so it does not depend on the threshold outcome
+    ///    or on whether the arming below ends up arming anything.
+    ///  - `Outward`, carry still flying: do nothing. The carry is a bounded tween
+    ///    and the engine ends it.
+    ///  - `Outward`, carry gone: the feature is over, whether it landed on its
+    ///    recorded target or was interrupted by something with a stronger claim
+    ///    on the view — a native scrollbar drag, a Helix view sync, a wheel
+    ///    notch, the engine being switched off. Both go to `Idle`, because with a
+    ///    single leg there is nothing left to arm; the landing check only decides
+    ///    which of the two the trace reports. An interrupted carry is not a stall
+    ///    either: the tween that was killed is gone, so the *next* frame's
+    ///    `key_inertia_pending()` is already false and the loop stops instead of
+    ///    spinning on a tween that no longer exists.
+    ///
+    /// The carry is an ordinary tween, so the frame driver samples it through
+    /// [`Self::advance_scroll_animation_at`] exactly like any other tween — this
+    /// method only decides what comes next, and only when nothing is flying.
+    pub(crate) fn advance_scrolloff_inertia(&self, now: Instant) -> bool {
+        if !self.scroll_animation_enabled() {
+            return false;
+        }
+
+        // Worked on as a copy and written back once, so the `RefCell` is never
+        // held across an arming call. `advance_wheel_glide` reads its state out
+        // for the same reason.
+        let mut state = *self.key_inertia.borrow();
+        let armed = self.step_key_inertia(&mut state, now);
+        *self.key_inertia.borrow_mut() = state;
+        armed
+    }
+
+    /// One step of [`Self::advance_scrolloff_inertia`], on a caller-owned copy
+    /// of the state.
+    fn step_key_inertia(&self, state: &mut KeyInertia, now: Instant) -> bool {
+        match state.phase {
+            KeyInertiaPhase::Idle => false,
+
+            KeyInertiaPhase::Collecting => {
+                let Some(last_reveal) = state.last_reveal else {
+                    // Unreachable by construction: `Collecting` is only ever
+                    // entered together with a timestamp. Treated as a clear
+                    // rather than an `unreachable!()` so a future edit that gets
+                    // it wrong ends the frame loop instead of panicking inside a
+                    // frame.
+                    *state = KeyInertia::default();
+                    return false;
+                };
+                if now.saturating_duration_since(last_reveal) < key_inertia::GESTURE_IDLE {
+                    return false;
+                }
+
+                // The gesture is over. It is dropped before the threshold is
+                // even consulted, so neither an insignificant gesture nor a
+                // feature switched off mid-gesture can leave a frame loop
+                // running. The clear covers the whole struct, carry included.
+                let travelled = state.rows;
+                let settle_row = state.settle_row;
+                *state = KeyInertia::default();
+
+                if (travelled.abs() as f32) < key_inertia::MIN_GESTURE_ROWS {
+                    return false;
+                }
+                // A carry *is* a tween, so it needs the engine. That is already
+                // guaranteed by the gate at the top of
+                // `advance_scrolloff_inertia`; it is not re-tested here because
+                // this function has no other caller, and duplicating the check
+                // would invite the two to drift.
+                self.arm_scrolloff_overshoot(state, travelled, settle_row, now)
+            }
+
+            KeyInertiaPhase::Outward => {
+                if self.animation.is_active() {
+                    return false;
+                }
+                // The tween is gone, so there is nothing left to fly: with one
+                // leg this is the end of the feature either way. It is worth
+                // knowing *which* way, because the two mean different things —
+                // a landing is the carry finishing as designed, while a position
+                // away from the recorded target means something with a stronger
+                // claim on the view took it (a native scrollbar drag, a Helix
+                // view sync, a wheel notch) and the feature must not fight that.
+                // The check therefore decides what the trace says; it no longer
+                // decides what the state says, because there is no second leg
+                // that only a landing is allowed to arm.
+                let landed = (self.scroll_position.get().y - state.outward_target).abs()
+                    <= key_inertia::LANDED_EPSILON;
+                trace!(
+                    landed,
+                    target_y = ?state.outward_target,
+                    "cursor-follow carry ended"
+                );
+                *state = KeyInertia::default();
+                false
+            }
+        }
+    }
+
+    /// Arm the carry for a gesture that has ended and travelled far enough.
+    /// `travelled` is its signed row travel and `settle_row` the exact
+    /// `scrolloff`-margin row its last reveal eased onto, which is the row the
+    /// carry is measured from.
+    fn arm_scrolloff_overshoot(
+        &self,
+        state: &mut KeyInertia,
+        travelled: isize,
+        settle_row: usize,
+        now: Instant,
+    ) -> bool {
+        // ### Why carrying is safe
+        //
+        // The carry always moves the view *further along the direction the
+        // gesture was already travelling*, and that is precisely the one
+        // direction in which the cursor retreats into the viewport rather than
+        // being pushed toward an edge:
+        //
+        //  - scrolling DOWN, the position grows, so the cursor's offset within
+        //    the viewport *decreases* — away from the bottom edge it had come to
+        //    rest against,
+        //  - scrolling UP, the position shrinks, so the offset *increases* —
+        //    away from the top edge.
+        //
+        // Inverting this sign would turn the whole feature into a way to push
+        // the cursor off the bottom of the screen, which is the one outcome
+        // that must never ship. That is why the direction is asserted in the
+        // tests against the cursor's offset within the viewport, and not only
+        // against the sign of the position.
+        //
+        // ### Why the margin cannot ratchet
+        //
+        // There is no return leg any more, so the obvious worry is that the
+        // margin creeps outward gesture after gesture until the configured
+        // `scrolloff` is fiction. It is bounded, and the reason is that the
+        // carry's base is the *fresh* margin row of the gesture's last reveal,
+        // not a running total. Worked through with `visible_rows = 40` and
+        // `margin = 5`, so the band fires forward at
+        // `cursor >= top + visible_rows - margin = top + 35` and the reveal's
+        // target row is `cursor + margin + 1 - visible_rows = cursor - 34`:
+        //
+        // ```
+        // reveal fires   cursor >= top + 35, target row `cursor - 34`, so the
+        //                cursor ends up 34 rows below the top — `margin = 5`
+        //                rows above the last visible row
+        // carry 2 rows   top += 2, so the cursor is 32 rows below the top, i.e.
+        //                7 rows from the bottom edge
+        // next fire      the band only fires again at `cursor >= top + 35`, so
+        //                the cursor has to walk back in by 3 rows first. Its
+        //                target is then `cursor - 34` *again*, and the carry is
+        //                measured from that row again — never from where the
+        //                previous carry left the pixels
+        // carry 2 rows   7 rows from the bottom edge again, and again after that
+        // ```
+        //
+        // In general, after a carry the cursor sits
+        // `(target_row + carry_rows + visible_rows - 1) - cursor`, and
+        // `target_row = cursor - visible_rows + margin + 1`, so that distance is
+        // exactly `margin + carry_rows`. It depends on *this* round's carry and
+        // nothing that came before: each reveal re-anchors the band to the
+        // current `dest_row`, so the previous carry is already inside the base
+        // rather than added to it. And `carry_rows = min(rows * RATIO, MAX)` is
+        // capped at [`key_inertia::OVERSHOOT_MAX`], so the distance can never
+        // exceed `margin + OVERSHOOT_MAX` — 7 rows here, for a capped gesture,
+        // every single time. A test pins exactly that across three rounds
+        // (`repeated_carries_hold_the_margin_instead_of_ratcheting`).
+        //
+        // The same arithmetic is the reason the carry is measured from
+        // `settle_row` rather than from the live position: an eased reveal is
+        // still short of its target when the idle window elapses, and measuring
+        // from where the pixels happen to be would make the carry's length depend
+        // on how long the reveal was.
+        let carry_rows = (travelled.abs() as f32 * key_inertia::OVERSHOOT_RATIO)
+            .min(key_inertia::OVERSHOOT_MAX);
+        let carry = carry_rows * self.line_height();
+        let direction = if travelled > 0 { 1.0 } else { -1.0 };
+        let settle_px = self.anchor_to_pixels(settle_row);
+        let current = self.scroll_position.get();
+
+        self.animate_scroll_to_at(
+            point(current.x, settle_px + direction * carry),
+            key_inertia::OVERSHOOT_DURATION,
+            now,
+        );
+
+        // Liveness is read back rather than assumed, and the landing target with
+        // it: a carry at the very top or bottom of the document clamps onto the
+        // margin the gesture already reached, which cancels instead of arming.
+        // Entering `Outward` with no tween would be a phase the frame loop could
+        // never advance, so the whole feature is dropped instead — and the
+        // recorded target is the *clamped* one, so "did it land" is asked about
+        // where the carry will really stop.
+        match self.animation.destination() {
+            Some(landed) => {
+                state.phase = KeyInertiaPhase::Outward;
+                state.outward_target = landed;
+                true
+            }
+            None => {
+                *state = KeyInertia::default();
+                false
+            }
+        }
     }
 
     /// The animation destination while a tween is in flight, otherwise the live

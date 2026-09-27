@@ -33,6 +33,7 @@ pub struct EditorViewState {
     line_height: Rc<Cell<Pixels>>,
     gutter_extra_columns: Rc<Cell<u16>>,
     gutter_run_button_lines: Rc<RefCell<Vec<usize>>>,
+    cursor_reveal_armed_motion: Rc<Cell<bool>>,
 }
 
 pub struct EditorViewFrameState {
@@ -81,6 +82,7 @@ impl EditorViewState {
             line_height: Rc::new(Cell::new(line_height)),
             gutter_extra_columns: Rc::new(Cell::new(0)),
             gutter_run_button_lines: Rc::new(RefCell::new(Vec::new())),
+            cursor_reveal_armed_motion: Rc::new(Cell::new(false)),
         }
     }
 
@@ -132,6 +134,17 @@ impl EditorViewState {
 
     pub fn request_cursor_reveal(&self, reveal: EditorCursorReveal) {
         self.viewport.request_cursor_reveal(reveal);
+    }
+
+    /// Whether the most recent `sync_frame_layout` armed scroll motion.
+    ///
+    /// Read by `view_component.rs` either side of paint, because paint is the
+    /// only place a cursor reveal is applied and a tween armed there has
+    /// already missed the frame driver's `scroll_needs_frames()` check for
+    /// this frame. `Rc<Cell<_>>` so the value is shared with every clone of
+    /// the state, matching the rest of the render-phase state.
+    pub fn cursor_reveal_armed_motion(&self) -> bool {
+        self.cursor_reveal_armed_motion.get()
     }
 
     pub fn clear_cursor_reveal_request(&self) {
@@ -263,6 +276,12 @@ impl EditorViewState {
         let viewport_update = self
             .viewport
             .sync_surface_layout(editor, doc_id, view_id, layout)?;
+
+        // Written on every layout sync, not only on the frames that take a
+        // reveal, so the render pass can read it as a per-paint level rather
+        // than as a latched event.
+        self.cursor_reveal_armed_motion
+            .set(viewport_update.cursor_revealed);
 
         self.overlay_state
             .set_gutter_width_from_columns(viewport_update.gutter_columns, layout.cell_width);

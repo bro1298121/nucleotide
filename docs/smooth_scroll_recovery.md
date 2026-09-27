@@ -12,9 +12,9 @@ Three motions are in scope, all editor-viewport only:
 
 | Motion | Status |
 |---|---|
-| Eased discrete jump (`page_down`/`page_up`, `scroll_down`/`scroll_up`) | Animates; landing is wrong |
-| Cursor-follow easing (`h`/`j`/`k`/`l`) | **Not implemented** — view jumps instantly |
-| Wheel glide / inertia | **Not implemented** — wheel is 1:1 |
+| Eased discrete jump (`page_down`/`page_up`, `scroll_down`/`scroll_up`) | **Done, user-verified** |
+| Cursor-follow easing (`h`/`j`/`k`/`l`) | **Done, user-verified**, plus a one-way gesture carry |
+| Mouse wheel | **Done, user-verified** — per-notch easing and a post-stop glide |
 
 Correctness outranks feel: a cursor that is off-screen is a bug, not a tuning problem.
 
@@ -175,16 +175,51 @@ the accumulator set, the frame loop would never terminate.
 Constants: `RATIO 0.25 / MAX_PX 120 / GLIDE_MS 140 / ARM_MIN_PX 72 / ARM_MIN_EVENTS 2 /
 GESTURE_IDLE_MS 90`. Gated behind its own config key, default true.
 
-## Phase 3b — Cursor-follow easing (not started)
+## Phase 3b — Cursor-follow easing (DONE, user-verified)
 
-`h`/`j`/`k`/`l` are still instant. This is the higher-risk of the two remaining motions: the
-reveal path fights the tween by design, and a wrong discriminator makes the viewport fight
-its own cursor, which is worse than no animation. Safe fallback if it proves unstable: keep
-the discrete tween and ease only the short case.
+`h`/`j`/`k`/`l` are eased. The `Scrolloff` reveal arms a tween over
+`editor_jump_duration(1) = 66ms`; it snaps instead when the travel exceeds
+`visible_rows - margin`, because past that the cursor leaves the *painted* band and is not
+drawn at all (`document_frame_painter.rs` returns `None` outside the rendered range).
+`Top`/`Center`/`Bottom` and the `apply_scroll_request` route stay instant, pinned by tests.
 
-**If cursor-follow reads as "not obvious", do not lengthen the duration.** The likelier cause
-is that cursor moves never triggered a scroll at all, because reveal only fires when the
-cursor crosses the `scrolloff` margin. Diagnose before touching a constant.
+Two prerequisites had to land first, and neither was optional:
+
+1. **The band origin had to move to the destination row.** Measured, not predicted: a
+   `page_down` tween put the destination at row 40 with the cursor at row 45, and a band
+   built from the mid-tween row 5 judged it out of band and dragged the view to row 11.
+2. **A tween armed during paint needs a frame.** The frame driver consults
+   `scroll_needs_frames()` at the top of `render`, but a reveal is applied in the paint
+   closure, which GPUI runs *after* `render` returns. The follow-up frame is scheduled with
+   `cx.notify` from a `cx.defer` — and it must **not** also call `request_animation_frame`,
+   which unwraps an empty `rendered_entity_stack` from a defer and panics
+   (`gpui/src/window.rs:4315`). 398 green tests did not catch that one; only a real held
+   `j` did.
+
+## Phase 3c — Per-notch wheel easing (DONE, user-verified)
+
+The 1:1 model was replaced after the user felt it: a Windows wheel delivers ~120px notches,
+so 1:1 instant looked like a jump per notch. Each notch now retargets an 80ms tween onto
+the gesture's accumulated destination. `scroll_by_delta` must report the **destination**,
+because `surface.rs`'s `if !scroll_update.changed { return; }` would otherwise swallow the
+update, and an armed tween with no frame never runs.
+
+## Phase 3d — Key gesture carry (DONE, pending user verification)
+
+A run of eased reveals is a gesture; on idle the view carries further along the travel
+direction and **stops there**. Constants: `GESTURE_IDLE_MS 120 / MIN_GESTURE_ROWS 3 /
+OVERSHOOT_RATIO 0.25 / OVERSHOOT_MAX 2 / OVERSHOOT_MS 100`.
+
+**The carry is one-way, and that is the whole design.** It shipped with a settle leg twice
+and both read as a rebound. The reason duration was never the variable: in the first attempt
+(50ms out, 60ms back) the return's peak speed was already *lower* than the throw's and it
+still read as a rebound. A reversal is noticed for existing, not for being fast.
+
+The settle leg was believed necessary to stop the margin ratcheting. It is self-limiting —
+the band is anchored to the top row against a fixed margin, so the resting distance is
+`margin + min(rows * OVERSHOOT_RATIO, OVERSHOOT_MAX)`, bounded at 7 rows — and the user
+accepted that steady state. `repeated_carries_hold_the_margin_instead_of_ratcheting` is the
+guard for it.
 
 ## Phase 4 — Cleanup and validation
 

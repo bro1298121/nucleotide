@@ -60,6 +60,20 @@ pub struct EditorViewportSurfaceUpdate {
     pub view_position: ViewPosition,
     pub view_position_plan: EditorViewportViewPositionPlan,
     pub helix_view_synced: bool,
+    /// This paint's cursor reveal armed motion, by any route: an instant
+    /// alignment jump, a `Scrolloff` travel that stranded the cursor, or a
+    /// `Scrolloff` tween that is now in flight.
+    ///
+    /// It is the *only* way out of paint for a tween that was armed during
+    /// paint. The frame driver in `view_component.rs` consults
+    /// `scroll_needs_frames()` at the top of `render`, which has already run
+    /// by the time this is written, so a tween armed below it has no frame
+    /// left to advance it unless the render pass is told to schedule one.
+    ///
+    /// This is a per-paint *level*, rewritten on every layout sync rather than
+    /// latched, and `view_component.rs` compares it across the paint as a
+    /// transition. A paint that merely *finishes* an armed tween also reports
+    /// `true`, and must not schedule another frame for it.
     pub cursor_revealed: bool,
     pub helix_snapshot: HelixViewportSnapshot,
 }
@@ -590,6 +604,14 @@ impl EditorViewport {
         let old_top_visual_row = self.top_visual_row();
 
         if rows != 0 {
+            // A discrete jump is a deliberate, absolute move. Any cursor-follow
+            // inertia still collecting from an earlier `j`/`k` run must be dropped
+            // here: its carry is aimed at the margin that was current *before* this
+            // jump, so letting the gesture window close afterwards would ease the
+            // view toward a stale position the user never asked for. The carry's
+            // landing check only guards a carry that is already in flight, not a
+            // gesture that is still collecting, so the clear belongs here.
+            self.scroll.clear_scrolloff_inertia();
             let delta_y = self.scroll.line_height() * rows as f32;
             let target = point(old_position.x, old_position.y + delta_y);
             if self.scroll.scroll_animation_enabled() {
@@ -672,6 +694,34 @@ impl EditorViewport {
         self.reveal_visual_row(visual_row, EditorCursorReveal::Scrolloff, scrolloff)
     }
 
+    /// Bring `visual_row` into view under `reveal`'s alignment rule.
+    ///
+    /// `Scrolloff` is the only reveal that eases. It is also the only one that
+    /// fires constantly — every `j`/`k` that walks the cursor off the scrolloff
+    /// margin — and the only one whose travel is bounded by that margin, so its
+    /// tween is a one-row move. `Top`/`Center`/`Bottom` are deliberate
+    /// alignment jumps and stay instant, as does the whole
+    /// `apply_scroll_request` route, which only queues a request.
+    ///
+    /// # The band origin is the destination, not the live row
+    ///
+    /// The `Scrolloff` band is measured from
+    /// [`ScrollManager::destination_position`], which resolves to the live
+    /// position while idle and to the tween's target while one is in flight.
+    /// `top_visual_row()` would be a mid-tween row, and a band built around a
+    /// row the viewport is still passing through judges a cursor that is
+    /// comfortably inside the *destination* band to be outside it. The traced
+    /// `page_down` case put the destination at row 40 with the cursor at row 45
+    /// and dragged the view to row 11 instead.
+    ///
+    /// # Applying the target retargets, never cancels
+    ///
+    /// A target is applied through [`ScrollManager::animate_scroll_to`], which
+    /// arms a fresh tween from the live position and replaces whatever was in
+    /// flight. The instant `set_scroll_position` path arrives with
+    /// `from_native_view = true` and cancels unconditionally, so it cannot be
+    /// used here: it would take down the very tween the reveal is being
+    /// applied on top of.
     pub fn reveal_visual_row(
         &self,
         visual_row: usize,
@@ -682,8 +732,16 @@ impl EditorViewport {
         let old_top_visual_row = self.top_visual_row();
         let visible_rows = self.visible_visual_rows();
         let tween_active = self.scroll_animation_active();
+        // Band origin. `destination_position()` is the live position while idle
+        // and the tween's target while one is in flight, so this is the row the
+        // view *will* be at when the reveal lands — the only row a scrolloff
+        // band can be meaningfully measured against.
         let tween_destination_row =
             self.scroll.pixels_to_anchor(self.scroll.destination_position().y);
+        // The scrolloff margin, clamped so a viewport too short to hold two
+        // margins plus a row still has a usable band. Only `Scrolloff` reads it;
+        // the other three rules align to an absolute row.
+        let margin = scrolloff.min(visible_rows.saturating_sub(1) / 2);
 
         // Entry log. `old_top_visual_row` is the *live* row, so during a tween
         // it is mid-flight rather than the destination; comparing it against
@@ -703,11 +761,9 @@ impl EditorViewport {
 
         let target_top = match reveal {
             EditorCursorReveal::Scrolloff => {
-                let margin = scrolloff.min(visible_rows.saturating_sub(1) / 2);
-                let top_visual_row = self.top_visual_row();
-                let lower_bound = top_visual_row.saturating_add(margin);
+                let lower_bound = tween_destination_row.saturating_add(margin);
                 let upper_bound =
-                    top_visual_row.saturating_add(visible_rows.saturating_sub(margin));
+                    tween_destination_row.saturating_add(visible_rows.saturating_sub(margin));
 
                 if visual_row < lower_bound {
                     Some(visual_row.saturating_sub(margin))
@@ -729,19 +785,82 @@ impl EditorViewport {
             }
         };
 
+        // Rows the view has to travel to reach the target the band chose,
+        // measured from the row the band itself was measured against. For the
+        // ordinary `Scrolloff` case this is exactly 1: the band fires as the
+        // cursor crosses the margin, and the target restores that margin.
+        let travel_rows = target_top
+            .map(|target| target as isize - tween_destination_row as isize)
+            .unwrap_or(0);
+
+        // Ease only when the cursor survives the flight inside the painted
+        // band. The hazard is the cursor leaving that band, not the distance
+        // travelled: a line outside the rendered range is not painted at all
+        // (`document_frame_painter.rs` returns `None` for it), so the cursor
+        // would simply vanish for the duration of the tween.
+        //
+        // The band spans `visible_rows` rows, the cursor is at most `margin`
+        // rows inside whichever edge fired, and the view is about to travel
+        // `travel_rows`, so the cursor ends up off the far edge exactly when
+        // `travel_rows > visible_rows - margin`. That threshold self-scales
+        // with the window instead of being a fixed row count: a one-row
+        // `Scrolloff` reveal is always far inside the band and must never snap,
+        // while a `G` of thousands of rows must.
+        //
+        // `visible_rows >= 1` and `margin <= (visible_rows - 1) / 2`, so the
+        // subtraction cannot underflow.
+        let eased = target_top.is_some()
+            && matches!(reveal, EditorCursorReveal::Scrolloff)
+            && travel_rows.unsigned_abs() <= visible_rows - margin
+            && self.smooth_scrolling_enabled();
+
         if let Some(target_top) = target_top {
-            // Deliberately uses the instant `set_scroll_position` path: a cursor
-            // reveal has to be correct on the very next frame, so it never goes
-            // through the smooth tween.
-            self.scroll.set_scroll_position(
-                point(old_position.x, self.scroll.anchor_to_pixels(target_top)),
-                "reveal_visual_row",
-            );
+            let target = point(old_position.x, self.scroll.anchor_to_pixels(target_top));
+
+            if eased {
+                // `animate_scroll_to` arms a *fresh*, full-duration tween from
+                // the live position, replacing whatever was in flight. That is
+                // deliberate: `retarget_from` carries the remaining budget
+                // forward instead, and holding `j` re-arms roughly every 33ms,
+                // which would collapse `remaining` onto its one-frame floor and
+                // pin the tween at its origin so the view never travels. Same
+                // argument as the wheel notch in `scroll_manager.rs`.
+                //
+                // The duration is the one every other viewport tween uses. The
+                // distance already bounds the cost — one row is 66ms — so a
+                // second constant ladder for the same value would be a second
+                // thing to tune wrong.
+                //
+                // `ease_scrolloff_reveal_to` is `animate_scroll_to` plus the
+                // cursor-follow gesture bookkeeping, in one call so that this
+                // paint path stays a single statement: an eased reveal is
+                // exactly what a `j`/`k` hold looks like from here, and it is the
+                // only thing that may contribute to the gesture.
+                self.scroll.ease_scrolloff_reveal_to(
+                    target,
+                    travel_rows,
+                    target_top,
+                    editor_jump_duration(travel_rows),
+                );
+            } else {
+                // Still the instant path, and still the one that cancels: this
+                // is where a deliberate alignment jump, a `Scrolloff` travel
+                // that would strand the cursor, and the no-smooth-scrolling
+                // configuration all land.
+                //
+                // A snap is a jump rather than a glide, so it resets the
+                // cursor-follow gesture instead of joining it — and the instant
+                // write below cancels whatever tween was in flight, which kills
+                // a carry of that gesture in the same stroke.
+                self.scroll.clear_scrolloff_inertia();
+                self.scroll
+                    .set_scroll_position(target, "reveal_visual_row");
+            }
         }
 
-        // Result log. `target_top` is the row the band chose, which is the row
-        // the instant jump above moved to. `None` means the band judged the
-        // cursor already visible and nothing moved.
+        // Result log. `target_top` is the row the band chose; `eased` says
+        // whether it was reached by a tween or by an instant write. `None`
+        // means the band judged the cursor already visible and nothing moved.
         trace!(
             reason = "reveal_visual_row",
             old_top_visual_row,
@@ -749,18 +868,27 @@ impl EditorViewport {
             tween_destination_row,
             visual_row,
             target_top = ?target_top,
+            travel_rows,
+            eased,
             new_top_visual_row = self.top_visual_row(),
             "EditorViewport reveal applied"
         );
 
-        let new_position = self.scroll_position();
-        let new_top_visual_row = self.top_visual_row();
+        // Report the destination, not the live position, for the same reason
+        // `scroll_by_visual_rows` does: an armed tween has not moved the
+        // viewport yet, but the caller still has to learn that the request
+        // moved the top visual row, because it decides `cx.notify()` and feeds
+        // the Helix cursor sync. Reporting the live row would make a one-row
+        // eased reveal report `changed: false`, and the frame that drives the
+        // tween would never be requested.
+        let new_position = self.scroll.destination_position();
+        let new_top_visual_row = self.scroll.pixels_to_anchor(new_position.y);
 
         ViewportScrollUpdate {
             changed: old_position != new_position,
             crossed_visual_rows: new_top_visual_row as isize - old_top_visual_row as isize,
             top_visual_row: new_top_visual_row,
-            offset_within_row: self.offset_within_row(),
+            offset_within_row: self.offset_within_row_for(new_position.y),
         }
     }
 
@@ -1235,7 +1363,8 @@ impl EditorViewport {
     /// This is about *desired* motion, not per-frame movement: a frame that
     /// moves no pixels still has to schedule the next one, otherwise a tween
     /// stalls. Do not collapse this into `scroll_animation_active()`; it also
-    /// covers a wheel gesture that is waiting out its idle window.
+    /// covers a wheel gesture that is waiting out its idle window, and a
+    /// cursor-follow gesture that is doing the same or is mid-flight.
     pub fn scroll_needs_frames(&self) -> bool {
         self.scroll.scroll_needs_frames()
     }
@@ -1275,6 +1404,21 @@ impl EditorViewport {
     /// long as [`Self::scroll_needs_frames`] holds.
     pub fn advance_wheel_glide(&self, now: std::time::Instant) -> bool {
         self.scroll.advance_wheel_glide(now)
+    }
+
+    /// Advance the cursor-follow inertia to `now`, arming the carry when a
+    /// gesture has gone idle and travelled far enough. Returns whether a carry
+    /// was armed.
+    ///
+    /// `now` is a parameter rather than a clock read inside so the whole
+    /// sequence is reproducible under an injected instant, exactly as for
+    /// [`Self::advance_wheel_glide`]. Call once per rendered frame, alongside
+    /// [`Self::advance_scroll_animation`] and [`Self::advance_wheel_glide`], for
+    /// as long as [`Self::scroll_needs_frames`] holds. It never arms a carry
+    /// while a tween is in flight, so it must run *after* the tween has been
+    /// sampled.
+    pub fn advance_scrolloff_inertia(&self, now: std::time::Instant) -> bool {
+        self.scroll.advance_scrolloff_inertia(now)
     }
 
     pub fn visible_visual_range(&self) -> (usize, usize) {
@@ -1582,6 +1726,8 @@ mod tests {
         view::ViewPosition,
     };
 
+    use crate::scroll_manager::key_inertia::OVERSHOOT_DURATION;
+
     use super::*;
 
     fn default_annotations() -> TextAnnotations<'static> {
@@ -1831,109 +1977,494 @@ mod tests {
         assert!(!viewport.scroll_animation_active());
     }
 
-    /// Reproduces the traced `page_down` failure and pins the mechanism the
-    /// workspace fix depends on.
+    /// A `Scrolloff` fixture big enough for the eased path to be measurable.
     ///
-    /// The trace: a page scroll arms a tween, `sync_cursor_after_native_page_scroll`
-    /// moves the Helix cursor into the *destination* page, `handle_selection_changed`
-    /// arms a `Scrolloff` reveal, and the next painted frame consumes that reveal
-    /// against the still-mid-tween `top_visual_row` and takes the tween down.
+    /// 800x800 bounds at a 20px line height give
+    /// `visible_visual_rows() = floor(800 / 20) = 40`. With `scrolloff = 5` that
+    /// is a band of rows `origin + 5 ..= origin + 35`, and the snap threshold is
+    /// `visible_rows - margin = 35` rows of travel.
     ///
-    /// `Workspace::handle_viewport_scroll` now calls `clear_cursor_reveal_request`
-    /// after the cursor sync, i.e. it *discards* the armed request. This asserts
-    /// that discarding is sufficient: the tween must run to its destination, while
-    /// applying the very same request one frame earlier kills it.
-    ///
-    /// This does not cover the workspace wiring itself — `handle_viewport_scroll`
-    /// needs a `Context<Workspace>` and cannot be driven headlessly. It covers the
-    /// viewport contract the wiring relies on.
-    #[test]
-    fn page_scroll_reveal_kills_the_tween_only_when_it_is_applied() {
-        // Applying the armed reveal is what kills the tween.
-        let mut killed = EditorViewport::new(px(20.0));
-        killed.set_layout(px(20.0), size(px(800.0), px(800.0)), 100);
-        killed.set_smooth_scrolling(true);
-        let update = killed.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
-        assert_eq!(update.top_visual_row, 40);
-        assert!(killed.scroll_animation_active());
-
-        killed.request_cursor_reveal(EditorCursorReveal::Scrolloff);
-        assert!(killed.advance_scroll_animation_at(Instant::now() + Duration::from_millis(20)));
-        let armed = killed
-            .take_cursor_reveal_request()
-            .expect("armed reveal from the selection change");
-        killed.reveal_visual_row(45, armed, 5);
-
-        assert!(!killed.scroll_animation_active());
-
-        // Discarding the same request — what `clear_cursor_reveal_request` does —
-        // leaves the tween running to its destination.
-        let mut survived = EditorViewport::new(px(20.0));
-        survived.set_layout(px(20.0), size(px(800.0), px(800.0)), 100);
-        survived.set_smooth_scrolling(true);
-        let update = survived.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
-        assert_eq!(update.top_visual_row, 40);
-        assert!(survived.scroll_animation_active());
-
-        survived.request_cursor_reveal(EditorCursorReveal::Scrolloff);
-        assert_eq!(
-            survived.take_cursor_reveal_request(),
-            Some(EditorCursorReveal::Scrolloff),
-            "the selection change armed a reveal"
+    /// `content_visual_rows` is the *total* row count, so the scroll range is
+    /// `20 * content_visual_rows - 800` px. The callers below assert the specific
+    /// target row they need is unclamped rather than trusting the arithmetic here.
+    fn scrolloff_reveal_viewport(content_visual_rows: usize) -> EditorViewport {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(
+            px(20.0),
+            size(px(800.0), px(800.0)),
+            content_visual_rows,
         );
-        assert!(survived.scroll_animation_active());
-
-        assert!(survived.advance_scroll_animation_at(Instant::now() + Duration::from_millis(500)));
-
-        assert_eq!(survived.top_visual_row(), 40);
-        assert!(!survived.scroll_animation_active());
+        viewport.set_smooth_scrolling(true);
+        assert_eq!(
+            viewport.visible_visual_rows(),
+            40,
+            "test fixture drifted: every expected row below assumes 40 visible rows"
+        );
+        // The scroll range is `20 * content_visual_rows - 800` px, and every
+        // target row below is quoted against it, so pin the derivation rather
+        // than let a silent re-clamp masquerade as a correct landing row.
+        assert_eq!(
+            viewport.max_scroll_offset().height,
+            px((20.0 * content_visual_rows as f32 - 800.0).max(0.0)),
+            "test fixture drifted: every expected pixel below is derived from this range"
+        );
+        viewport
     }
 
-    /// KNOWN-FAILURE CHARACTERIZATION — pins current, incorrect behaviour.
+    /// Arm the 40-row page tween from an explicit origin clock.
     ///
-    /// `reveal_visual_row` derives its `Scrolloff` band from `top_visual_row()`,
-    /// which during a tween is the *mid-tween* row rather than the destination
-    /// row. The traced `page_down` case lands here: a 40-row page scroll puts the
-    /// destination at row 40 and the cursor at destination + scrolloff = 45, but
-    /// on the first painted frame the live row is still small, so the band is
-    /// computed around the wrong origin, 45 is judged out of band, and the
-    /// viewport is dragged back to roughly row 11 instead of row 40.
+    /// `editor_jump_duration(40) = min(60 + 6 * 40, 280) = 280ms`, so the flight is
+    /// `0px -> 800px` and the destination is row 40. Arming through
+    /// `animate_scroll_to_at` rather than `apply_scroll_request` is what lets the
+    /// samples below be exact arithmetic instead of a race against the wall clock;
+    /// it is the same tween `VisualPages(1)` produces on a 40-row viewport.
+    fn arm_page_tween_from(viewport: &EditorViewport, origin: Instant) {
+        viewport.scroll.animate_scroll_to_at(
+            point(px(0.0), px(800.0)),
+            editor_jump_duration(40),
+            origin,
+        );
+        assert!(viewport.scroll_animation_active());
+    }
+
+    /// The `Scrolloff` band is measured from the tween's **destination**, and a
+    /// target that *is* chosen **retargets** the tween instead of cancelling it.
     ///
-    /// The next phase fixes this (read the band origin from `destination_position()`
-    /// and retarget instead of cancelling). It is pinned here so that fix has a
-    /// red test to turn green. Do not correct the expected values below without
-    /// fixing the behaviour they describe.
+    /// This is the traced `page_down` case, pinned as correct behaviour rather
+    /// than characterised as a failure. The trace: a page scroll arms a tween to
+    /// row 40, `sync_cursor_after_native_page_scroll` moves the Helix cursor into
+    /// the *destination* page at `40 + scrolloff = 45`, and the next painted frame
+    /// applies a `Scrolloff` reveal for row 45 while the tween is still in flight.
+    ///
+    /// Fixture: 800x800 bounds, 20px rows, 100 content rows, `scrolloff = 5`, so
+    /// `visible_visual_rows() = 40` and the page tween runs `0px -> 800px` over
+    /// `editor_jump_duration(40) = 280ms`. The scroll range is
+    /// `20 * 100 - 800 = 1200px`, so row 40 is unclamped.
+    ///
+    /// The 20ms sample is the frame the traced bug landed on:
+    ///  - `t = 20 / 280 = 0.07143`
+    ///  - `ease_out_quad(t) = 2t - t^2 = 0.14286 - 0.00510 = 0.13776`
+    ///  - `y = 0 + 800 * 0.13776 = 110.20px` -> live top row `floor(110.20 / 20) = 5`
+    ///
+    /// Band arithmetic for cursor row 45:
+    ///  - From the destination: `lower = 40 + 5 = 45`, `upper = 40 + (40 - 5) = 75`.
+    ///    `45 < 45` is false and `45 >= 75` is false, so the cursor is already
+    ///    visible and the correct answer is *no motion at all*.
+    ///  - From the mid-tween row 5: `lower = 10`, `upper = 5 + 35 = 40`, so
+    ///    `45 >= 40` fires and the target becomes
+    ///    `45 + 5 + 1 - 40 = 11` — 29 rows short of the destination the tween is
+    ///    flying towards. That is the whole bug, and this test is what rules it out.
     #[test]
-    fn known_failure_reveal_band_is_computed_from_the_mid_tween_row() {
-        let mut viewport = EditorViewport::new(px(20.0));
-        viewport.set_layout(px(20.0), size(px(800.0), px(800.0)), 100);
-        viewport.set_smooth_scrolling(true);
+    fn reveal_band_uses_the_tween_destination_and_retargets_instead_of_cancelling() {
+        // --- the traced case: the reveal must not move anything -----------------
+        let viewport = scrolloff_reveal_viewport(100);
+        let origin = Instant::now();
+        arm_page_tween_from(&viewport, origin);
 
-        let update = viewport.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
-        assert_eq!(update.top_visual_row, 40, "destination top visual row");
-
-        assert!(viewport.advance_scroll_animation_at(Instant::now() + Duration::from_millis(20)));
-        let live_row = viewport.top_visual_row();
-        assert!(
-            live_row < 40,
-            "the tween should still be mid-flight, live row {live_row}"
+        assert!(viewport.advance_scroll_animation_at(origin + Duration::from_millis(20)));
+        assert_eq!(
+            viewport.top_visual_row(),
+            5,
+            "the 20ms sample must land mid-tween on row 5, not on the destination"
         );
 
         // 45 is where the cursor really is: destination (40) + scrolloff (5).
+        //
+        // `changed` is destination-based by design, so it is `true` whenever a
+        // tween is in flight even if the reveal itself moves nothing: it answers
+        // "does this request have a destination", which is what the surface layer
+        // needs in order to know a paint armed motion. Asserting on it here would
+        // be asserting the wrong thing. The intent is that the reveal neither
+        // moved the viewport nor retargeted the tween, so assert those directly.
+        let sampled = viewport.scroll_position();
         let reveal = viewport.reveal_visual_row(45, EditorCursorReveal::Scrolloff, 5);
 
-        assert!(reveal.changed);
-        // Wrong on purpose. The band origin is `live_row` (the mid-tween row, 5),
-        // not the destination (40), so the *absolute* row the reveal lands on is
-        // `cursor + margin + 1 - visible_rows` = 45 + 5 + 1 - 40 = 11 — 29 rows
-        // short of the destination. The correct target is row 40.
-        assert_eq!(viewport.top_visual_row(), 11);
-        assert!(
-            viewport.top_visual_row() < 40,
-            "the reveal should miss the destination row 40 entirely, not land on it"
+        assert_eq!(
+            reveal.top_visual_row,
+            40,
+            "the update reports the destination, which is still row 40"
         );
-        // The reveal still cancels the tween, which is exactly why the workspace
-        // fix has to clear the request before it is ever applied.
+        assert_eq!(
+            viewport.scroll_position(),
+            sampled,
+            "row 45 is inside the destination band 45..=75, so the reveal must not move anything"
+        );
+        assert!(
+            viewport.scroll_animation_active(),
+            "the reveal took down the tween it was applied on top of"
+        );
+        assert!(
+            (px(100.0)..px(120.0)).contains(&viewport.scroll_position().y),
+            "the tween origin moved: {} is not the sampled 110.20px",
+            viewport.scroll_position().y
+        );
+
+        // And the page still lands where it was always going to land.
+        assert!(viewport.advance_scroll_animation_at(origin + Duration::from_millis(280)));
+        assert_eq!(viewport.scroll_position().y, px(800.0));
+        assert_eq!(viewport.top_visual_row(), 40);
+        assert!(!viewport.scroll_animation_active());
+
+        // --- the retarget case: a real target replaces the flight ---------------
+        // 200 rows this time, so a cursor well past the destination is legal:
+        // `max_scroll_offset().height = 20 * 200 - 800 = 3200px`, and the retarget
+        // below aims at row 66 = 1320px.
+        let viewport = scrolloff_reveal_viewport(200);
+        let origin = Instant::now();
+        arm_page_tween_from(&viewport, origin);
+        assert!(viewport.advance_scroll_animation_at(origin + Duration::from_millis(20)));
+        assert_eq!(viewport.top_visual_row(), 5);
+
+        // Cursor row 100 against the destination band `45..=75`: `100 >= 75` fires,
+        // so the target is `100 + 5 + 1 - 40 = 66`. `travel_rows` is measured from
+        // the same origin the band was, `66 - 40 = 26`, and
+        // `26 <= visible_rows - margin = 35`, so this one eases.
+        let before = Instant::now();
+        let reveal = viewport.reveal_visual_row(100, EditorCursorReveal::Scrolloff, 5);
+        let after = Instant::now();
+
+        assert!(reveal.changed);
+        assert_eq!(reveal.top_visual_row, 66, "66 = 100 + 5 + 1 - 40");
+        assert_eq!(
+            reveal.crossed_visual_rows,
+            61,
+            "61 = 66 - 5, from the live row to the destination"
+        );
+        assert_eq!(
+            editor_jump_duration(26),
+            Duration::from_millis(216),
+            "the duration moved; the samples below assume 60 + 6 * 26"
+        );
+        assert!(
+            viewport.scroll_animation_active(),
+            "the retarget cancelled instead of replacing the page tween"
+        );
+        assert!(
+            (px(100.0)..px(120.0)).contains(&viewport.scroll_position().y),
+            "the retarget teleported to its target instead of easing from 110.20px: {}",
+            viewport.scroll_position().y
+        );
+
+        // The replacement is a *fresh, full* 216ms flight from the live position,
+        // not the 260ms the old tween had left. At 100ms the fresh tween is at
+        // `t = 100/216 = 0.463`, `ease = 0.463 * 1.537 = 0.712`,
+        // `y = 110.20 + 1209.80 * 0.712 = 971.5px`; an inherited 260ms budget would
+        // be at `t = 0.385`, `y = 862.0px`. Both are strictly short of 1320px, so
+        // this sample pins "still travelling" rather than the budget itself — the
+        // budget is discriminated at the deadline sample below.
+        assert!(viewport.advance_scroll_animation_at(before + Duration::from_millis(100)));
+        assert!(viewport.scroll_animation_active(), "the retarget completed in under 100ms");
+        assert!(
+            (px(110.0)..px(1000.0)).contains(&viewport.scroll_position().y),
+            "y = {} is outside the 110.20..=971.5px the fresh flight passes through",
+            viewport.scroll_position().y
+        );
+
+        // At 216ms the fresh flight is done and lands exactly on 1320px. Had the
+        // remaining 260ms been carried forward instead, `t = 216/260 = 0.831`,
+        // `ease = 0.831 * 1.169 = 0.971`, and `y = 110.20 + 1209.80 * 0.971 =
+        // 1284.9px` with the tween still running.
+        assert!(viewport.advance_scroll_animation_at(after + Duration::from_millis(216)));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(1320.0),
+            "the retarget did not run its full 216ms from the live position"
+        );
+        assert_eq!(viewport.top_visual_row(), 66);
+        assert!(!viewport.scroll_animation_active());
+    }
+
+    /// Applying the armed reveal and discarding it are now equally harmless.
+    ///
+    /// `reveal_visual_row` measures the `Scrolloff` band from the tween's
+    /// destination, so the very request that used to kill the page tween — the
+    /// traced `page_down` reveal for row 45 while the page tween is still at
+    /// row 5 — now resolves to "already visible" and leaves the flight alone.
+    ///
+    /// `Workspace::handle_viewport_scroll` still calls
+    /// `clear_cursor_reveal_request` after the cursor sync. That workaround is no
+    /// longer load-bearing: discarding the request and applying it both leave the
+    /// page tween running to row 40. Both halves are asserted because the
+    /// workspace wiring cannot be driven headlessly, and this is the viewport
+    /// contract it relies on either way.
+    #[test]
+    fn page_scroll_reveal_applied_or_discarded_both_leave_the_page_tween_intact() {
+        // Applying the armed reveal. Arithmetic is spelled out in
+        // `reveal_band_uses_the_tween_destination_and_retargets_instead_of_cancelling`.
+        let applied = scrolloff_reveal_viewport(100);
+        let origin = Instant::now();
+        arm_page_tween_from(&applied, origin);
+
+        applied.request_cursor_reveal(EditorCursorReveal::Scrolloff);
+        assert!(applied.advance_scroll_animation_at(origin + Duration::from_millis(20)));
+        assert_eq!(applied.top_visual_row(), 5, "mid-tween");
+        let armed = applied
+            .take_cursor_reveal_request()
+            .expect("armed reveal from the selection change");
+        // `changed` is destination-based, so it is `true` for any in-flight tween
+        // regardless of what this reveal did; it reports that a paint armed
+        // motion, not that the viewport moved. Assert the two things that actually
+        // matter — the destination is untouched and the live position is unmoved.
+        let sampled = applied.scroll_position();
+        let update = applied.reveal_visual_row(45, armed, 5);
+
+        assert_eq!(
+            update.top_visual_row,
+            40,
+            "the tween was retargeted away from row 40"
+        );
+        assert_eq!(
+            applied.scroll_position(),
+            sampled,
+            "row 45 is inside the destination band, so applying the reveal must move nothing"
+        );
+        assert!(applied.scroll_animation_active(), "applying the reveal killed the tween");
+        assert!(applied.advance_scroll_animation_at(origin + Duration::from_millis(280)));
+        assert_eq!(applied.top_visual_row(), 40);
+        assert!(!applied.scroll_animation_active());
+
+        // Discarding the same request — what `clear_cursor_reveal_request` does.
+        let discarded = scrolloff_reveal_viewport(100);
+        let origin = Instant::now();
+        arm_page_tween_from(&discarded, origin);
+
+        discarded.request_cursor_reveal(EditorCursorReveal::Scrolloff);
+        assert_eq!(
+            discarded.take_cursor_reveal_request(),
+            Some(EditorCursorReveal::Scrolloff),
+            "the selection change armed a reveal"
+        );
+        assert!(discarded.scroll_animation_active());
+
+        assert!(discarded.advance_scroll_animation_at(origin + Duration::from_millis(280)));
+        assert_eq!(discarded.top_visual_row(), 40);
+        assert!(!discarded.scroll_animation_active());
+    }
+
+    /// A `Scrolloff` reveal that keeps the cursor inside the painted band eases,
+    /// and the ease lands exactly on the row the band chose.
+    ///
+    /// Fixture: 800x800 bounds, 20px rows, 200 content rows, `scrolloff = 5`, so
+    /// `visible_visual_rows() = 40` and the snap threshold is
+    /// `visible_rows - margin = 35` rows. A one-row `Scrolloff` travel is what
+    /// ordinary cursor following produces, and one row is nowhere near the
+    /// threshold, so these are the eased cases.
+    ///
+    /// Forward, from row 0, cursor at 35:
+    ///  - `lower = 0 + 5 = 5`, `upper = 0 + (40 - 5) = 35`, so `35 >= 35` fires.
+    ///  - target `= 35 + 5 + 1 - 40 = 1`, `travel_rows = 1 - 0 = 1`,
+    ///    `1 <= 35`, so the reveal eases over
+    ///    `editor_jump_duration(1) = 60 + 6 = 66ms` towards `1 * 20 = 20px`.
+    ///
+    /// Backward, from row 10 (reached instantly through the scrollbar, which is
+    /// the cancel-on-purpose path and so is a clean idle origin), cursor at 14:
+    ///  - `lower = 10 + 5 = 15`, so `14 < 15` fires.
+    ///  - target `= 14 - 5 = 9`, `travel_rows = 9 - 10 = -1`, `1 <= 35`, so it
+    ///    eases over the same 66ms towards `9 * 20 = 180px`.
+    #[test]
+    fn scrolloff_reveal_within_the_painted_band_is_eased_and_lands_on_target() {
+        assert_eq!(
+            editor_jump_duration(1),
+            Duration::from_millis(66),
+            "the duration moved; the 66ms samples below assume 60 + 6 * 1"
+        );
+
+        // Forward.
+        let forward = scrolloff_reveal_viewport(200);
+        let update = forward.reveal_visual_row(35, EditorCursorReveal::Scrolloff, 5);
+
+        assert!(update.changed);
+        assert_eq!(update.top_visual_row, 1, "1 = 35 + 5 + 1 - 40");
+        assert_eq!(update.crossed_visual_rows, 1);
+        assert_eq!(update.offset_within_row, px(0.0));
+        assert!(forward.scroll_animation_active(), "a one-row reveal must ease");
+        assert_eq!(
+            forward.scroll_position().y,
+            px(0.0),
+            "an armed tween has not moved the viewport yet"
+        );
+        assert_eq!(forward.top_visual_row(), 0);
+
+        assert!(forward.advance_scroll_animation_at(Instant::now() + Duration::from_millis(66)));
+        assert_eq!(forward.scroll_position().y, px(20.0));
+        assert_eq!(forward.top_visual_row(), 1, "the ease must land exactly on its target");
+        assert!(!forward.scroll_animation_active());
+
+        // Backward.
+        let backward = scrolloff_reveal_viewport(200);
+        backward.scroll_to_vertical_position_from_scrollbar(px(200.0));
+        assert_eq!(backward.top_visual_row(), 10, "fixture setup");
+        assert!(!backward.scroll_animation_active());
+
+        let update = backward.reveal_visual_row(14, EditorCursorReveal::Scrolloff, 5);
+
+        assert!(update.changed);
+        assert_eq!(update.top_visual_row, 9, "9 = 14 - 5");
+        assert_eq!(update.crossed_visual_rows, -1);
+        assert!(backward.scroll_animation_active());
+        assert_eq!(backward.scroll_position().y, px(200.0), "the ease has not moved yet");
+        assert_eq!(backward.top_visual_row(), 10);
+
+        assert!(backward.advance_scroll_animation_at(Instant::now() + Duration::from_millis(66)));
+        assert_eq!(backward.scroll_position().y, px(180.0));
+        assert_eq!(backward.top_visual_row(), 9);
+        assert!(!backward.scroll_animation_active());
+    }
+
+    /// A `Scrolloff` travel that would strand the cursor snaps instead.
+    ///
+    /// The hazard is not the distance, it is the cursor leaving the painted band:
+    /// a line outside the rendered range is not painted at all, so during a tween
+    /// the cursor would simply vanish. The band spans `visible_rows` rows, the
+    /// cursor sits at most `margin` rows inside whichever edge fired, and the view
+    /// travels `travel_rows`, so the cursor leaves the far edge exactly when
+    /// `travel_rows > visible_rows - margin`.
+    ///
+    /// Fixture: 800x800 bounds, 20px rows, 200 content rows, `scrolloff = 5`, so
+    /// `visible_visual_rows() = 40` and the threshold is
+    /// `visible_rows - margin = 40 - 5 = 35` rows exactly. Each case below sits on
+    /// one side of that number, and the boundary itself is asserted rather than
+    /// inferred.
+    ///
+    /// From top row `T` the band is `T + 5 ..= T + 35`, and
+    ///  - forward, cursor `C >= T + 35` -> target `C + 5 + 1 - 40 = C - 34`, so
+    ///    `travel = C - 34 - T`. With `T = 0`: `C = 69 -> 35` (travel 35, eased)
+    ///    and `C = 70 -> 36` (travel 36, snapped).
+    ///  - backward, cursor `C < T + 5` -> target `C - 5`, so
+    ///    `travel = C - 5 - T`. With `T = 100`: `C = 70 -> 65` (travel -35, eased)
+    ///    and `C = 69 -> 64` (travel -36, snapped).
+    #[test]
+    fn scrolloff_reveal_beyond_the_painted_band_snaps() {
+        struct Case {
+            label: &'static str,
+            top_row: usize,
+            cursor_row: usize,
+            expected_target: usize,
+            expected_eased: bool,
+        }
+
+        let cases = [
+            Case {
+                label: "forward at the threshold",
+                top_row: 0,
+                cursor_row: 69,
+                expected_target: 35,
+                expected_eased: true,
+            },
+            Case {
+                label: "forward one row past the threshold",
+                top_row: 0,
+                cursor_row: 70,
+                expected_target: 36,
+                expected_eased: false,
+            },
+            Case {
+                label: "backward at the threshold",
+                top_row: 100,
+                cursor_row: 70,
+                expected_target: 65,
+                expected_eased: true,
+            },
+            Case {
+                label: "backward one row past the threshold",
+                top_row: 100,
+                cursor_row: 69,
+                expected_target: 64,
+                expected_eased: false,
+            },
+        ];
+
+        for case in cases {
+            let viewport = scrolloff_reveal_viewport(200);
+            viewport.scroll_to_vertical_position_from_scrollbar(px(20.0 * case.top_row as f32));
+            assert_eq!(viewport.top_visual_row(), case.top_row, "{}: fixture", case.label);
+            let origin_y = viewport.scroll_position().y;
+
+            let update = viewport.reveal_visual_row(case.cursor_row, EditorCursorReveal::Scrolloff, 5);
+
+            assert!(update.changed, "{}: nothing moved", case.label);
+            assert_eq!(
+                update.top_visual_row, case.expected_target,
+                "{}: target row",
+                case.label
+            );
+            assert_eq!(
+                viewport.scroll_animation_active(),
+                case.expected_eased,
+                "{}: eased={} at the threshold visible_rows - margin = 35",
+                case.label, case.expected_eased
+            );
+
+            if case.expected_eased {
+                assert_eq!(
+                    viewport.scroll_position().y,
+                    origin_y,
+                    "{}: an armed tween has not moved the viewport yet",
+                    case.label
+                );
+                // 35 rows is the last count below the 280ms cap:
+                // `editor_jump_duration(35) = 60 + 6 * 35 = 270ms`.
+                assert!(viewport.advance_scroll_animation_at(Instant::now() + Duration::from_millis(500)));
+                assert_eq!(
+                    viewport.top_visual_row(),
+                    case.expected_target,
+                    "{}: the ease must land exactly on its target",
+                    case.label
+                );
+            } else {
+                assert_eq!(
+                    viewport.scroll_position().y,
+                    px(20.0 * case.expected_target as f32),
+                    "{}: a snap is instant, not a tween that has not moved yet",
+                    case.label
+                );
+            }
+        }
+    }
+
+    /// The eased `Scrolloff` path is symmetric in both directions.
+    ///
+    /// Starting from row 20, a cursor at 55 sits exactly on the band's firing
+    /// edge `20 + (40 - 5) = 55`, and a cursor at 24 from row 21 sits just inside
+    /// the lower edge `21 + 5 = 26`. Both reveals therefore ease, one downwards
+    /// and one upwards, and `crossed_visual_rows` has to carry the sign.
+    ///
+    ///  - down: target `= 55 + 5 + 1 - 40 = 21`, `travel = +1`,
+    ///    `editor_jump_duration(1) = 66ms`, destination `21 * 20 = 420px`.
+    ///  - up (from the row the first ease landed on): target `= 24 - 5 = 19`,
+    ///    `travel = -2`, `editor_jump_duration(2) = 60 + 12 = 72ms`, destination
+    ///    `19 * 20 = 380px`.
+    #[test]
+    fn scrolloff_reveal_eases_in_both_directions_from_the_same_origin() {
+        let viewport = scrolloff_reveal_viewport(200);
+        viewport.scroll_to_vertical_position_from_scrollbar(px(400.0));
+        assert_eq!(viewport.top_visual_row(), 20, "fixture setup");
+
+        let update = viewport.reveal_visual_row(55, EditorCursorReveal::Scrolloff, 5);
+
+        assert!(update.changed);
+        assert_eq!(update.top_visual_row, 21, "21 = 55 + 5 + 1 - 40");
+        assert_eq!(update.crossed_visual_rows, 1);
+        assert!(viewport.scroll_animation_active());
+        assert_eq!(viewport.scroll_position().y, px(400.0), "the ease has not moved yet");
+
+        assert!(viewport.advance_scroll_animation_at(Instant::now() + Duration::from_millis(66)));
+        assert_eq!(viewport.top_visual_row(), 21);
+        assert_eq!(viewport.scroll_position().y, px(420.0));
+        assert!(!viewport.scroll_animation_active());
+
+        let update = viewport.reveal_visual_row(24, EditorCursorReveal::Scrolloff, 5);
+
+        assert!(update.changed);
+        assert_eq!(update.top_visual_row, 19, "19 = 24 - 5");
+        assert_eq!(update.crossed_visual_rows, -2, "two rows up from row 21");
+        assert!(viewport.scroll_animation_active());
+        assert_eq!(viewport.scroll_position().y, px(420.0), "the ease has not moved yet");
+        assert_eq!(viewport.top_visual_row(), 21);
+
+        assert!(viewport.advance_scroll_animation_at(Instant::now() + Duration::from_millis(72)));
+        assert_eq!(viewport.top_visual_row(), 19);
+        assert_eq!(viewport.scroll_position().y, px(380.0));
         assert!(!viewport.scroll_animation_active());
     }
 
@@ -2865,6 +3396,852 @@ mod tests {
         assert!(!viewport.scroll_needs_frames());
     }
 
+    // ---------------------------------------------------------------------
+    // Cursor-follow inertia: the keyboard "inertia" added on top of the
+    // working cursor-follow ease.
+    //
+    // One leg. The carry travels further along the direction the gesture was
+    // already going, decelerates, and stops — the wheel glide's shape, and for
+    // the same reason. There is deliberately no return leg: any reversal in the
+    // direction of travel reads as a rebound, and two duration pairs were
+    // shipped and measured to find that out (50ms out against 60ms back, then
+    // 100ms out against 40ms back). The reasoning is recorded where the carry is
+    // armed, in `arm_scrolloff_overshoot`.
+    //
+    // Every expected number below is derived from the *intended* behaviour and
+    // the constants, with the arithmetic shown, rather than read out of the
+    // implementation. Two earlier rounds of work in this file derived their
+    // expectations from the code's own formula, and thereby pinned an inverted
+    // glide that shipped green through a full suite; the direction assertions in
+    // particular are written against the *cursor's offset within the viewport*,
+    // which is the property that actually matters and which an implementation
+    // that inverts its sign cannot fake.
+    // ---------------------------------------------------------------------
+
+    /// How far past the reveal clock a test probes the idle-window decision.
+    /// Well clear of `GESTURE_IDLE_MS = 120ms` and of
+    /// `editor_jump_duration(1) = 66ms`, and it is always read *after* the
+    /// reveal that stamped the gesture, so the window it is compared against is
+    /// already behind it. Same discipline as the wheel's `IDLE_PROBE`.
+    const KEY_IDLE_PROBE: Duration = Duration::from_millis(200);
+
+    /// The cursor row the first `j` in a gesture starts from on the fixture:
+    /// `20 + (40 - 5) = 55`, the band's firing edge. A press at cursor `C`
+    /// targets `C + 5 + 1 - 40 = C - 34`, so press `n` is `C = 54 + n` and
+    /// lands on `20 + n`.
+    const FIRST_FORWARD_CURSOR: usize = 55;
+    /// The cursor row the first `k` in a gesture starts from: `20 + 5 - 1 = 24`,
+    /// the last row *inside* the lower edge. The backward band fires only when
+    /// `C < top + 5`, so press `n` is `C = FIRST_BACKWARD_CURSOR + 1 - n` —
+    /// 24, 23, 22, 21 — and targets `C - 5 = 20 - n`.
+    const FIRST_BACKWARD_CURSOR: usize = 24;
+
+    /// The cursor-follow inertia fixture: `scrolloff_reveal_viewport(200)` parked
+    /// at row 20 through the scrollbar.
+    ///
+    /// The scrollbar is the cancel-on-purpose path, so it leaves no tween in
+    /// flight and is a clean idle origin — which matters because every test here
+    /// starts a gesture from scratch and a stray tween would be sampled as part
+    /// of it.
+    ///
+    /// Row 20 rather than row 0, so that neither direction of the first reveal
+    /// can saturate against a document edge: a carry that clamps takes a
+    /// different path through the arming (it refuses to arm), and these tests
+    /// are about the arithmetic of an unclamped one. The scroll range is
+    /// `20 * 200 - 800 = 3200px`, i.e. row 160, which every target quoted below
+    /// stays well inside.
+    fn key_inertia_viewport() -> EditorViewport {
+        let viewport = scrolloff_reveal_viewport(200);
+        viewport.scroll_to_vertical_position_from_scrollbar(px(400.0));
+        assert_eq!(viewport.top_visual_row(), 20, "fixture setup");
+        assert!(
+            !viewport.scroll_animation_active(),
+            "fixture setup: the scrollbar is the cancel-on-purpose path"
+        );
+        viewport
+    }
+
+    /// Press `j` `count` times, one `Scrolloff` reveal per press.
+    ///
+    /// The band is measured from the tween's *destination*, so consecutive
+    /// presses each produce a one-row travel even though the view has not moved
+    /// between them — the same property the existing `Scrolloff` tests rely on.
+    /// Each press arms a fresh full-duration tween from the live position, so
+    /// only the last one's target is left to land.
+    ///
+    /// The target row is asserted here rather than derived in each test, so that
+    /// a change to the band shows up as a fixture failure instead of as a
+    /// silently different carry. The tween is deliberately *not* asserted here:
+    /// this helper is also used with the engine off, where the same rows are
+    /// reached by instant writes and nothing may arm.
+    fn press_j_toward_the_bottom_margin(viewport: &EditorViewport, count: usize) {
+        for n in 1..=count {
+            let cursor = FIRST_FORWARD_CURSOR + n - 1;
+            let update = viewport.reveal_visual_row(cursor, EditorCursorReveal::Scrolloff, 5);
+            assert_eq!(
+                update.top_visual_row,
+                20 + n,
+                "press {n} at cursor {cursor} chose the wrong target"
+            );
+        }
+    }
+
+    /// Press `k` `count` times. The exact mirror of
+    /// [`press_j_toward_the_bottom_margin`]: the cursor walks *up* the same
+    /// number of rows, so the gesture's accumulated travel is `-count`.
+    fn press_k_toward_the_top_margin(viewport: &EditorViewport, count: usize) {
+        for n in 1..=count {
+            let cursor = FIRST_BACKWARD_CURSOR + 1 - n;
+            let update = viewport.reveal_visual_row(cursor, EditorCursorReveal::Scrolloff, 5);
+            assert_eq!(
+                update.top_visual_row,
+                20usize.saturating_sub(n),
+                "press {n} at cursor {cursor} chose the wrong target"
+            );
+        }
+    }
+
+    /// Let a reveal chain's last tween land, and hand back the instant from which
+    /// the idle window can be probed.
+    ///
+    /// `editor_jump_duration(1) = 60 + 6 = 66ms`, so sampling half a second out
+    /// is exactly `t = 1` however long the press loop itself took. The returned
+    /// instant is read *after* the landing, so `+ KEY_IDLE_PROBE` from it is
+    /// unambiguously past the `GESTURE_IDLE_MS = 120ms` window measured from the
+    /// real clock that stamped the last reveal.
+    fn land_reveal_tweens(viewport: &EditorViewport) -> Instant {
+        assert!(
+            viewport.advance_scroll_animation_at(Instant::now() + Duration::from_millis(500)),
+            "the reveal chain did not land"
+        );
+        assert!(
+            !viewport.scroll_animation_active(),
+            "the reveal chain landed but left a tween behind"
+        );
+        Instant::now() + KEY_IDLE_PROBE
+    }
+
+    /// Press `j` `count` times and land the chain, returning the instant from
+    /// which the idle window can be probed.
+    fn j_gesture(viewport: &EditorViewport, count: usize) -> Instant {
+        press_j_toward_the_bottom_margin(viewport, count);
+        land_reveal_tweens(viewport)
+    }
+
+    // ---------------------------------------------------------------------
+    // Where to sample the carry, derived rather than hardcoded.
+    //
+    // These are the sample *times* only. The carry's duration is the feel, and
+    // the feel is meant to be tuned: a suite that hardcoded `50ms` and `60ms`
+    // pinned the numbers instead of the mechanism, so a single tune invalidated
+    // five tests that were never about the tune. The mechanism is the exact
+    // landing — the carry ends on its clamped target, to the pixel — and that
+    // stays asserted.
+    //
+    // So every offset below is a fraction of the duration the implementation
+    // actually uses, and every expected position in every test is derived from
+    // the same fraction via `ease_out_quad`. The doc comment on each test spells
+    // the arithmetic out with the fractions, so a tune moves the sample and its
+    // expected position together and the test still means the same thing.
+    // ---------------------------------------------------------------------
+
+    /// A quarter of the way through the carry, so `t = 0.25`.
+    fn outward_quarter() -> Duration {
+        OVERSHOOT_DURATION / 4
+    }
+
+    /// One millisecond before the carry ends, so `t = 0.99`.
+    ///
+    /// The sample exists to show the carry had *not* finished, and
+    /// `ease_out_quad(0.99) = 2 * 0.99 - 0.99^2 = 0.9999`, so the view is
+    /// `1 - 0.9999 = 0.01%` of the carry short of its target — on a 20px carry
+    /// that is two thousandths of a pixel, close enough to look landed and
+    /// provably not. Derived as an offset rather than written as a literal so it
+    /// tracks the duration.
+    fn outward_just_before_landing() -> Duration {
+        OVERSHOOT_DURATION - Duration::from_millis(1)
+    }
+
+    /// The instant the carry lands exactly, `t = 1`.
+    fn outward_landing() -> Duration {
+        OVERSHOOT_DURATION
+    }
+
+    /// Comfortably past the end of the carry, for the "nothing is waiting to
+    /// fire later" probes.
+    ///
+    /// Measured from the carry's own landing rather than written as a flat 500ms,
+    /// so a future tune that made the carry *longer* could not quietly push the
+    /// probe back inside it — which would turn "nothing re-arms" into "the probe
+    /// was too early to see anything".
+    fn long_after_the_carry() -> Duration {
+        outward_landing() + Duration::from_millis(500)
+    }
+
+    /// Press `j` at `cursor` and report the row the viewport will be on once the
+    /// reveal lands.
+    ///
+    /// [`press_j_toward_the_bottom_margin`] cannot serve the steady-state test
+    /// below: it asserts the `20 + n` progression, which only holds from a cold
+    /// fixture, whereas from the second round on the band origin is wherever the
+    /// last carry stopped. It reports rather than asserts so each test can state
+    /// the row it expects, and it says nothing about whether a reveal fired at
+    /// all — for a cursor still inside the band the reported row is just the row
+    /// the view is already on, which is the case the steady-state test needs to
+    /// pin.
+    fn press_j_at(viewport: &EditorViewport, cursor: usize) -> usize {
+        viewport
+            .reveal_visual_row(cursor, EditorCursorReveal::Scrolloff, 5)
+            .top_visual_row
+    }
+
+    /// Repeated carries hold the margin still instead of ratcheting it outward.
+    ///
+    /// This is the guard for the property the feature is *built* on, and it is
+    /// the one that was originally got wrong: a settle leg was added to stop the
+    /// margin creeping, on the belief that the creep was unbounded. It is not.
+    /// The carry is measured from the *fresh* margin row of the gesture's last
+    /// reveal, and that row comes from the cursor and the current band origin, so
+    /// every round re-anchors and the previous carry is already inside the base
+    /// rather than added to it. Worked through on this fixture, with
+    /// `visible_rows = 40` and `scrolloff = 5`:
+    ///
+    ///  - the band fires forward at `cursor >= top + 40 - 5 = top + 35`, and the
+    ///    target row is `cursor + 5 + 1 - 40 = cursor - 34`,
+    ///  - so after a reveal `cursor - top = 34`, i.e. the cursor sits exactly
+    ///    `margin = 5` rows above the last visible row,
+    ///  - after a carry of `c` rows it sits `margin + c` rows above it, and
+    ///    `c = min(rows * 0.25, OVERSHOOT_MAX = 2)`, so the distance can never
+    ///    exceed `5 + 2 = 7` and is exactly 7 for any gesture that reaches the
+    ///    cap at `2 / 0.25 = 8` rows.
+    ///
+    /// Three rounds of a capped gesture, and the distance is 7 every time:
+    ///
+    /// ```text
+    /// round 1  idle presses 53, 54 (inside the band: no reveal, no gesture)
+    ///          8 presses, cursors 55..62, rows 20 -> 28
+    ///          carry 2 rows: 28 -> 30, cursor 62, distance (30 + 39) - 62 = 7
+    /// round 2  idle presses 63, 64 (the cursor walks back in from 7 rows inside)
+    ///          8 presses, cursors 65..72, rows 28 -> 38
+    ///          carry 2 rows: 38 -> 40, cursor 72, distance (40 + 39) - 72 = 7
+    /// round 3  idle presses 73, 74
+    ///          8 presses, cursors 75..82, rows 40 -> 48
+    ///          carry 2 rows: 48 -> 50, cursor 82, distance (50 + 39) - 82 = 7
+    /// ```
+    ///
+    /// The idle presses are part of the mechanism rather than padding: after a
+    /// carry the cursor is `OVERSHOOT_MAX` rows further inside the band than the
+    /// firing edge, so it has to walk back in before the band fires again. A
+    /// press that does not fire the band is not a step, so it neither joins the
+    /// gesture nor refreshes its idle window — and the eight presses of a round
+    /// therefore all arrive inside `GESTURE_IDLE_MS` of each other and form one
+    /// gesture of exactly 8 rows, which is what puts the carry on its cap.
+    ///
+    /// **If the margin did ratchet**, the distance would grow by a full
+    /// `OVERSHOOT_MAX` every round — 7, 9, 11 — because that is what "the carry
+    /// is applied on top of where the last one stopped" means. Round 2 would then
+    /// fail as `9 != 7` and round 3 as `11 != 7`, and after `n` rounds the
+    /// configured `scrolloff = 5` would be silently `5 + 2n` rows, which at
+    /// `visible_rows = 40` puts the cursor off the top of the viewport after 17
+    /// rounds. That is the failure this test exists to make impossible.
+    ///
+    /// Upward is the same arithmetic mirrored — the backward target is
+    /// `cursor - margin`, so the rows above the cursor after a carry are
+    /// `margin + c` — and
+    /// [`backward_gesture_carries_upward_and_adds_margin_symmetrically`] covers
+    /// one cycle of it.
+    #[test]
+    fn repeated_carries_hold_the_margin_instead_of_ratcheting() {
+        let viewport = key_inertia_viewport();
+        let visible_rows = viewport.visible_visual_rows();
+        assert_eq!(visible_rows, 40, "test fixture drifted: 40 visible rows");
+        let distance_from_bottom_edge = |viewport: &EditorViewport, cursor: usize| -> usize {
+            (viewport.top_visual_row() + visible_rows - 1) - cursor
+        };
+
+        // `(first cursor of the round's eight presses, row the round starts on,
+        // row its last reveal lands on, row the carry ends on)`.
+        let rounds = [(55, 20, 28, 30), (65, 30, 38, 40), (75, 40, 48, 50)];
+
+        for (round, &(first_cursor, start_row, margin_row, carried_row)) in
+            rounds.iter().enumerate()
+        {
+            // Two cursor moves that are still inside the band: no reveal, so no
+            // gesture, and the view must not move.
+            for cursor in first_cursor - 2..first_cursor {
+                assert_eq!(
+                    press_j_at(&viewport, cursor),
+                    start_row,
+                    "round {round}: cursor {cursor} is inside the band, so the press \
+                     must not move the view"
+                );
+            }
+
+            // Eight one-row reveals: `2 / OVERSHOOT_RATIO` rows of gesture, which
+            // is exactly enough to take the carry to its cap.
+            for step in 0..8usize {
+                let cursor = first_cursor + step;
+                assert_eq!(
+                    press_j_at(&viewport, cursor),
+                    margin_row - 7 + step,
+                    "round {round}: press {step} of eight, at cursor {cursor}"
+                );
+            }
+
+            let arm = land_reveal_tweens(&viewport);
+            assert_eq!(
+                viewport.scroll_position().y,
+                px((margin_row * 20) as f32),
+                "round {round}: the round's last reveal landed on row {margin_row}"
+            );
+
+            assert!(
+                viewport.advance_scrolloff_inertia(arm),
+                "round {round}: an eight-row gesture armed no carry"
+            );
+            assert!(viewport.advance_scroll_animation_at(arm + outward_landing()));
+            assert_eq!(
+                viewport.top_visual_row(),
+                carried_row,
+                "round {round}: the carry is two rows past row {margin_row}"
+            );
+            assert_eq!(
+                distance_from_bottom_edge(&viewport, first_cursor + 7),
+                7,
+                "round {round}: the cursor must end `scrolloff + OVERSHOOT_MAX` rows \
+                 from the bottom edge every time, not further in than the round before"
+            );
+
+            // The carry landing is the last transition in the feature: one leg,
+            // and then `Idle`.
+            assert!(
+                !viewport.advance_scrolloff_inertia(arm + outward_landing()),
+                "round {round}: a landed carry armed a second leg"
+            );
+            assert!(
+                !viewport.scroll_needs_frames(),
+                "round {round}: a completed carry left the frame loop running"
+            );
+        }
+    }
+
+    /// One deliberate `j` is a precision movement, and it has to stay one.
+    ///
+    /// A single press is one reveal and one row of travel, which is what an
+    /// ordinary cursor-follow reveal always is: the band fires the moment the
+    /// cursor crosses the margin and the target restores it, so press `n`
+    /// travels exactly `+1` row. The gesture therefore accumulates `1` row, and
+    /// `MIN_GESTURE_ROWS = 3` is not reached — no carry is ever armed, and the view
+    /// eases to `21 * 20 = 420px` and stops there.
+    ///
+    /// The minimum is a row count precisely so that this holds on any window
+    /// size or line height: one row can never reach three rows, so a single press
+    /// can never carry no matter how the constants are tuned.
+    ///
+    /// The last two assertions are the load-bearing ones. The gesture has to be
+    /// *dropped*, not merely declined, and it has to stay dropped — otherwise the
+    /// render pass would request frames forever after one keypress.
+    #[test]
+    fn single_scrolloff_reveal_carries_nothing_and_stops_the_frame_loop() {
+        let viewport = key_inertia_viewport();
+        let arm = j_gesture(&viewport, 1);
+
+        assert_eq!(viewport.top_visual_row(), 21, "the reveal landed on its target");
+        assert_eq!(viewport.scroll_position(), point(px(0.0), px(420.0)));
+
+        assert!(
+            !viewport.advance_scrolloff_inertia(arm),
+            "one row of travel armed a carry"
+        );
+        assert_eq!(
+            viewport.scroll_position(),
+            point(px(0.0), px(420.0)),
+            "a declined gesture moved the view"
+        );
+        assert!(
+            !viewport.scroll_needs_frames(),
+            "a declined gesture left the frame loop running"
+        );
+
+        // And nothing is waiting to fire later either.
+        assert!(!viewport.advance_scrolloff_inertia(arm + long_after_the_carry()));
+        assert!(!viewport.scroll_needs_frames());
+        assert_eq!(viewport.scroll_position(), point(px(0.0), px(420.0)));
+    }
+
+    /// A four-press gesture carries one row further and stops there.
+    ///
+    /// Carry arithmetic, from the constants and nothing else:
+    ///  - four presses at one row each is `rows = 4`, and `4 >= MIN_GESTURE_ROWS = 3`,
+    ///  - `OVERSHOOT_RATIO = 0.25` gives `4 * 0.25 = 1.0` row, and `1.0 <= OVERSHOOT_MAX = 2`
+    ///    so the cap does not bind,
+    ///  - `1.0` rows at a 20px line height is `20px`,
+    ///  - the gesture travelled **down**, so the carry is `+20px` past the
+    ///    margin: `24 * 20 = 480px -> 500px`, rows 24 -> 25, and that is where
+    ///    the view stays.
+    ///
+    /// Every offset below is a fraction of the duration the implementation
+    /// actually uses — see the sample-offset helpers just above — so retuning the
+    /// feel moves the samples and the arithmetic with it instead of breaking
+    /// this test. The arithmetic is written in fractions of the duration, not in
+    /// milliseconds, for the same reason.
+    ///
+    /// The carry runs `480px -> 500px` over `OVERSHOOT_DURATION`:
+    ///  - a quarter of the way in, `t = 0.25`, and
+    ///    `ease_out_quad(0.25) = 2 * 0.25 - 0.25^2 = 0.5 - 0.0625 = 0.4375`, so
+    ///    `y = 480 + 20 * 0.4375 = 480 + 8.75 = 488.75px`,
+    ///  - `0.99` of the way in, `ease_out_quad(0.99) = 2 * 0.99 - 0.99^2 =
+    ///    1.98 - 0.9801 = 0.9999`, so `y = 480 + 20 * 0.9999 = 499.998px`: two
+    ///    thousandths of a pixel short of the target, and still in flight, which
+    ///    is what makes the duration an assertion rather than an assumption,
+    ///  - at the end, `t = 1` exactly, so `y = 500px` and it deactivates.
+    ///
+    /// There is no second leg, and that is the assertion rather than an
+    /// omission: a return would move the position *back* towards `480px`, and
+    /// **any reversal in the direction of travel reads as a rebound** no matter
+    /// which of the two lasts longer. Two pairs were shipped and measured — 50ms
+    /// out against 60ms back, then 100ms out against 40ms back — and both read
+    /// as one. A reversal is noticed for existing, not for being fast, so the
+    /// duration was never the variable. The carry is the wheel glide's shape: out,
+    /// decelerating, done.
+    #[test]
+    fn multi_reveal_gesture_carries_further_and_stops_there() {
+        let viewport = key_inertia_viewport();
+        let arm = j_gesture(&viewport, 4);
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(480.0),
+            "four one-row presses: 24 * 20px"
+        );
+
+        assert!(
+            viewport.advance_scrolloff_inertia(arm),
+            "a four-row gesture armed no carry"
+        );
+        assert!(
+            viewport.scroll_needs_frames(),
+            "the carry has to keep the frame loop alive while it flies"
+        );
+        assert!(viewport.advance_scroll_animation_at(arm + outward_quarter()));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(488.75),
+            "480 + 20 * 0.4375, a quarter of the way through the carry"
+        );
+        assert!(viewport.advance_scroll_animation_at(arm + outward_just_before_landing()));
+        assert!(
+            viewport.scroll_animation_active(),
+            "the carry finished before OVERSHOOT_DURATION had elapsed"
+        );
+        assert!(
+            viewport.scroll_position().y < px(500.0),
+            "the carry reached its target before OVERSHOOT_DURATION had elapsed"
+        );
+        assert!(viewport.advance_scroll_animation_at(arm + outward_landing()));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(500.0),
+            "the carry did not land on 480 + 4 * 0.25 rows"
+        );
+        assert_eq!(viewport.top_visual_row(), 25, "one row further down the document");
+        assert!(!viewport.scroll_animation_active());
+
+        // The landing is the last transition in the feature: there is nothing
+        // left to arm, so the state goes to `Idle` and the frame loop with it.
+        assert!(
+            !viewport.advance_scrolloff_inertia(arm + outward_landing()),
+            "the carry landing armed a second leg"
+        );
+        assert!(!viewport.scroll_needs_frames(), "a landed carry left the frame loop running");
+        assert!(!viewport.advance_scrolloff_inertia(arm + long_after_the_carry()));
+        assert!(!viewport.scroll_needs_frames());
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(500.0),
+            "the view drifted after the carry landed"
+        );
+    }
+
+    /// A two-row gesture does not carry: `MIN_GESTURE_ROWS - 1 = 2`.
+    ///
+    /// The minimum is a row count, so the way to sit exactly on the wrong side of
+    /// it is to press one time fewer than a qualifying gesture: two presses,
+    /// `2 * 1 = 2` rows, `2 < 3`, no carry. The view is left on `20 + 2 = 22`,
+    /// i.e. `22 * 20 = 440px`, which is the row the second reveal asked for and
+    /// the row the `scrolloff` margin puts the cursor at.
+    #[test]
+    fn below_threshold_gesture_carries_nothing() {
+        let viewport = key_inertia_viewport();
+        let arm = j_gesture(&viewport, 2);
+        assert_eq!(viewport.scroll_position().y, px(440.0), "22 * 20px");
+
+        assert!(
+            !viewport.advance_scrolloff_inertia(arm),
+            "two rows of travel armed a carry"
+        );
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(440.0),
+            "a declined gesture moved the view"
+        );
+        assert!(
+            !viewport.scroll_needs_frames(),
+            "a below-threshold gesture left the frame loop running"
+        );
+        assert!(!viewport.advance_scrolloff_inertia(arm + long_after_the_carry()));
+        assert!(!viewport.scroll_needs_frames());
+        assert_eq!(viewport.scroll_position().y, px(440.0));
+    }
+
+    /// A long hold carries `OVERSHOOT_MAX` rows and no more.
+    ///
+    /// Twelve presses is `12 * 1 = 12` rows, and the cap is applied *after* the
+    /// ratio: `12 * OVERSHOOT_RATIO = 12 * 0.25 = 3.0` rows, held down to
+    /// `OVERSHOOT_MAX = 2.0` rows. At a 20px line height that is `40px`, so the
+    /// carry runs `32 * 20 = 640px -> 680px` — rows 32 to 34 — and stops. Uncapped
+    /// it would have been `60px` and row 35, which is what makes the cap
+    /// load-bearing rather than decorative: this test fails if the `min` is ever
+    /// moved below the ratio, or dropped.
+    ///
+    /// The cap is also the bound on how far the carry can ever move the cursor
+    /// *inside* the band, and therefore on how far the `scrolloff` margin can be
+    /// pushed outward; that argument is spelled out where the carry is armed, and
+    /// pinned across repeated rounds by
+    /// [`repeated_carries_hold_the_margin_instead_of_ratcheting`].
+    ///
+    /// The fixture's scroll range is `20 * 200 - 800 = 3200px` (row 160), so
+    /// nothing here is clipped by the end of the document and the numbers are
+    /// pure carry arithmetic.
+    #[test]
+    fn scrolloff_carry_is_capped_at_the_maximum_rows() {
+        let viewport = key_inertia_viewport();
+        let arm = j_gesture(&viewport, 12);
+        assert_eq!(viewport.scroll_position().y, px(640.0), "32 * 20px");
+
+        assert!(viewport.advance_scrolloff_inertia(arm));
+        assert!(viewport.advance_scroll_animation_at(arm + outward_landing()));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(680.0),
+            "12 * 0.25 = 3 rows should have been held down to OVERSHOOT_MAX = 2 rows = 40px"
+        );
+        assert_eq!(viewport.top_visual_row(), 34, "640 + 40 = 680px, which is row 34");
+
+        assert!(!viewport.advance_scrolloff_inertia(arm + outward_landing()));
+        assert!(!viewport.scroll_needs_frames());
+    }
+
+    /// The carry runs *along* the travel direction, and that is the whole reason
+    /// it is safe.
+    ///
+    /// The sign of the position is not the claim. The claim is about the
+    /// **cursor**: a downward gesture comes to rest with the cursor against the
+    /// `scrolloff = 5` margin above the last visible row, so scrolling further
+    /// down has to move the cursor's offset within the viewport *down*, further
+    /// from that edge. A carry that pushed the cursor the other way would pass
+    /// every distance check, and would only be visible to a user holding `j`.
+    ///
+    /// After four presses from row 20 the cursor is at row `54 + 4 = 58`, and
+    /// `visible_visual_rows() = 40` means the viewport shows rows `top ..= top+39`:
+    ///  - at rest the view is on row 24, so the offset is `58 - 24 = 34` and the
+    ///    margin below is `(24 + 39) - 58 = 5` — exactly `scrolloff`,
+    ///  - a quarter of the way through the carry the position is
+    ///    `480 + 20 * 0.4375 = 488.75px`, still row `floor(488.75/20) = 24`, so
+    ///    the offset is still 34,
+    ///  - at the end (`500px`, row 25) the offset is `58 - 25 = 33`, one row
+    ///    *more* of margin, not one row less: 6 rows below the cursor, and the
+    ///    view stops there.
+    #[test]
+    fn downward_gesture_carries_downward_and_adds_margin() {
+        let viewport = key_inertia_viewport();
+        let arm = j_gesture(&viewport, 4);
+        let cursor_row = 58;
+        let visible_rows = viewport.visible_visual_rows();
+        assert_eq!(visible_rows, 40, "test fixture drifted: 40 visible rows");
+
+        let offset_in_viewport = |viewport: &EditorViewport| -> isize {
+            cursor_row as isize - viewport.top_visual_row() as isize
+        };
+        let margin_below = |viewport: &EditorViewport| -> usize {
+            (viewport.top_visual_row() + visible_rows - 1) - cursor_row
+        };
+
+        assert_eq!(offset_in_viewport(&viewport), 34);
+        assert_eq!(margin_below(&viewport), 5, "the scrolloff margin, at rest");
+
+        assert!(viewport.advance_scrolloff_inertia(arm));
+        assert!(viewport.advance_scroll_animation_at(arm + outward_quarter()));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(488.75),
+            "480 + 20 * 0.4375, a quarter of the way through the carry"
+        );
+        assert_eq!(viewport.top_visual_row(), 24, "floor(488.75 / 20) = 24");
+
+        assert!(viewport.advance_scroll_animation_at(arm + outward_landing()));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(500.0),
+            "a downward carry must increase the position, because a larger position is further down"
+        );
+        assert_eq!(viewport.top_visual_row(), 25);
+        assert_eq!(
+            offset_in_viewport(&viewport),
+            33,
+            "the carry must push the cursor up into the viewport, never down toward the bottom edge"
+        );
+        assert_eq!(margin_below(&viewport), 6, "the carry added a row of margin");
+        assert!(
+            (0..visible_rows as isize).contains(&offset_in_viewport(&viewport)),
+            "the cursor left the painted band during the carry"
+        );
+
+        // The landing ends the feature, so the driver arms nothing further.
+        assert!(!viewport.advance_scrolloff_inertia(arm + outward_landing()));
+        assert!(!viewport.scroll_needs_frames());
+        assert_eq!(
+            offset_in_viewport(&viewport),
+            33,
+            "the cursor must still be inside the viewport once the carry has landed"
+        );
+        assert_eq!(margin_below(&viewport), 6, "the added margin is where the view rests");
+    }
+
+    /// `k` is the mirror image of `j`, in the position *and* in the safety
+    /// argument.
+    ///
+    /// Four presses from row 20 put the cursor at row `25 - 4 = 21` with the view
+    /// on row `20 - 4 = 16`, an offset of 5 rows from the top — exactly the
+    /// `scrolloff = 5` margin above the top edge. The gesture's travel is `-4`
+    /// rows, so `4 * 0.25 = 1.0` row = 20px, and because the gesture travelled
+    /// **up** the carry is `16 * 20 = 320px - 20px = 300px`: the position
+    /// *decreases*, rows 16 -> 15, and stops there.
+    ///
+    /// The safety claim is the mirror of the downward one: a smaller position
+    /// means the cursor's offset within the viewport *increases*, away from the
+    /// top edge. So the carry again only ever adds margin — 5 rows above the
+    /// cursor become 6.
+    #[test]
+    fn backward_gesture_carries_upward_and_adds_margin_symmetrically() {
+        let viewport = key_inertia_viewport();
+        press_k_toward_the_top_margin(&viewport, 4);
+        let arm = land_reveal_tweens(&viewport);
+        let cursor_row = 21;
+        let visible_rows = viewport.visible_visual_rows();
+        assert_eq!(visible_rows, 40, "test fixture drifted: 40 visible rows");
+
+        // At the *top* margin the rows above the cursor and the cursor's offset
+        // within the viewport are the same number, so `offset_in_viewport`
+        // measures both at once and carries the safety claim on its own. (In the
+        // downward test they are different quantities, hence two closures there.)
+        let offset_in_viewport = |viewport: &EditorViewport| -> isize {
+            cursor_row as isize - viewport.top_visual_row() as isize
+        };
+
+        assert_eq!(viewport.scroll_position().y, px(320.0), "16 * 20px");
+        assert_eq!(offset_in_viewport(&viewport), 5, "the scrolloff margin, at rest");
+
+        assert!(viewport.advance_scrolloff_inertia(arm));
+        assert!(viewport.advance_scroll_animation_at(arm + outward_quarter()));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(311.25),
+            "320 - 20 * 0.4375, a quarter of the way through the carry"
+        );
+        assert!(
+            viewport.scroll_animation_active(),
+            "the carry finished before OVERSHOOT_DURATION had elapsed"
+        );
+
+        assert!(viewport.advance_scroll_animation_at(arm + outward_landing()));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(300.0),
+            "an upward carry must decrease the position, because a smaller position is further up"
+        );
+        assert_eq!(viewport.top_visual_row(), 15);
+        assert_eq!(
+            offset_in_viewport(&viewport),
+            6,
+            "the carry must push the cursor down into the viewport, never up past the top edge"
+        );
+        assert!((0..visible_rows as isize).contains(&offset_in_viewport(&viewport)));
+
+        // The landing ends the feature, so the driver arms nothing further.
+        assert!(!viewport.advance_scrolloff_inertia(arm + outward_landing()));
+        assert!(!viewport.scroll_needs_frames());
+        assert_eq!(
+            offset_in_viewport(&viewport),
+            6,
+            "the cursor must still be inside the viewport once the carry has landed"
+        );
+    }
+
+    /// A direction reversal restarts the accumulation instead of netting against
+    /// it, exactly as `record_wheel_gesture` does.
+    ///
+    /// The numbers are chosen so that the two readings disagree. Four `j` presses
+    /// are `+4` rows, and the upward reveal below travels `-4`, so a net sum
+    /// would be `0` and produce no carry at all, while a reset restarts at `-4`
+    /// and carries *upwards*. The peak position is therefore the discriminating
+    /// assertion.
+    ///
+    /// That upward reveal is a four-row jump rather than the one-row jump a `k`
+    /// hold makes, and it has to be: from row 24 the backward band's lower edge
+    /// is `24 + 5 = 29`, so a one-row upward press would have to put the cursor
+    /// below 29 to reveal at all, and it does not. A cursor at 25 is four rows
+    /// inside the margin — where an intervening search or mode change lands — and
+    /// it reveals with `target = 25 - 5 = 20`, i.e. `travel = 20 - 24 = -4`, well
+    /// inside the `visible_rows - margin = 35` snap threshold.
+    ///
+    /// The carry is `4 * 0.25 = 1.0` row = 20px **upwards** from the
+    /// `20 * 20 = 400px` margin: `400px -> 380px`, rows 20 -> 19, and it stops
+    /// there. A net would have left the view on `400px` throughout.
+    #[test]
+    fn direction_reversal_resets_the_gesture_rather_than_netting_it() {
+        let viewport = key_inertia_viewport();
+        j_gesture(&viewport, 4);
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(480.0),
+            "four j presses: row 24"
+        );
+
+        // One upward reveal of -4 rows, arriving while the +4-row gesture is
+        // still collecting. The four presses are *landed* first, so the live row
+        // is the band origin (24) and the new reveal has a real 4-row distance to
+        // travel. Left in flight they would share a live row, the new target
+        // would land on the position already on screen, and the reveal would be
+        // correctly refused as a zero-distance step instead of a reversal.
+        let update = viewport.reveal_visual_row(25, EditorCursorReveal::Scrolloff, 5);
+        assert_eq!(update.top_visual_row, 20, "25 - 5");
+        let arm = land_reveal_tweens(&viewport);
+        assert_eq!(viewport.scroll_position().y, px(400.0), "row 20");
+
+        assert!(
+            viewport.advance_scrolloff_inertia(arm),
+            "the gesture netted to +4 - 4 = 0 rows, which carries nothing"
+        );
+        assert!(viewport.advance_scroll_animation_at(arm + outward_landing()));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(380.0),
+            "the carry must be upwards: the reversal restarted the accumulator at -4 rows"
+        );
+        assert_eq!(viewport.top_visual_row(), 19);
+
+        // The landing ends the feature, so the driver arms nothing further and
+        // the view stays where the carry put it.
+        assert!(!viewport.advance_scrolloff_inertia(arm + outward_landing()));
+        assert!(!viewport.scroll_needs_frames());
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(380.0),
+            "the view drifted after the carry landed"
+        );
+    }
+
+    /// Every route out of the feature has to leave the frame loop off.
+    ///
+    /// Three cases, and the middle one is the one this feature could most
+    /// plausibly ship broken: a gesture that clears its idle window but fails
+    /// its threshold. If that clear were conditional, `scroll_needs_frames()`
+    /// would stay true and the editor would request frames forever after two `j`
+    /// presses. The first case also asserts the positive half of the argument —
+    /// the loop has to stay *on* while the gesture is still collecting, or the
+    /// window could never elapse and the carry would never be decided at all —
+    /// and the two steps after the carry's landing are the whole termination
+    /// argument for the `Outward` phase: the tween is spent, so the driver
+    /// clears the phase and the loop is off on the very next frame.
+    #[test]
+    fn scrolloff_inertia_always_leaves_the_frame_loop_off() {
+        // A qualifying gesture, run all the way through its one carry.
+        let carried = key_inertia_viewport();
+        let arm = j_gesture(&carried, 4);
+        assert!(carried.advance_scrolloff_inertia(arm));
+        assert!(
+            carried.scroll_needs_frames(),
+            "a carry in flight has to keep the frame loop alive"
+        );
+        assert!(carried.advance_scroll_animation_at(arm + outward_landing()));
+        assert!(!carried.advance_scrolloff_inertia(arm + outward_landing()));
+        assert!(!carried.scroll_needs_frames(), "a completed carry left the frame loop running");
+        // And it has to stay off: nothing is waiting to re-arm.
+        assert!(!carried.advance_scrolloff_inertia(arm + long_after_the_carry()));
+        assert!(!carried.scroll_needs_frames());
+
+        // A below-threshold gesture: the same decision point, the other branch.
+        let declined = key_inertia_viewport();
+        press_j_toward_the_bottom_margin(&declined, 2);
+        let arm = land_reveal_tweens(&declined);
+        assert!(
+            declined.scroll_needs_frames(),
+            "a collecting gesture has to keep the frame loop alive until its window elapses"
+        );
+        assert!(!declined.advance_scrolloff_inertia(arm));
+        assert!(!declined.scroll_needs_frames(), "a declined gesture left the frame loop running");
+
+        // The engine off: the feature must not even ask for a frame.
+        let disabled = scrolloff_reveal_viewport(200);
+        disabled.set_smooth_scrolling(false);
+        assert!(!disabled.smooth_scrolling_enabled());
+        press_j_toward_the_bottom_margin(&disabled, 4);
+        assert_eq!(disabled.scroll_position().y, px(480.0), "row 24, reached instantly");
+        assert!(
+            !disabled.scroll_needs_frames(),
+            "a disabled feature asked the render pass for a frame"
+        );
+        assert!(!disabled.advance_scrolloff_inertia(Instant::now() + KEY_IDLE_PROBE));
+        assert!(!disabled.scroll_needs_frames());
+    }
+
+    /// With smooth scrolling off the feature is a complete no-op.
+    ///
+    /// The same four presses are made, but every reveal snaps instead of
+    /// easing, so none of them is a glide and none of them may feed a gesture.
+    /// The view still lands on row 24 — `480px`, reached by four instant writes
+    /// rather than by one tween — because the band is a property of the cursor
+    /// and the margins and is unchanged by the switch. What must not happen is
+    /// anything after that: no carry armed, no extra frame requested, and probing
+    /// far past the idle window changes nothing at all.
+    #[test]
+    fn scrolloff_inertia_is_inert_when_smooth_scrolling_is_off() {
+        let viewport = scrolloff_reveal_viewport(200);
+        viewport.scroll_to_vertical_position_from_scrollbar(px(400.0));
+        viewport.set_smooth_scrolling(false);
+        assert!(!viewport.smooth_scrolling_enabled());
+        assert_eq!(viewport.top_visual_row(), 20, "fixture setup");
+
+        for n in 1..=4 {
+            let update = viewport.reveal_visual_row(54 + n, EditorCursorReveal::Scrolloff, 5);
+            assert_eq!(
+                update.top_visual_row,
+                20 + n,
+                "the band is unchanged by the switch; only the route to the row is"
+            );
+            assert!(
+                !viewport.scroll_animation_active(),
+                "press {n} armed a tween with the engine off"
+            );
+            assert!(
+                !viewport.scroll_needs_frames(),
+                "press {n} made a disabled feature ask for a frame"
+            );
+        }
+        assert_eq!(viewport.scroll_position().y, px(480.0), "row 24, reached instantly");
+
+        let probe = Instant::now() + KEY_IDLE_PROBE;
+        assert!(!viewport.advance_scrolloff_inertia(probe));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(480.0),
+            "a disabled feature moved the view"
+        );
+        assert!(!viewport.advance_scrolloff_inertia(probe + Duration::from_secs(5)));
+        assert!(!viewport.scroll_needs_frames());
+        assert_eq!(viewport.scroll_position().y, px(480.0));
+    }
+
     #[test]
     fn viewport_cursor_reveal_request_cancels_an_in_flight_scroll_animation() {
         let mut viewport = EditorViewport::new(px(20.0));
@@ -2899,18 +4276,44 @@ mod tests {
         assert_eq!(viewport.scroll_position().y, px(20.0));
     }
 
+    /// The three *deliberate alignment* reveals are instant, and stay instant
+    /// with smooth scrolling on.
+    ///
+    /// `align_view_top`/`_center`/`_bottom` are user-issued jumps, not cursor
+    /// follow, so a tween there would put latency between the keypress and the
+    /// requested alignment. Only `Scrolloff` eases. `scrolloff` is 0 throughout
+    /// so the margin cannot muddy the arithmetic, and the numbers below are
+    /// read straight off the alignment rule, not off a helper.
+    ///
+    /// Arithmetic, with 800x100 bounds and a 20px line height:
+    /// `visible_visual_rows() = floor(100 / 20) = 5`.
+    ///  - `Top`: target is the cursor row itself -> `20` -> `20 * 20 = 400px`.
+    ///  - `Center`: `visual_row - visible_rows / 2 = 20 - 2 = 18` -> `360px`.
+    ///  - `Bottom`: `visual_row - (visible_rows - 1) = 20 - 4 = 16` -> `320px`.
     #[test]
-    fn viewport_reveal_visual_row_stays_instant_with_smooth_scrolling() {
-        let mut viewport = EditorViewport::new(px(20.0));
-        viewport.set_layout(px(20.0), size(px(800.0), px(100.0)), 100);
-        viewport.set_smooth_scrolling(true);
+    fn viewport_explicit_alignment_reveals_stay_instant_with_smooth_scrolling() {
+        let cases = [
+            (EditorCursorReveal::Top, px(400.0), 20),
+            (EditorCursorReveal::Center, px(360.0), 18),
+            (EditorCursorReveal::Bottom, px(320.0), 16),
+        ];
 
-        let update = viewport.reveal_visual_row(20, EditorCursorReveal::Top, 0);
+        for (reveal, expected_y, expected_row) in cases {
+            let mut viewport = EditorViewport::new(px(20.0));
+            viewport.set_layout(px(20.0), size(px(800.0), px(100.0)), 100);
+            viewport.set_smooth_scrolling(true);
 
-        assert!(update.changed);
-        assert!(!viewport.scroll_animation_active());
-        assert_eq!(viewport.scroll_position().y, px(400.0));
-        assert_eq!(viewport.top_visual_row(), 20);
+            let update = viewport.reveal_visual_row(20, reveal, 0);
+
+            assert_eq!(viewport.visible_visual_rows(), 5, "test fixture drifted");
+            assert!(update.changed, "{reveal:?} did not move the view");
+            assert!(
+                !viewport.scroll_animation_active(),
+                "{reveal:?} armed a tween; only Scrolloff may ease"
+            );
+            assert_eq!(viewport.scroll_position().y, expected_y, "{reveal:?}");
+            assert_eq!(viewport.top_visual_row(), expected_row, "{reveal:?}");
+        }
     }
 
     #[test]
@@ -3635,6 +5038,130 @@ mod tests {
         assert!(update.helix_view_synced);
         assert_eq!(viewport.top_visual_row(), eof_row);
         assert_eq!(update.helix_snapshot.top_visual_row, eof_row);
+    }
+
+    /// A tween armed *during* paint is the one thing the pre-paint frame driver
+    /// cannot see, so the paint has to hand the frame loop a follow-up.
+    ///
+    /// `view_component.rs` consults `scroll_needs_frames()` at the top of
+    /// `render`, which has already run by the time `sync_surface_layout` applies
+    /// the cursor reveal. Before the follow-up frame existed, a `Scrolloff` reveal
+    /// that eased was armed with nothing left to drive it and the view sat still
+    /// for good: the tween was live, the loop had ended, and the user saw a
+    /// frozen viewport.
+    ///
+    /// This reproduces that ordering exactly — the driver's own check runs first
+    /// and declines to ask for a frame, then the paint arms the tween, then a
+    /// driver pass runs to completion. The loop mirrors the one in
+    /// `view_component.rs`, with an injected clock so the samples are exact
+    /// arithmetic and the test is neither slow nor timing-sensitive.
+    ///
+    /// Fixture: 801px-tall bounds make the viewport `(801 - 1) = 800px`, so
+    /// `visible_visual_rows() = floor(800 / 20) = 40`. The document is 200 lines
+    /// of `line N`, which is far wider than the ~26 text columns a 240px surface
+    /// leaves after the gutter, so nothing soft-wraps and the cursor's visual row
+    /// is its line number. `scrolloff = 5` with the cursor parked on line 35:
+    /// `upper = 0 + (40 - 5) = 35`, so `35 >= 35` fires, the target is
+    /// `35 + 5 + 1 - 40 = 1`, and `travel_rows = 1` gives a 66ms eased reveal
+    /// rather than an instant jump.
+    #[tokio::test(flavor = "current_thread")]
+    async fn paint_that_arms_a_scrolloff_tween_needs_the_follow_up_frame_to_run_it() {
+        let text = (0..200)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let (mut editor, doc_id, view_id) = test_editor_with_text(&text);
+        {
+            let doc = editor.document_mut(doc_id).unwrap();
+            let cursor = doc.text().line_to_char(35);
+            doc.set_selection(view_id, Selection::point(cursor));
+        }
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_smooth_scrolling(true);
+        let layout = EditorViewportSurfaceLayout {
+            theme: None,
+            bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(240.0), px(801.0))),
+            cell_width: px(8.0),
+            line_height: px(20.0),
+            minimum_columns: 1,
+            extra_gutter_columns: 0,
+            scrolloff: 5,
+            cursor_reveal: Some(EditorCursorReveal::Scrolloff),
+        };
+
+        // The driver's check, run where `render` runs it: before the paint below,
+        // nothing wants a frame, so no follow-up would be scheduled.
+        assert!(
+            !viewport.scroll_needs_frames(),
+            "the driver would have asked for a frame before anything moved"
+        );
+        assert!(!viewport.scroll_animation_active());
+
+        let update = viewport
+            .sync_surface_layout(&mut editor, doc_id, view_id, layout)
+            .unwrap();
+
+        assert_eq!(
+            viewport.visible_visual_rows(),
+            40,
+            "test fixture drifted: the target row below assumes 40 visible rows"
+        );
+        assert!(
+            update.cursor_revealed,
+            "the paint armed motion without reporting it, so the render pass cannot \
+             schedule the follow-up frame that drives it"
+        );
+        assert!(
+            viewport.scroll_animation_active(),
+            "Scrolloff armed no tween, so this test would pass without the follow-up frame"
+        );
+        assert_eq!(
+            viewport.top_visual_row(),
+            0,
+            "the tween is armed but has not moved the viewport yet"
+        );
+        // The view-position plan is built from the *live* row, so it is still 0
+        // here: Helix is synced to what is on screen, and the tween's own
+        // whole-row crossing is what arms the sync that follows the ease. The
+        // tween surviving this paint is the assertion that matters, and it is the
+        // one the view-position sync above could have broken.
+        assert_eq!(update.view_position_plan.top_visual_row, 0);
+
+        // The driver's pass, 16ms at a time.
+        //
+        // This loop is a miniature of the real driver in `view_component.rs` and
+        // must call the same advances in the same order. `scroll_needs_frames()`
+        // has three terms — the in-flight tween, a pending wheel gesture, and a
+        // pending cursor-follow inertia — and only the matching driver can clear
+        // the latter two. A loop that advanced the tween alone spins forever the
+        // moment a reveal leaves an inertia collecting, and the failure reads as
+        // "the feature never terminates" rather than "this copy drifted". When a
+        // term is added to that predicate, its driver belongs here too.
+        //
+        // `frames` is a bound, not an expectation: the loop's clock starts after
+        // the tween's own, so the count depends on how long the arming call took.
+        // What must hold is that the loop terminates and lands the reveal.
+        let mut now = Instant::now();
+        let mut frames = 0;
+        while viewport.scroll_needs_frames() {
+            now += Duration::from_millis(16);
+            viewport.advance_scroll_animation_at(now);
+            viewport.advance_wheel_glide(now);
+            viewport.advance_scrolloff_inertia(now);
+            frames += 1;
+            assert!(frames <= 16, "the frame loop did not terminate");
+        }
+        assert!(frames > 0, "the loop never ran, so the tween was never driven");
+
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(20.0),
+            "1 row over editor_jump_duration(1) = 66ms"
+        );
+        assert_eq!(viewport.top_visual_row(), 1, "the reveal never landed on its target");
+        assert!(
+            viewport.has_pending_view_sync(),
+            "crossing a whole row must arm the Helix sync"
+        );
     }
 
     #[test]
