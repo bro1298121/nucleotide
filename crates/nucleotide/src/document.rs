@@ -545,6 +545,18 @@ impl Render for DocumentView {
         self.editor_state
             .set_gutter_run_button_lines(runnable_tasks_by_line.keys().copied());
 
+        // Resolve the effective smooth-scroll flag at the read site so runtime
+        // reduced-motion / animation toggles take effect without a config reload.
+        // `animations_enabled` already ANDs `!enable_reduced_motion`, so the
+        // reduced-motion check does not need to be repeated here.
+        let configured_smooth_scrolling = cx
+            .global::<nucleotide_types::EditorScrollConfig>()
+            .smooth_scrolling;
+        let smooth_scrolling = configured_smooth_scrolling && nucleotide_ui::animations_enabled(cx);
+        self.editor_state
+            .viewport()
+            .set_smooth_scrolling(smooth_scrolling);
+
         let markdown_document = markdown_document_info(&self.core, self.view_id, cx);
         let markdown_mode = markdown_document
             .as_ref()

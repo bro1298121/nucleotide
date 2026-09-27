@@ -17,7 +17,8 @@ use nucleotide_logging::{PerfTimer, trace};
 
 use crate::{
     EDITOR_MINIMUM_VIEWPORT_COLUMNS, EditorDocumentMetrics, EditorDocumentMetricsCache,
-    EditorDocumentMetricsCacheResolveParams, ScrollManager, soft_wrap_visual_position,
+    EditorDocumentMetricsCacheResolveParams, ScrollManager, scroll_animation::editor_jump_duration,
+    soft_wrap_visual_position,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -493,7 +494,7 @@ impl EditorViewport {
     }
 
     pub fn set_scroll_offset_from_scrollbar(&self, offset: Point<Pixels>) {
-        self.scroll.set_scroll_offset(offset);
+        self.scroll.set_scroll_offset(offset, "scrollbar_offset");
     }
 
     pub fn viewport_bounds(&self) -> Bounds<Pixels> {
@@ -531,6 +532,10 @@ impl EditorViewport {
                 self.scroll_by_visual_page_fraction(pages, divisor)
             }
             EditorViewportScrollRequest::CursorReveal(reveal) => {
+                // Cursor correctness beats smoothness: a reveal jump has to land
+                // on the cursor immediately, so any in-flight scroll tween is
+                // dropped before the reveal is queued.
+                self.scroll.animation_cancel("cursor_reveal_request");
                 self.request_cursor_reveal(reveal);
                 ViewportScrollUpdate {
                     changed: false,
@@ -562,18 +567,28 @@ impl EditorViewport {
 
         if rows != 0 {
             let delta_y = self.scroll.line_height() * rows as f32;
-            self.scroll
-                .set_scroll_position(point(old_position.x, old_position.y + delta_y));
+            let target = point(old_position.x, old_position.y + delta_y);
+            if self.scroll.scroll_animation_enabled() {
+                self.scroll
+                    .animate_scroll_to(target, editor_jump_duration(rows));
+            } else {
+                self.scroll.set_scroll_position(target, "instant_scroll_fallback");
+            }
         }
 
-        let new_position = self.scroll_position();
-        let new_top_visual_row = self.top_visual_row();
+        // Report the destination, not the live position. A smooth tween has not
+        // moved the viewport yet, but the caller still has to learn that the
+        // request moved the top visual row: it decides `cx.notify()` and feeds
+        // the Helix cursor sync, so reporting the current row would make
+        // `page_down` silently stop moving the cursor with no repaint at all.
+        let new_position = self.scroll.destination_position();
+        let new_top_visual_row = self.scroll.pixels_to_anchor(new_position.y);
 
         ViewportScrollUpdate {
             changed: old_position != new_position,
             crossed_visual_rows: new_top_visual_row as isize - old_top_visual_row as isize,
             top_visual_row: new_top_visual_row,
-            offset_within_row: self.offset_within_row(),
+            offset_within_row: self.offset_within_row_for(new_position.y),
         }
     }
 
@@ -581,7 +596,8 @@ impl EditorViewport {
         let old_position = self.scroll_position();
         let old_top_visual_row = self.top_visual_row();
 
-        self.scroll.set_scroll_position(point(old_position.x, y));
+        self.scroll
+            .set_scroll_position(point(old_position.x, y), "vertical_scrollbar_drag");
 
         let new_position = self.scroll_position();
         let new_top_visual_row = self.top_visual_row();
@@ -598,7 +614,8 @@ impl EditorViewport {
         let old_position = self.scroll_position();
         let old_top_visual_row = self.top_visual_row();
 
-        self.scroll.set_scroll_position(point(x, old_position.y));
+        self.scroll
+            .set_scroll_position(point(x, old_position.y), "horizontal_scrollbar_drag");
 
         let new_position = self.scroll_position();
         let new_top_visual_row = self.top_visual_row();
@@ -640,6 +657,25 @@ impl EditorViewport {
         let old_position = self.scroll_position();
         let old_top_visual_row = self.top_visual_row();
         let visible_rows = self.visible_visual_rows();
+        let tween_active = self.scroll_animation_active();
+        let tween_destination_row =
+            self.scroll.pixels_to_anchor(self.scroll.destination_position().y);
+
+        // Entry log. `old_top_visual_row` is the *live* row, so during a tween
+        // it is mid-flight rather than the destination; comparing it against
+        // `tween_destination_row` is what shows whether the scrolloff band below
+        // is being evaluated against a mid-tween origin.
+        trace!(
+            reason = "reveal_visual_row",
+            old_top_visual_row,
+            tween_active,
+            tween_destination_row,
+            visual_row,
+            visible_rows,
+            scrolloff,
+            reveal = ?reveal,
+            "EditorViewport reveal entry"
+        );
 
         let target_top = match reveal {
             EditorCursorReveal::Scrolloff => {
@@ -670,11 +706,28 @@ impl EditorViewport {
         };
 
         if let Some(target_top) = target_top {
-            self.scroll.set_scroll_position(point(
-                old_position.x,
-                self.scroll.anchor_to_pixels(target_top),
-            ));
+            // Deliberately uses the instant `set_scroll_position` path: a cursor
+            // reveal has to be correct on the very next frame, so it never goes
+            // through the smooth tween.
+            self.scroll.set_scroll_position(
+                point(old_position.x, self.scroll.anchor_to_pixels(target_top)),
+                "reveal_visual_row",
+            );
         }
+
+        // Result log. `target_top` is the row the band chose, which is the row
+        // the instant jump above moved to. `None` means the band judged the
+        // cursor already visible and nothing moved.
+        trace!(
+            reason = "reveal_visual_row",
+            old_top_visual_row,
+            tween_active,
+            tween_destination_row,
+            visual_row,
+            target_top = ?target_top,
+            new_top_visual_row = self.top_visual_row(),
+            "EditorViewport reveal applied"
+        );
 
         let new_position = self.scroll_position();
         let new_top_visual_row = self.top_visual_row();
@@ -750,9 +803,11 @@ impl EditorViewport {
         } else {
             self.cell_width.get() * horizontal_offset as f32
         };
-        let current = self.scroll_position();
-        self.scroll
-            .set_scroll_position_from_view_sync_preserving_subrow_offset(point(x, current.y));
+        // Axis-only write. This sync cannot move the viewport vertically, so it
+        // must not cancel a vertical scroll tween; it used to route through the
+        // general view-sync setter, whose then-unconditional `animation.cancel`
+        // killed an in-flight tween on every painted frame.
+        self.scroll.set_horizontal_scroll_offset_from_view_sync(x);
     }
 
     fn horizontal_offset_columns(&self, text_format: &TextFormat) -> usize {
@@ -1129,6 +1184,50 @@ impl EditorViewport {
         self.scroll.vertical_offset_within_line()
     }
 
+    fn offset_within_row_for(&self, position_y: Pixels) -> Pixels {
+        self.scroll.vertical_offset_within_line_at(position_y)
+    }
+
+    /// Enable or disable smooth scrolling of discrete scroll requests.
+    ///
+    /// Disabled by default, in which case every request lands instantly.
+    pub fn set_smooth_scrolling(&self, enabled: bool) {
+        self.scroll.set_scroll_animation_enabled(enabled);
+    }
+
+    pub fn smooth_scrolling_enabled(&self) -> bool {
+        self.scroll.scroll_animation_enabled()
+    }
+
+    /// Whether a scroll tween is currently in flight. Cheap enough to use as a
+    /// per-frame guard before driving the animation.
+    pub fn scroll_animation_active(&self) -> bool {
+        self.scroll.scroll_animation_active()
+    }
+
+    /// Whether the render pass must keep requesting frames to make scroll
+    /// progress.
+    ///
+    /// This is about *desired* motion, not per-frame movement: a frame that
+    /// moves no pixels still has to schedule the next one, otherwise a tween
+    /// stalls. Do not collapse this into `scroll_animation_active()`; a later
+    /// phase widens it to cover a wheel momentum arming window.
+    pub fn scroll_needs_frames(&self) -> bool {
+        self.scroll.scroll_needs_frames()
+    }
+
+    /// Advance an in-flight tween to the current instant, returning whether the
+    /// scroll position changed. Call once per rendered frame.
+    pub fn advance_scroll_animation(&self) -> bool {
+        self.scroll.advance_scroll_animation()
+    }
+
+    /// Deterministic variant of [`Self::advance_scroll_animation`] for tests.
+    #[cfg(test)]
+    pub(crate) fn advance_scroll_animation_at(&self, now: std::time::Instant) -> bool {
+        self.scroll.advance_scroll_animation_at(now)
+    }
+
     pub fn visible_visual_range(&self) -> (usize, usize) {
         let position = self.scroll_position();
         let viewport = self.scroll.viewport_size();
@@ -1416,6 +1515,7 @@ fn document_cursor_visual_row_for_cursor(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use arc_swap::{ArcSwap, access::Map};
     use gpui::{Bounds, point, px, size};
@@ -1581,6 +1681,506 @@ mod tests {
         assert_eq!(update.crossed_visual_rows, 2);
         assert_eq!(update.top_visual_row, 2);
         assert!(viewport.has_pending_view_sync());
+    }
+
+    #[test]
+    fn viewport_smooth_scrolling_is_disabled_by_default() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(100.0), px(100.0)), 50);
+
+        assert!(!viewport.smooth_scrolling_enabled());
+
+        let update = viewport.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
+
+        assert!(update.changed);
+        assert_eq!(viewport.scroll_position().y, px(100.0));
+        assert!(!viewport.scroll_animation_active());
+    }
+
+    #[test]
+    fn viewport_smooth_scroll_reports_destination_before_the_tween_moves() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(100.0), px(100.0)), 50);
+        let mut instant = EditorViewport::new(px(20.0));
+        instant.set_layout(px(20.0), size(px(100.0), px(100.0)), 50);
+
+        viewport.set_smooth_scrolling(true);
+        assert!(viewport.smooth_scrolling_enabled());
+
+        let update = viewport.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
+
+        // The destination has to be reported even though the tween has not moved
+        // the viewport yet, otherwise no repaint is ever scheduled.
+        assert!(update.changed);
+        assert_eq!(update.crossed_visual_rows, 5);
+        assert_eq!(update.top_visual_row, 5);
+        assert_eq!(update.offset_within_row, px(0.0));
+        assert_eq!(viewport.scroll_position().y, px(0.0));
+        assert!(viewport.scroll_animation_active());
+
+        // Driving the tween past its duration lands exactly where the instant
+        // path would have put the viewport.
+        assert!(viewport.advance_scroll_animation_at(Instant::now() + Duration::from_millis(500)));
+        assert_eq!(viewport.scroll_position().y, px(100.0));
+        assert_eq!(viewport.top_visual_row(), 5);
+        assert!(!viewport.scroll_animation_active());
+
+        instant.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
+        assert_eq!(viewport.scroll_position(), instant.scroll_position());
+    }
+
+    #[test]
+    fn viewport_smooth_scroll_moves_continuously_toward_the_destination() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(100.0), px(100.0)), 50);
+        viewport.set_smooth_scrolling(true);
+
+        let update = viewport.apply_scroll_request(EditorViewportScrollRequest::VisualRows(3));
+        let start = Instant::now();
+        assert_eq!(update.top_visual_row, 3);
+        assert_eq!(viewport.scroll_position().y, px(0.0));
+
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(40)));
+        let mid = viewport.scroll_position().y;
+        assert!(mid > px(0.0));
+        assert!(mid < px(60.0));
+
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(1000)));
+        assert_eq!(viewport.scroll_position().y, px(60.0));
+        assert!(!viewport.scroll_animation_active());
+    }
+
+    #[test]
+    fn viewport_scroll_needs_frames_tracks_tween_liveness() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(100.0), px(100.0)), 50);
+
+        assert!(!viewport.scroll_needs_frames());
+
+        viewport.set_smooth_scrolling(true);
+        assert!(!viewport.scroll_needs_frames());
+
+        viewport.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
+
+        // Frames are needed from the moment the tween is armed, even before any
+        // frame has moved a pixel.
+        assert!(viewport.scroll_needs_frames());
+        assert!(viewport.scroll_animation_active());
+
+        assert!(viewport.advance_scroll_animation_at(Instant::now() + Duration::from_millis(500)));
+
+        assert!(!viewport.scroll_needs_frames());
+        assert!(!viewport.scroll_animation_active());
+    }
+
+    /// Reproduces the traced `page_down` failure and pins the mechanism the
+    /// workspace fix depends on.
+    ///
+    /// The trace: a page scroll arms a tween, `sync_cursor_after_native_page_scroll`
+    /// moves the Helix cursor into the *destination* page, `handle_selection_changed`
+    /// arms a `Scrolloff` reveal, and the next painted frame consumes that reveal
+    /// against the still-mid-tween `top_visual_row` and takes the tween down.
+    ///
+    /// `Workspace::handle_viewport_scroll` now calls `clear_cursor_reveal_request`
+    /// after the cursor sync, i.e. it *discards* the armed request. This asserts
+    /// that discarding is sufficient: the tween must run to its destination, while
+    /// applying the very same request one frame earlier kills it.
+    ///
+    /// This does not cover the workspace wiring itself — `handle_viewport_scroll`
+    /// needs a `Context<Workspace>` and cannot be driven headlessly. It covers the
+    /// viewport contract the wiring relies on.
+    #[test]
+    fn page_scroll_reveal_kills_the_tween_only_when_it_is_applied() {
+        // Applying the armed reveal is what kills the tween.
+        let mut killed = EditorViewport::new(px(20.0));
+        killed.set_layout(px(20.0), size(px(800.0), px(800.0)), 100);
+        killed.set_smooth_scrolling(true);
+        let update = killed.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
+        assert_eq!(update.top_visual_row, 40);
+        assert!(killed.scroll_animation_active());
+
+        killed.request_cursor_reveal(EditorCursorReveal::Scrolloff);
+        assert!(killed.advance_scroll_animation_at(Instant::now() + Duration::from_millis(20)));
+        let armed = killed
+            .take_cursor_reveal_request()
+            .expect("armed reveal from the selection change");
+        killed.reveal_visual_row(45, armed, 5);
+
+        assert!(!killed.scroll_animation_active());
+
+        // Discarding the same request — what `clear_cursor_reveal_request` does —
+        // leaves the tween running to its destination.
+        let mut survived = EditorViewport::new(px(20.0));
+        survived.set_layout(px(20.0), size(px(800.0), px(800.0)), 100);
+        survived.set_smooth_scrolling(true);
+        let update = survived.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
+        assert_eq!(update.top_visual_row, 40);
+        assert!(survived.scroll_animation_active());
+
+        survived.request_cursor_reveal(EditorCursorReveal::Scrolloff);
+        assert_eq!(
+            survived.take_cursor_reveal_request(),
+            Some(EditorCursorReveal::Scrolloff),
+            "the selection change armed a reveal"
+        );
+        assert!(survived.scroll_animation_active());
+
+        assert!(survived.advance_scroll_animation_at(Instant::now() + Duration::from_millis(500)));
+
+        assert_eq!(survived.top_visual_row(), 40);
+        assert!(!survived.scroll_animation_active());
+    }
+
+    /// KNOWN-FAILURE CHARACTERIZATION — pins current, incorrect behaviour.
+    ///
+    /// `reveal_visual_row` derives its `Scrolloff` band from `top_visual_row()`,
+    /// which during a tween is the *mid-tween* row rather than the destination
+    /// row. The traced `page_down` case lands here: a 40-row page scroll puts the
+    /// destination at row 40 and the cursor at destination + scrolloff = 45, but
+    /// on the first painted frame the live row is still small, so the band is
+    /// computed around the wrong origin, 45 is judged out of band, and the
+    /// viewport is dragged back to roughly row 11 instead of row 40.
+    ///
+    /// The next phase fixes this (read the band origin from `destination_position()`
+    /// and retarget instead of cancelling). It is pinned here so that fix has a
+    /// red test to turn green. Do not correct the expected values below without
+    /// fixing the behaviour they describe.
+    #[test]
+    fn known_failure_reveal_band_is_computed_from_the_mid_tween_row() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(800.0), px(800.0)), 100);
+        viewport.set_smooth_scrolling(true);
+
+        let update = viewport.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
+        assert_eq!(update.top_visual_row, 40, "destination top visual row");
+
+        assert!(viewport.advance_scroll_animation_at(Instant::now() + Duration::from_millis(20)));
+        let live_row = viewport.top_visual_row();
+        assert!(
+            live_row < 40,
+            "the tween should still be mid-flight, live row {live_row}"
+        );
+
+        // 45 is where the cursor really is: destination (40) + scrolloff (5).
+        let reveal = viewport.reveal_visual_row(45, EditorCursorReveal::Scrolloff, 5);
+
+        assert!(reveal.changed);
+        // Wrong on purpose. The band origin is `live_row` (the mid-tween row, 5),
+        // not the destination (40), so the *absolute* row the reveal lands on is
+        // `cursor + margin + 1 - visible_rows` = 45 + 5 + 1 - 40 = 11 — 29 rows
+        // short of the destination. The correct target is row 40.
+        assert_eq!(viewport.top_visual_row(), 11);
+        assert!(
+            viewport.top_visual_row() < 40,
+            "the reveal should miss the destination row 40 entirely, not land on it"
+        );
+        // The reveal still cancels the tween, which is exactly why the workspace
+        // fix has to clear the request before it is ever applied.
+        assert!(!viewport.scroll_animation_active());
+    }
+
+    /// Regression: a Helix horizontal-offset sync must not cancel an in-flight
+    /// vertical scroll tween.
+    ///
+    /// `sync_from_helix_horizontal_offset` passed `current.y` straight into
+    /// `set_scroll_position_from_view_sync_preserving_subrow_offset`, which
+    /// cancelled unconditionally.
+    /// Because the incoming
+    /// line always equalled the current line, that call could not change the
+    /// vertical position at all — its only effect on a tween was to destroy it.
+    /// `page_down` therefore animated a single frame and stopped partway.
+    ///
+    /// The sibling case, a *vertical* sync that also resolves to the same row,
+    /// is covered by `same_row_helix_vertical_sync_does_not_cancel_an_in_flight_tween`.
+    #[test]
+    fn helix_horizontal_sync_does_not_cancel_an_in_flight_vertical_tween() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(400.0), px(800.0)), 100);
+        viewport.set_content_width(px(2000.0));
+        viewport.set_cell_width(px(10.0));
+        viewport.set_smooth_scrolling(true);
+
+        // 40 rows -> 800px -> the 280ms duration cap.
+        let update = viewport.scroll_by_visual_rows(40);
+        assert_eq!(update.top_visual_row, 40);
+        assert!(viewport.scroll_animation_active());
+
+        // Sample at half the flight, which reads ~600px under ease_out_quad:
+        // y is strictly inside the travel, so the tween is demonstrably mid-air.
+        assert!(viewport.advance_scroll_animation_at(Instant::now() + Duration::from_millis(140)));
+        let mid_position = viewport.scroll_position();
+        assert!(mid_position.y > px(0.0), "the tween never advanced");
+        assert!(
+            mid_position.y < px(800.0),
+            "the tween had already landed at {mid_position:?}"
+        );
+        assert!(viewport.scroll_animation_active());
+
+        let no_soft_wrap = TextFormat {
+            soft_wrap: false,
+            viewport_width: 40,
+            ..TextFormat::default()
+        };
+        viewport.sync_from_helix_horizontal_offset(7, &no_soft_wrap);
+
+        assert_eq!(viewport.scroll_position().x, px(70.0), "x was not updated");
+        assert!(
+            viewport.scroll_animation_active(),
+            "the horizontal sync cancelled the vertical tween"
+        );
+        assert_eq!(
+            viewport.scroll_position().y,
+            mid_position.y,
+            "the horizontal sync moved the vertical position"
+        );
+
+        // And the tween is still live: it can still be driven to its destination.
+        assert!(viewport.advance_scroll_animation_at(Instant::now() + Duration::from_millis(500)));
+        assert_eq!(viewport.scroll_position().y, px(800.0));
+        assert!(!viewport.scroll_animation_active());
+    }
+
+    /// Regression: a same-row Helix *vertical* view sync must not cancel an
+    /// in-flight vertical scroll tween.
+    ///
+    /// Prevents the traced `page_down` failure: the 228ms tween lived 2.85ms and
+    /// covered 2.5px of 728px because a sync arrived with `current_row = 0
+    /// incoming_row = 0`. That sync resolved `y` to `current.y` — it moved
+    /// nothing vertically — and still cancelled the flight, because the cancel
+    /// used to sit above the `preserved_subrow` test.
+    ///
+    /// Sample arithmetic (one row at 20px => 80px viewport, 100 content rows, so
+    /// 1200px of travel and no clamping):
+    ///  - `scroll_by_visual_rows(1)` arms 0 -> 20px over `editor_jump_duration(1)`
+    ///    = 60 + 6 = 66ms.
+    ///  - At 16ms, `t = 16/66 = 0.2424`, `ease_out_quad(t) = 2t - t^2 =
+    ///    0.4848 - 0.0588 = 0.4261`, so `y = 20 * 0.4261 = 8.52px`.
+    ///  - `8.52 < 20`, so the sample is still *inside* row 0: the live top row and
+    ///    Helix's row 0 are the same row, which is what makes the sync a same-row
+    ///    no-op. (The exact sample is not asserted — only the one-sided bounds
+    ///    that must hold: it must be above 0 and below the row boundary.)
+    #[test]
+    fn same_row_helix_vertical_sync_does_not_cancel_an_in_flight_tween() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(400.0), px(800.0)), 100);
+        viewport.set_smooth_scrolling(true);
+
+        // One row down: 0 -> 20px over 66ms.
+        let update = viewport.scroll_by_visual_rows(1);
+        assert_eq!(update.top_visual_row, 1);
+        assert!(viewport.scroll_animation_active());
+
+        let start = Instant::now();
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(16)));
+        let sub_row = viewport.scroll_position();
+
+        // Guards the arithmetic in the doc comment: the sample has to be mid-tween
+        // *and* sub-row, or this test is not exercising the same-row branch.
+        assert!(
+            viewport.scroll_animation_active(),
+            "the tween completed before the sample"
+        );
+        assert!(
+            sub_row.y > px(0.0) && sub_row.y < px(20.0),
+            "sample {sub_row:?} did not land inside row 0"
+        );
+        assert_eq!(viewport.top_visual_row(), 0);
+
+        // Helix's stored row is 0, the same row the live tween is inside, so this
+        // sync has no vertical effect to defend and must leave the tween alone.
+        viewport.sync_from_helix_top_visual_row(0);
+
+        assert!(
+            viewport.scroll_animation_active(),
+            "a same-row view sync cancelled the tween"
+        );
+        assert_eq!(
+            viewport.scroll_position(),
+            sub_row,
+            "the same-row view sync moved the scroll position"
+        );
+
+        // And the spared tween is live, not merely still flagged: it can still be
+        // driven the rest of the way to row 1.
+        assert!(viewport.advance_scroll_animation_at(Instant::now() + Duration::from_millis(500)));
+        assert_eq!(viewport.scroll_position().y, px(20.0));
+        assert_eq!(viewport.top_visual_row(), 1);
+        assert!(!viewport.scroll_animation_active());
+    }
+
+    /// The guard on the fix above: a vertical view sync that *does* change the
+    /// top row still wins over an in-flight tween.
+    ///
+    /// A lazy "just delete the cancel" fix passes the test above and breaks this
+    /// one: the tween would keep flying to row 4 while the viewport is required
+    /// to sit on Helix's row 0, and the crossing-gated sync would then report a
+    /// top row the cursor is nowhere near. Helix owns the top row; the tween is
+    /// only ever an animation of it.
+    ///
+    /// Sample arithmetic (four rows at 20px):
+    ///  - `scroll_by_visual_rows(4)` arms 0 -> 80px over `editor_jump_duration(4)`
+    ///    = 60 + 24 = 84ms.
+    ///  - At 30ms, `t = 30/84 = 0.3571`, `ease_out_quad(t) = 0.7143 - 0.1276 =
+    ///    0.5867`, so `y = 80 * 0.5867 = 46.94px`.
+    ///  - `46.94 > 40`, i.e. row 2: a row boundary has been crossed, so the live
+    ///    top row is not 0 and the incoming row 0 is a *different* row. Reaching
+    ///    row 3 would need `ease_out_quad(t) = 0.75`, i.e. `t = 0.5` and 42ms, and
+    ///    row 3 would still satisfy the assertion — hence `> 0` rather than an
+    ///    exact row, with the mid-tween check below as the upper bound.
+    #[test]
+    fn row_changing_helix_vertical_sync_still_cancels_an_in_flight_tween() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(400.0), px(800.0)), 100);
+        viewport.set_smooth_scrolling(true);
+
+        // Four rows down: 0 -> 80px over 84ms.
+        let update = viewport.scroll_by_visual_rows(4);
+        assert_eq!(update.top_visual_row, 4);
+        assert!(viewport.scroll_animation_active());
+
+        let start = Instant::now();
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(30)));
+        let past_crossing = viewport.scroll_position();
+
+        // Guards the arithmetic in the doc comment: past a row crossing *and*
+        // still mid-tween, so the sync below is a genuine row correction.
+        assert!(
+            viewport.scroll_animation_active(),
+            "the tween completed before the sample"
+        );
+        assert!(
+            past_crossing.y > px(40.0),
+            "sample {past_crossing:?} had not crossed the row 1 boundary"
+        );
+        assert!(
+            viewport.top_visual_row() > 0,
+            "the tween is still inside row 0, so the sync would be a same-row no-op"
+        );
+
+        // Helix says the top row is 0; the tween says row 2 heading for row 4.
+        // Helix wins.
+        viewport.sync_from_helix_top_visual_row(0);
+
+        assert!(
+            !viewport.scroll_animation_active(),
+            "a row-changing view sync failed to cancel the tween"
+        );
+        assert_eq!(viewport.scroll_position(), point(px(0.0), px(0.0)));
+        assert_eq!(viewport.top_visual_row(), 0);
+    }
+
+    /// The axis-only change must not have cost the horizontal sync its actual
+    /// job: write x, clamp it into the scrollable width on both sides, and force
+    /// x back to zero under soft wrap.
+    #[test]
+    fn helix_horizontal_sync_sets_and_clamps_x_only() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(400.0), px(800.0)), 100);
+        viewport.set_content_width(px(2000.0));
+        viewport.set_cell_width(px(10.0));
+
+        assert_eq!(
+            viewport.max_scroll_offset().width,
+            px(1600.0),
+            "2000px of content in a 400px viewport"
+        );
+
+        // Park y off the origin so any accidental vertical write is visible.
+        viewport.sync_from_helix_top_visual_row(30);
+        assert_eq!(viewport.scroll_position(), point(px(0.0), px(600.0)));
+
+        let no_soft_wrap = TextFormat {
+            soft_wrap: false,
+            viewport_width: 40,
+            ..TextFormat::default()
+        };
+        let soft_wrap = TextFormat {
+            soft_wrap: true,
+            viewport_width: 40,
+            ..TextFormat::default()
+        };
+
+        // In range: x follows cell_width * horizontal_offset.
+        viewport.sync_from_helix_horizontal_offset(7, &no_soft_wrap);
+        assert_eq!(viewport.scroll_position(), point(px(70.0), px(600.0)));
+
+        // Past the end: clamped to max_scroll_offset().width.
+        viewport.sync_from_helix_horizontal_offset(10_000, &no_soft_wrap);
+        assert_eq!(viewport.scroll_position(), point(px(1600.0), px(600.0)));
+
+        // Soft wrap: the offset is ignored and x is forced to zero.
+        viewport.sync_from_helix_horizontal_offset(9, &soft_wrap);
+        assert_eq!(viewport.scroll_position(), point(px(0.0), px(600.0)));
+
+        // Back off the soft-wrap zero and confirm y never moved across any of
+        // it. The horizontal axis must stay an x-only write.
+        viewport.sync_from_helix_horizontal_offset(9, &no_soft_wrap);
+        assert_eq!(viewport.scroll_position(), point(px(90.0), px(600.0)));
+        viewport.sync_from_helix_horizontal_offset(0, &no_soft_wrap);
+        assert_eq!(viewport.scroll_position(), point(px(0.0), px(600.0)));
+    }
+
+    #[test]
+    fn viewport_wheel_delta_cancels_an_in_flight_scroll_animation() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(100.0), px(100.0)), 50);
+        viewport.set_smooth_scrolling(true);
+        viewport.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
+        assert!(viewport.scroll_animation_active());
+
+        let update = viewport.scroll_by_delta(point(px(0.0), px(-5.0)));
+
+        assert!(update.changed);
+        assert!(!viewport.scroll_animation_active());
+        assert_eq!(viewport.scroll_position(), point(px(0.0), px(5.0)));
+    }
+
+    #[test]
+    fn viewport_cursor_reveal_request_cancels_an_in_flight_scroll_animation() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(100.0), px(100.0)), 50);
+        viewport.set_smooth_scrolling(true);
+        viewport.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
+        assert!(viewport.scroll_animation_active());
+
+        viewport.apply_scroll_request(EditorViewportScrollRequest::CursorReveal(
+            EditorCursorReveal::Center,
+        ));
+
+        assert!(!viewport.scroll_animation_active());
+        assert_eq!(viewport.scroll_position().y, px(0.0));
+        assert_eq!(
+            viewport.take_cursor_reveal_request(),
+            Some(EditorCursorReveal::Center)
+        );
+    }
+
+    #[test]
+    fn viewport_scrollbar_drag_cancels_an_in_flight_scroll_animation() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(100.0), px(100.0)), 50);
+        viewport.set_smooth_scrolling(true);
+        viewport.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
+        assert!(viewport.scroll_animation_active());
+
+        viewport.scroll_to_vertical_position_from_scrollbar(px(20.0));
+
+        assert!(!viewport.scroll_animation_active());
+        assert_eq!(viewport.scroll_position().y, px(20.0));
+    }
+
+    #[test]
+    fn viewport_reveal_visual_row_stays_instant_with_smooth_scrolling() {
+        let mut viewport = EditorViewport::new(px(20.0));
+        viewport.set_layout(px(20.0), size(px(800.0), px(100.0)), 100);
+        viewport.set_smooth_scrolling(true);
+
+        let update = viewport.reveal_visual_row(20, EditorCursorReveal::Top, 0);
+
+        assert!(update.changed);
+        assert!(!viewport.scroll_animation_active());
+        assert_eq!(viewport.scroll_position().y, px(400.0));
+        assert_eq!(viewport.top_visual_row(), 20);
     }
 
     #[test]

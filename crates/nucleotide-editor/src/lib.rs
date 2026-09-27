@@ -28,6 +28,7 @@ pub mod overlay_state;
 pub mod render_snapshot;
 pub mod ruler;
 pub mod run_gutter;
+mod scroll_animation;
 pub mod scroll_manager;
 pub mod scrollbar;
 pub mod selection;

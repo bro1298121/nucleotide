@@ -13,7 +13,7 @@ pub mod vcs;
 // Re-export commonly used types
 pub use completion::CompletionTrigger;
 pub use config::{FontConfig, FontWeight};
-pub use editor_types::{EditorStatus, Severity};
+pub use editor_types::{EditorScrollConfig, EditorStatus, Severity};
 pub use font_config::{
     EditorFontConfig, Font, FontFeatureSettings, FontSettings, FontStyle, UiFontConfig,
 };

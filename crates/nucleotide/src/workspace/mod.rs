@@ -8130,7 +8130,10 @@ impl Workspace {
         request: nucleotide_editor::EditorViewportScrollRequest,
         cx: &mut Context<Self>,
     ) {
-        let Some(view_entity) = self.view_manager.get_document_view(&view_id) else {
+        // Cloned so the borrow of `*self` ends here: below, `handle_selection_changed`
+        // takes `&mut self` while still needing this view again afterwards, which
+        // would otherwise be a borrow conflict across the two uses.
+        let Some(view_entity) = self.view_manager.get_document_view(&view_id).cloned() else {
             return;
         };
 
@@ -8159,6 +8162,27 @@ impl Workspace {
             });
             if let Some(doc_id) = changed_doc_id {
                 self.handle_selection_changed(doc_id, view_id, cx);
+                // `handle_selection_changed` always arms a `Scrolloff` reveal, and
+                // for a native page scroll that reveal is not just redundant but
+                // actively destructive. `sync_cursor_after_native_page_scroll` has
+                // already placed the cursor `scrolloff` rows inside the
+                // *destination* page, so there is nothing left to reveal. Worse,
+                // `reveal_visual_row` derives its band from the live
+                // `top_visual_row`, which on the first painted frame is still
+                // mid-tween; it judges the destination-page cursor to be out of
+                // band, jumps the viewport back toward the old page and cancels
+                // the tween through `set_scroll_position(from_native_view = true)`.
+                // The page jump then animates exactly one frame.
+                //
+                // Clearing here — and only here, only when a cursor actually
+                // moved — keeps the tween alive. The reveal path itself is
+                // untouched and still serves every other request, including the
+                // `align_view_*` / `CursorReveal` command path, which must stay
+                // instant.
+                view_entity.update(cx, |view, cx| {
+                    view.clear_cursor_reveal_request();
+                    cx.notify();
+                });
             }
         }
 
@@ -9622,9 +9646,13 @@ impl Workspace {
         let file_tree_config = file_tree_config_from_gui(&config.gui);
         let editor_font = config.editor_font();
         let ui_font = config.ui_font();
+        let editor_smooth_scrolling = config.editor_smooth_scrolling();
         let ui_chrome_style = config.ui_chrome_style();
         let previous_ui_chrome_style = cx.global::<crate::ThemeManager>().ui_chrome_style();
         let ui_chrome_style_changed = previous_ui_chrome_style != ui_chrome_style;
+
+        let editor_scroll_config = cx.global_mut::<nucleotide_types::EditorScrollConfig>();
+        editor_scroll_config.smooth_scrolling = editor_smooth_scrolling;
 
         let editor_font_config = cx.global_mut::<crate::types::EditorFontConfig>();
         editor_font_config.family = editor_font.family.clone();

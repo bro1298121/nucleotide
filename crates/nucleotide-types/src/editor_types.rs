@@ -19,6 +19,23 @@ pub struct EditorStatus {
     pub severity: Severity,
 }
 
+/// Editor viewport motion configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditorScrollConfig {
+    pub smooth_scrolling: bool,
+}
+
+impl Default for EditorScrollConfig {
+    fn default() -> Self {
+        Self {
+            smooth_scrolling: true,
+        }
+    }
+}
+
+#[cfg(feature = "gpui-bridge")]
+impl gpui::Global for EditorScrollConfig {}
+
 #[cfg(feature = "helix-bridge")]
 impl From<helix_core::diagnostic::Severity> for Severity {
     fn from(s: helix_core::diagnostic::Severity) -> Self {

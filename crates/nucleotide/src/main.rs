@@ -1219,6 +1219,10 @@ fn gui_main(
                 features: editor_font_config.features,
             });
 
+            // Store editor viewport motion config; the effective value is resolved
+            // per render against the UI animation flags.
+            cx.set_global(nucleotide_types::EditorScrollConfig::default());
+
             // Store UI font config for UI components
             cx.set_global(UiFontConfig {
                 family: ui_font_config.family,

@@ -199,7 +199,7 @@ where
         ) -> Option<CursorOverlayPlan>
         + 'static,
 {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let NativeEditorView {
             view_entity_id,
             editor_state,
@@ -216,6 +216,22 @@ where
             on_mouse_drag,
             on_mouse_up,
         } = self;
+
+        // Drive the smooth-scroll tween from the render pass. Requesting a frame
+        // notifies this view, which renders again and advances the animation, so
+        // the loop is self-sustaining the same way `AnimationElement` drives
+        // itself.
+        //
+        // Liveness is keyed on `scroll_needs_frames()`, never on whether this
+        // frame happened to move any pixels: a frame with no movement must still
+        // schedule the next one, otherwise a tween stalls mid-flight and never
+        // completes. `cx.notify` is the load-bearing tick; `request_animation_frame`
+        // is only vsync pacing, so it is safe to request unconditionally.
+        if editor_state.viewport().scroll_needs_frames() {
+            editor_state.viewport().advance_scroll_animation();
+            cx.notify(view_entity_id);
+            window.request_animation_frame();
+        }
 
         let root = div().id("editor-content").w_full().h_full().flex();
 

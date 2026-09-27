@@ -118,6 +118,9 @@ look = "theme"
 # Invalid tags (not exactly four ASCII alphanumeric characters) are ignored.
 # features = { calt = true, liga = true, clig = true }
 
+# Animate editor viewport scrolling (eased page/row jumps). Default: true.
+# smooth_scrolling = true
+
 [tab_bar]
 # Show the tab bar. Default: true.
 show = true

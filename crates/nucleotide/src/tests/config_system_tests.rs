@@ -477,6 +477,7 @@ dark_theme = "custom_dark"
                     line_height: 1.5,
                     ..Default::default()
                 }),
+                ..Default::default()
             },
             theme: ThemeConfig {
                 mode: ThemeMode::Light,

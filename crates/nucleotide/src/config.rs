@@ -239,11 +239,24 @@ pub struct UiConfig {
 }
 
 /// Editor-specific GUI configuration
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditorGuiConfig {
     /// Font used in the editor
     #[serde(default, deserialize_with = "deserialize_editor_font")]
     pub font: Option<FontConfig>,
+
+    /// Animate viewport scrolling (eased page/row jumps).
+    #[serde(default = "default_true")]
+    pub smooth_scrolling: bool,
+}
+
+impl Default for EditorGuiConfig {
+    fn default() -> Self {
+        Self {
+            font: None,
+            smooth_scrolling: true,
+        }
+    }
 }
 
 /// Theme mode selection
@@ -849,7 +862,7 @@ impl LspConfig {
     }
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -1073,6 +1086,14 @@ impl Config {
     /// Get the UI look configuration.
     pub fn ui_look(&self) -> UiLook {
         self.gui.ui.look
+    }
+
+    /// Whether editor viewport scrolling should be animated.
+    ///
+    /// This is the raw configured preference; the effective value is resolved at the
+    /// read site so runtime reduced-motion / animation toggles apply without a reload.
+    pub fn editor_smooth_scrolling(&self) -> bool {
+        self.gui.editor.smooth_scrolling
     }
 
     /// Get the UI chrome style used by nucleotide-ui.

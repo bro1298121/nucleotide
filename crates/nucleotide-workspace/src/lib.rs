@@ -23,6 +23,8 @@ use thiserror::Error;
 
 const DEFAULT_PROCESS_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
 const LOCAL_FILE_IO_CHUNK_BYTES: usize = 64 * 1024;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
@@ -3999,8 +4001,25 @@ fn join_io_thread<T>(
         })
 }
 
+/// Applies the Windows `CREATE_NO_WINDOW` creation flag.
+///
+/// Console-mode programs such as `git` otherwise flash a console window every time they are
+/// spawned from the GUI process. The flag is process-creation only, so arguments, working
+/// directory, and error handling are unaffected.
+#[cfg(windows)]
+fn hide_console_window(mut command: Command) -> Command {
+    use std::os::windows::process::CommandExt as _;
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(not(windows))]
+fn hide_console_window(command: Command) -> Command {
+    command
+}
+
 fn local_git_head(root: &Path) -> Result<GitHeadResult> {
-    let output = Command::new("git")
+    let output = hide_console_window(Command::new("git"))
         .args(["rev-parse", "--verify", "HEAD"])
         .current_dir(root)
         .output()
@@ -4023,7 +4042,7 @@ fn local_git_head(root: &Path) -> Result<GitHeadResult> {
         .map(str::trim)
         .filter(|head| !head.is_empty())
         .map(ToOwned::to_owned);
-    let display_ref = Command::new("git")
+    let display_ref = hide_console_window(Command::new("git"))
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
         .current_dir(root)
         .output()
@@ -4041,7 +4060,7 @@ fn local_git_head(root: &Path) -> Result<GitHeadResult> {
 }
 
 fn local_git_status(root: &Path, options: GitStatusOptions) -> Result<GitStatusResult> {
-    let mut command = Command::new("git");
+    let mut command = hide_console_window(Command::new("git"));
     command
         .args(["status", "--porcelain=v1", "-z"])
         .current_dir(root);
