@@ -121,15 +121,24 @@ look = "theme"
 # Animate editor viewport scrolling (eased page/row jumps). Default: true.
 # smooth_scrolling = true
 
-# Add a short eased glide after a mouse-wheel gesture stops. Default: true.
+# Smooth mouse-wheel scrolling, including a short glide after a gesture stops.
+# Default: true.
 #
-# The wheel always tracks 1:1 and instantly, so the view never lags the input;
-# this only adds a small extra glide *after* the wheel goes quiet, proportional
-# to the travel the gesture accumulated. Horizontal wheel scrolling is 1:1 with
-# no glide. Setting this to false leaves the wheel behaviour exactly as it is
-# with no glide at all.
+# While you are scrolling, each notch eases onto an accumulated destination over
+# about 80ms, so the view catches up to your intent instead of snapping notch by
+# notch. Notches keep stacking while it eases, so N notches of X still travel
+# N * X: the easing changes how it gets there, not how far.
 #
-# A glide is an eased tween, so it also requires smooth_scrolling = true.
+# Once the wheel goes quiet a small extra glide is added on top, proportional to
+# the travel the gesture accumulated, which is what makes a flick carry. A long
+# gesture therefore overshoots its own input by roughly a quarter; a single
+# deliberate notch does not glide at all.
+#
+# Horizontal wheel scrolling is always 1:1 and instant, as are the h and l keys.
+# Setting this to false leaves the wheel exactly 1:1 and instant, with no glide.
+#
+# Wheel easing and the glide are both tweened, so this also requires
+# smooth_scrolling = true.
 # wheel_glide = true
 
 [tab_bar]

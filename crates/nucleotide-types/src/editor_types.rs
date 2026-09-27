@@ -23,11 +23,12 @@ pub struct EditorStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditorScrollConfig {
     pub smooth_scrolling: bool,
-    /// Add an eased glide after a mouse-wheel gesture goes idle.
+    /// Smooth mouse-wheel scrolling, including the glide after a gesture stops.
     ///
-    /// The wheel itself always tracks 1:1; this only controls the extra glide
-    /// that follows the gesture. Requires the tween engine (`smooth_scrolling`)
-    /// to be on, because a glide *is* a tween.
+    /// Each notch eases onto an accumulated destination, and a gesture that goes
+    /// idle adds a short extra glide on top. Horizontal wheel scrolling stays 1:1
+    /// and instant. Requires the tween engine (`smooth_scrolling`) to be on,
+    /// because both the easing and the glide *are* tweens.
     #[serde(default = "default_true")]
     pub wheel_glide: bool,
 }

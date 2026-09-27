@@ -11,25 +11,52 @@ use std::{
 
 use crate::scroll_animation::ScrollAnimation;
 
-/// Mouse-wheel glide feel, gathered into one block because these are the knobs
-/// to reach for first when the glide feels wrong.
+/// Mouse-wheel feel, gathered into one block because these are the knobs
+/// to reach for first when the wheel feels wrong.
 ///
-/// The model is **not** the Firefox one, where every wheel pixel is animated
-/// and the view lags the input. It is 1:1 plus a tail:
+/// The model is the Firefox/Chrome one, and it is deliberately *not* 1:1:
 ///
-///  - while the wheel is turning the viewport tracks it exactly and instantly,
-///    and that path is never tweened — precision during the gesture is the
-///    entire point,
-///  - once the wheel goes quiet, an *additional* eased glide proportional to
-///    what the gesture accumulated is tweened on top of the position the 1:1
-///    path already reached.
+///  - **during** the gesture every vertical notch retargets a short eased tween
+///    toward the position the whole gesture has asked for so far, so the view
+///    glides continuously instead of stepping. A Windows wheel delivers discrete
+///    notches of roughly 120px, so the old 1:1-and-instant path produced exactly
+///    the visible jump per notch that this removes,
+///  - **after** the wheel goes quiet, a further eased glide proportional to what
+///    the gesture accumulated is tweened on top of the position the gesture
+///    reached. Total travel is therefore about `1 + RATIO` times the raw wheel
+///    travel, which is accepted: the glide is a fling tail, not a correction.
 ///
-/// Only the tail animates, so `ease_out_quad` is the one curve that has to
-/// exist and no new curve is introduced here.
+/// Each notch gets a *fresh* full duration for its retarget, because a notch is
+/// a new intent that deserves its own flight time. That is the one place a fresh
+/// deadline is correct; every other retarget in this file carries the remaining
+/// budget forward (see [`ScrollAnimation::retarget_from`]).
+///
+/// Horizontal wheel travel is untouched: 1:1, instant, never eased, never glided.
+/// `h`/`l` are 1:1 by design for the same reason — they are deliberate, repeated
+/// keypresses and already arrive as many small steps.
+///
+/// Only `ease_out_quad` is used, so no new curve is introduced here.
 mod wheel_glide {
     use gpui::{Pixels, px};
     use std::time::Duration;
 
+    /// How long the in-gesture tween onto the accumulated wheel target runs.
+    ///
+    /// A distinct constant from `GLIDE_MS` because the two are different motions:
+    /// this is one notch settling onto a position the user has already asked for,
+    /// whereas the glide is the long tail of a finished flick.
+    ///
+    /// Deliberately shorter than both other wheel timings:
+    ///  - shorter than [`GESTURE_IDLE_MS`] so a single deliberate notch has
+    ///    settled *before* the idle window elapses. The post-stop glide then
+    ///    continues an already-arrived view instead of correcting one that is
+    ///    still in the air, and it never has to replace a live tween.
+    ///  - shorter than [`GLIDE_MS`], because a notch is a small movement that
+    ///    should arrive quickly.
+    ///
+    /// Notches arriving faster than this simply retarget a tween that is still in
+    /// flight, which is the continuous-scroll case and is the entire point.
+    pub(crate) const TWEEN_MS: u64 = 80;
     /// Fraction of the gesture's accumulated vertical travel added as glide.
     /// `0.25` means a 400px gesture glides a further 100px.
     pub(crate) const RATIO: f32 = 0.25;
@@ -47,6 +74,7 @@ mod wheel_glide {
     /// Wheel silence that ends a gesture.
     pub(crate) const GESTURE_IDLE_MS: u64 = 90;
 
+    pub(crate) const TWEEN_DURATION: Duration = Duration::from_millis(TWEEN_MS);
     pub(crate) const GLIDE_DURATION: Duration = Duration::from_millis(GLIDE_MS);
     pub(crate) const GESTURE_IDLE: Duration = Duration::from_millis(GESTURE_IDLE_MS);
 }
@@ -67,6 +95,21 @@ struct WheelGesture {
     /// Timestamp of the most recent wheel event. `None` means no gesture is
     /// pending, which is what keeps the frame loop from spinning forever.
     last_event: Option<Instant>,
+    /// The vertical position the gesture as a whole has now asked for, or
+    /// `None` when no gesture is pending.
+    ///
+    /// In `scroll_position().y` space, where a **larger** value means further
+    /// **down** — the opposite of the incoming `delta.y`. A notch is added here
+    /// rather than to the live position, which is what makes N notches of X land
+    /// on N*X from where the gesture started regardless of how far the view had
+    /// already travelled.
+    ///
+    /// Only ever written by the eased path, and reset to `None` by
+    /// [`Self::clear_wheel_gesture`]. That is what bounds it: a gesture's target
+    /// cannot outlive its own idle window, so a later gesture always starts from
+    /// the live position rather than from a stale one, and a switch flipped on
+    /// mid-gesture cannot apply a target accumulated while nothing was animating.
+    target: Option<Pixels>,
 }
 
 /// Manages native scroll state for a document viewport.
@@ -253,36 +296,147 @@ impl ScrollManager {
 
     /// Apply a GPUI-style pixel scroll delta to the current offset.
     ///
-    /// Returns whether the offset changed and how many whole document lines the
-    /// scroll position crossed. Wheel scrolling uses this to keep fractional
-    /// pixel movement local while letting the GUI viewport decide when to sync
-    /// the visible visual row back to Helix.
+    /// Returns whether the request moves the viewport, and how many whole
+    /// document lines it crosses. Both are reported against the **destination**,
+    /// not the live position, for the same reason [`Self::scroll_by_visual_rows`]
+    /// reports the destination: with a tween in flight nothing has moved yet, and
+    /// a caller told "nothing changed" would skip its repaint and its Helix sync,
+    /// leaving an armed tween with no frame to run on.
     ///
-    /// The motion itself is applied 1:1 and instantly, exactly as before. All
-    /// this adds is the *recording* of the vertical gesture, which
-    /// [`Self::advance_wheel_glide`] later turns into a short eased glide once
-    /// the wheel stops. Nothing here waits on, or is blocked by, that glide.
+    /// Horizontal travel is applied 1:1 and instantly. Vertical travel is
+    /// accumulated into [`WheelGesture::target`] and eased onto, each notch
+    /// retargeting a fresh tween; a gesture that goes idle then adds its glide on
+    /// top. See [`Self::wheel_target_for_delta`].
     pub(crate) fn scroll_by_delta(&self, delta: Point<Pixels>) -> (bool, isize) {
+        self.scroll_by_delta_at(delta, Instant::now())
+    }
+
+    /// [`Self::scroll_by_delta`] with an injected tween clock.
+    ///
+    /// `now` is a parameter rather than a clock read inside so that the whole
+    /// wheel sequence — per-notch retargeting, a retarget arriving mid-flight,
+    /// the idle window elapsing, the glide arming and its flight — is reproducible
+    /// from an injected `Instant` in a test. Each notch's deadline is exactly
+    /// `now + TWEEN_MS`, so sampling at `now + k` measures `k` of easing with no
+    /// dependence on how long the arming call itself happened to take.
+    pub(crate) fn scroll_by_delta_at(&self, delta: Point<Pixels>, now: Instant) -> (bool, isize) {
         // A wheel gesture is a continuous user intent; it overrides an in-flight
         // discrete tween rather than fighting it. The same cancel kills an
-        // in-flight glide, so a new wheel event resumes 1:1 from wherever the
-        // glide had actually reached, rather than snapping to its target first.
+        // in-flight glide, so a new wheel event resumes from wherever the glide
+        // had actually reached, rather than snapping to its target first.
         self.animation.cancel("wheel_scroll");
         self.record_wheel_gesture(delta.y);
+
         let old_position = self.scroll_position.get();
         let old_line = self.pixels_to_anchor(old_position.y);
-        let next_offset = self.scroll_offset() + delta;
 
-        self.set_scroll_offset_internal(next_offset, false, "wheel_scroll");
+        // Horizontal wheel travel is 1:1 and instant by design and is never part
+        // of the vertical gesture, so it is written straight through whatever the
+        // vertical axis is about to do. `delta` is an offset delta and a position
+        // is its negation (see [`Self::scroll_offset`]), so the move is `-delta.x`.
+        if delta.x != px(0.0) {
+            self.set_scroll_position_internal(
+                point(old_position.x - delta.x, old_position.y),
+                false,
+                "wheel_scroll",
+            );
+        }
 
-        let new_position = self.scroll_position.get();
+        // A vertical notch is eased onto only when there is a tween to ease it
+        // with. With either switch off this falls through to the original 1:1
+        // instant write, so a disabled feature is exactly the old behaviour.
+        let eased = delta.y != px(0.0) && self.wheel_tween_enabled();
+        if eased {
+            // The deadline is set here and only here. `animate_scroll_to_at`
+            // replaces the tween state outright, so this stores `now` and the
+            // full `TWEEN_DURATION`: a fresh, full-length flight for this
+            // notch's own intent. It deliberately does not go through
+            // `retarget_scroll_animation`, which is the extent-change
+            // re-anchor — that one carries the remaining budget forward, and
+            // using it here would cap the tween at its one-frame floor instead
+            // of easing at all. No per-frame caller re-anchors either, so
+            // nothing can reset this clock under the tween's feet.
+            let target = self.wheel_target_for_delta(delta.y);
+            let current = self.scroll_position.get();
+            self.animate_scroll_to_at(
+                point(current.x, target),
+                wheel_glide::TWEEN_DURATION,
+                now,
+            );
+        } else if delta.y != px(0.0) {
+            let current = self.scroll_position.get();
+            self.set_scroll_position_internal(
+                point(current.x, current.y - delta.y),
+                false,
+                "wheel_scroll",
+            );
+        }
+
+        // Report the destination, not the live position: see the doc comment.
+        let new_position = self.destination_position();
         let new_line = self.pixels_to_anchor(new_position.y);
         let crossed_lines = new_line as isize - old_line as isize;
-        if crossed_lines != 0 || old_position.x != new_position.x {
+
+        // `pending_view_sync` is the paint-time channel that pushes the **live**
+        // top row into Helix, so it is armed only for motion that has already
+        // happened. When a tween is armed, the whole-row crossings that actually
+        // reach Helix are armed inside `advance_scroll_animation_at`, one per
+        // painted sample; arming here too would report a destination the view has
+        // not arrived at. The horizontal move is a real instantaneous write in
+        // both paths, so it arms either way.
+        if old_position.x != new_position.x || (!eased && crossed_lines != 0) {
             self.pending_view_sync.set(true);
         }
 
         (old_position != new_position, crossed_lines)
+    }
+
+    /// Whether a vertical wheel notch may be eased onto rather than applied 1:1.
+    ///
+    /// Two independent switches, and both have to be on:
+    ///  - `wheel_glide`, the user-facing master switch for wheel smoothing, and
+    ///  - the tween engine, because a smoothed notch *is* a tween and there is
+    ///    nothing to ease it with otherwise.
+    ///
+    /// The engine is tested here rather than left to `animate_to_at` refusing.
+    /// That refusal is a *cancel*, so letting it fire would silently turn "no
+    /// smoothing" into "no wheel", and the caller could not tell them apart.
+    fn wheel_tween_enabled(&self) -> bool {
+        self.wheel_glide_enabled.get() && self.scroll_animation_enabled()
+    }
+
+    /// The vertical position this gesture has now asked for, in position space.
+    ///
+    /// Sign spaces. The incoming `delta.y` is GPUI's: NEGATIVE means scrolling
+    /// DOWN. `scroll_position().y` is the opposite: a LARGER position means
+    /// further down. Converting a notch into position space therefore means
+    /// negating it, and the arithmetic here is `previous_target - delta.y`.
+    /// Adding them directly — or dropping the negation — sends a downward notch
+    /// *upward*, which no distance check can see and every user can.
+    ///
+    /// The notch is added to the **previous target**, not to the live position.
+    /// That is what makes N notches of X land on N*X from where the gesture
+    /// started, and it is the difference between extending a flight and
+    /// discarding it: adding to the live position instead would throw away
+    /// whatever the in-flight tween had not covered yet, so a fast wheel would
+    /// travel less than the user asked for and a slow one would land short. A
+    /// retarget therefore eases from the live position onto an accumulated
+    /// destination, never from a stale origin.
+    ///
+    /// Clamped into the scrollable range on every step, so a gesture held against
+    /// the end of the document cannot accumulate a destination the document can
+    /// never reach.
+    fn wheel_target_for_delta(&self, delta_y: Pixels) -> Pixels {
+        let start = self
+            .wheel_gesture
+            .borrow()
+            .target
+            .unwrap_or_else(|| self.scroll_position.get().y);
+        // `clamp_position` is the manager's single clamping rule, so its y leg is
+        // taken from it rather than restated here. The x leg is discarded.
+        let clamped = self.clamp_position(point(px(0.0), start - delta_y)).y;
+        self.wheel_gesture.borrow_mut().target = Some(clamped);
+        clamped
     }
 
     /// Fold one wheel event's vertical travel into the pending gesture.
@@ -524,7 +678,8 @@ impl ScrollManager {
     /// schedule the next one, otherwise a tween stalls and never completes.
     /// It covers two things, both of which terminate on their own:
     ///
-    ///  - the discrete scroll tween, and
+    ///  - the scroll tween, which is the discrete jump, the in-gesture wheel
+    ///    tween onto the accumulated target, or the post-stop glide, and
     ///  - a wheel gesture that has not yet gone idle, which needs the idle
     ///    window to elapse before it can arm (or decline to arm) its glide.
     ///
@@ -532,6 +687,13 @@ impl ScrollManager {
     /// passes the idle window [`Self::advance_wheel_glide`] clears the gesture
     /// unconditionally, so a gesture that ends below the arming thresholds
     /// leaves nothing pending here and the loop stops.
+    ///
+    /// The first term terminates on its own schedule and is not re-armed by the
+    /// frame loop: only input re-arms it. Each arming hands the tween a fresh
+    /// `TWEEN_DURATION` deadline, and `ScrollAnimation::advance` cancels it as
+    /// soon as a sample reaches `t = 1`, so a gesture cannot keep it alive
+    /// indefinitely. Nothing in the frame path calls back into `scroll_by_delta`
+    /// or any `animate_*`, so a tween is never extended by a frame.
     pub(crate) fn scroll_needs_frames(&self) -> bool {
         self.animation.is_active() || self.wheel_gesture_pending()
     }
@@ -1162,6 +1324,25 @@ mod scroll_manager_tests {
         assert_eq!(manager.scroll_position(), point(px(0.0), px(200.0)));
     }
 
+    /// A wheel event must take priority over an in-flight discrete jump, and the
+    /// proof is what survives the sampling rather than whether a tween exists.
+    ///
+    /// The wheel now replaces the dead tween with its *own* tween, so
+    /// `scroll_animation_active()` is true again immediately after the event.
+    /// What must not survive is the 200ms `0 -> 400px` jump, and the two tween
+    /// shapes are told apart by the sample they produce:
+    ///
+    ///  - the wheel's tween is `0 -> 5px` over `TWEEN_MS = 80ms`, so a sample at
+    ///    `+40ms` is `t = 0.5`, `ease_out_quad(0.5) = 0.75`, and reads
+    ///    `0 + 5 * 0.75 = 3.75px`;
+    ///  - the page jump, had it survived, would be `0 -> 400px` over 200ms, and
+    ///    the same `+40ms` sample would read `t = 0.2`, eased `0.36`, i.e. `144px`
+    ///    — and it would still be in flight at `+80ms`, where the wheel's tween
+    ///    has already landed.
+    ///
+    /// The landing on exactly `5px` at `+80ms` is the sharper of the two
+    /// assertions: `0.2`-of-200ms is not a rounding artefact of a live tween, it
+    /// is a completely different destination.
     #[test]
     fn test_scroll_by_delta_cancels_in_flight_scroll_animation() {
         let manager = scrollable_manager();
@@ -1169,12 +1350,32 @@ mod scroll_manager_tests {
         manager.animate_scroll_to(point(px(0.0), px(400.0)), Duration::from_millis(200));
         assert!(manager.scroll_animation_active());
 
-        let (changed, crossed_lines) = manager.scroll_by_delta(point(px(0.0), px(-5.0)));
+        let start = Instant::now();
+        let (changed, crossed_lines) = manager.scroll_by_delta_at(point(px(0.0), px(-5.0)), start);
 
         assert!(changed);
+        // 5px is inside row 0 on a 20px row, so the request crosses no row.
         assert_eq!(crossed_lines, 0);
+        assert_eq!(
+            manager.scroll_position().y,
+            px(0.0),
+            "the wheel teleported instead of easing onto the target"
+        );
+
+        assert!(manager.advance_scroll_animation_at(start + Duration::from_millis(40)));
+        assert!(
+            (manager.scroll_position().y - px(3.75)).abs() < px(0.01),
+            "half-flight sample was {:?}, expected the wheel tween's 3.75px",
+            manager.scroll_position().y
+        );
+
+        assert!(manager.advance_scroll_animation_at(start + Duration::from_millis(80)));
+        assert_eq!(
+            manager.scroll_position().y,
+            px(5.0),
+            "the surviving tween was the 200ms page jump, not the wheel's"
+        );
         assert!(!manager.scroll_animation_active());
-        assert_eq!(manager.scroll_position(), point(px(0.0), px(5.0)));
     }
 
     #[test]

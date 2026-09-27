@@ -510,13 +510,37 @@ impl EditorViewport {
     }
 
     pub fn scroll_by_delta(&self, delta: Point<Pixels>) -> ViewportScrollUpdate {
-        let (changed, crossed_visual_rows) = self.scroll.scroll_by_delta(delta);
+        self.scroll_by_delta_at(delta, std::time::Instant::now())
+    }
+
+    /// [`Self::scroll_by_delta`] with an injected tween clock.
+    ///
+    /// The in-gesture wheel tween is armed with `now`, so its deadline is exactly
+    /// `now + TWEEN_MS` and sampling at `now + k` measures `k` of easing. That is
+    /// what makes the whole wheel sequence reproducible from an injected
+    /// `Instant`, including a notch that arrives while a tween is in flight.
+    pub(crate) fn scroll_by_delta_at(
+        &self,
+        delta: Point<Pixels>,
+        now: std::time::Instant,
+    ) -> ViewportScrollUpdate {
+        let (changed, crossed_visual_rows) = self.scroll.scroll_by_delta_at(delta, now);
+
+        // Report the destination, not the live position, for the same reason
+        // `scroll_by_visual_rows` does. The in-gesture tween has not moved the
+        // viewport yet, but the caller still has to learn that the notch moved the
+        // top visual row: it decides `cx.notify()` and feeds the Helix cursor sync.
+        // A `changed` of false here is exactly what makes the wheel handler's
+        // early return swallow the whole update — no repaint, so no frame, so the
+        // tween that was just armed never runs and the view never scrolls.
+        let new_position = self.scroll.destination_position();
+        let new_top_visual_row = self.scroll.pixels_to_anchor(new_position.y);
 
         ViewportScrollUpdate {
             changed,
             crossed_visual_rows,
-            top_visual_row: self.top_visual_row(),
-            offset_within_row: self.offset_within_row(),
+            top_visual_row: new_top_visual_row,
+            offset_within_row: self.offset_within_row_for(new_position.y),
         }
     }
 
@@ -1618,10 +1642,18 @@ mod tests {
         (editor, doc_id, view_id)
     }
 
+    /// The engine-off wheel path is still exactly 1:1 and instant.
+    ///
+    /// This fixture never enables `smooth_scrolling`, and a smoothed notch *is* a
+    /// tween, so there is nothing to ease with and the notch is applied directly.
+    /// The test is therefore also the regression guard for that fallback: if the
+    /// wheel ever armed a tween with the engine off, the position would still read
+    /// `0px` here (a tween has not moved yet) and the update would report row 2.
     #[test]
     fn viewport_reports_subrow_wheel_scroll() {
         let mut viewport = EditorViewport::new(px(20.0));
         viewport.set_layout(px(20.0), size(px(800.0), px(400.0)), 100);
+        assert!(!viewport.smooth_scrolling_enabled());
 
         let update = viewport.scroll_by_delta(point(px(0.0), px(-5.0)));
 
@@ -1629,6 +1661,7 @@ mod tests {
         assert_eq!(update.crossed_visual_rows, 0);
         assert_eq!(update.top_visual_row, 0);
         assert_eq!(update.offset_within_row, px(5.0));
+        assert_eq!(viewport.scroll_position().y, px(5.0));
         assert!(!viewport.has_pending_view_sync());
     }
 
@@ -2094,14 +2127,29 @@ mod tests {
         assert_eq!(viewport.top_visual_row(), 0);
     }
 
-    /// Fixture for the wheel-glide tests: 20px rows, a 400x800 viewport and 100
+    /// Fixture for the wheel tests: 20px rows, a 400x800 viewport and 100
     /// content rows, so `max_scroll_offset().height = 100 * 20 - 800 = 1200px`
-    /// of travel. Every glide target below stays well inside it, so nothing is
-    /// clamped by the scroll range and the assertions are pure glide arithmetic.
+    /// of travel. Every wheel target below stays well inside it, so nothing is
+    /// clamped by the scroll range and the assertions are pure wheel arithmetic.
     ///
-    /// Both switches are on: the glide is gated on the tween engine
-    /// (`smooth_scrolling`) as well as on its own key, because a glide *is* a
-    /// tween.
+    /// Both switches are on, because they are two halves of one thing: wheel
+    /// smoothing *is* a tween, so it is gated on the tween engine
+    /// (`smooth_scrolling`) as well as on its own key.
+    ///
+    /// Notches are delivered through `scroll_by_delta_at` with an injected clock
+    /// so that each one arms a tween whose deadline is exactly `now + TWEEN_MS`.
+    /// `scroll_by_delta` would use the real clock, and a test that then samples
+    /// at `now + k` would be measuring how long the test itself took.
+    ///
+    /// The flip side of reading that clock *before* the event is that the idle
+    /// window cannot be probed at exactly `GESTURE_IDLE_MS` off it:
+    /// `record_wheel_gesture` timestamps the gesture with the real clock a moment
+    /// later, so `start + 90ms` is a hair *short* of the window rather than safely
+    /// past it. Every test below therefore probes the idle decision at
+    /// [`IDLE_PROBE`], which is unambiguously past the window. The glide is armed
+    /// from whatever instant the probe uses, so the choice does not affect the
+    /// glide arithmetic — only the offsets, which are all relative to the same
+    /// probe.
     fn wheel_glide_viewport() -> EditorViewport {
         let mut viewport = EditorViewport::new(px(20.0));
         viewport.set_layout(px(20.0), size(px(400.0), px(800.0)), 100);
@@ -2110,49 +2158,94 @@ mod tests {
         viewport
     }
 
+    /// How far past the tween clock a test probes the idle-window decision. Well
+    /// clear of `GESTURE_IDLE_MS = 90ms`, and well clear of `TWEEN_MS = 80ms`, so
+    /// the in-gesture tween has always landed by the time the probe is taken.
+    const IDLE_PROBE: Duration = Duration::from_millis(200);
+
     /// A single wheel event must not glide, and the frame loop must stop.
     ///
-    /// One deliberate notch is a precision movement, not a flick. A glide on top
+    /// One deliberate notch is a precision movement, not a flick. A *glide* on top
     /// of it would move the viewport further than the user asked for, so the
     /// event count is a gate in its own right, independent of travel.
     ///
-    /// Arithmetic (one event of `delta.y = -40px` on a 0px start):
-    ///  - 1:1 puts the position at `0 - (-40) = 40px`, inside row 2.
+    /// The gesture is still *eased* — that is the whole point of the change — so
+    /// what has to hold is that the ease settles and the loop ends, not that the
+    /// position lands instantly.
+    ///
+    /// Arithmetic (one event of `delta.y = -40px` on a `0px` start, tween armed at
+    /// `start`):
+    ///  - the target is `0 - (-40) = 40px`, so the tween runs `0px -> 40px` over
+    ///    `TWEEN_MS = 80ms`. The live position is still `0px` when the event
+    ///    returns, which is the assertion that the view eases rather than jumps.
+    ///  - at `start + 40ms`, `t = 0.5` and `ease_out_quad(0.5) = 0.75`, so
+    ///    `y = 0 + 40 * 0.75 = 30px`. At `start + 79ms` the tween is still in
+    ///    flight, and at `start + 80ms` it has landed on exactly `40px`. Pinning
+    ///    both bounds is what makes the duration an assertion rather than an
+    ///    assumption.
     ///  - accumulated = `-40px`, so `|accumulated| = 40 < ARM_MIN_PX = 72`, and
     ///    `events = 1 < ARM_MIN_EVENTS = 2`. Both gates fail, so no glide.
-    ///  - `start` is taken *after* the wheel event, so `start + 90ms` is at
-    ///    least `GESTURE_IDLE_MS` past the recorded timestamp. Sampling at
-    ///    `start + 50ms` is therefore unambiguously still inside the window.
+    ///  - the idle decision is probed at `start + 50ms` and `start + IDLE_PROBE`
+    ///    (see the fixture). The first is unambiguously inside the 90ms window
+    ///    because it is nowhere near it; the second unambiguously past it.
     ///
-    /// The `!scroll_needs_frames()` assertion at the end is the load-bearing one:
-    /// the gesture has to have been dropped, not merely declined, or the render
-    /// loop would request frames forever.
+    /// Direction, pinned explicitly: a NEGATIVE `delta.y` is a downward notch and
+    /// it moves the position UP in value, because a larger position is further
+    /// down the document. `0px -> 40px` is downward. This is the assertion that
+    /// catches an inverted wheel, which no distance check can see.
+    ///
+    /// The `!scroll_needs_frames()` assertion near the end is the load-bearing
+    /// one: the gesture has to have been *dropped*, not merely declined, or the
+    /// render loop would request frames forever.
     #[test]
     fn single_wheel_event_glides_nothing_and_stops_the_frame_loop() {
         let viewport = wheel_glide_viewport();
         assert!(viewport.wheel_glide_enabled());
 
-        viewport.scroll_by_delta(point(px(0.0), px(-40.0)));
+        let start = Instant::now();
+        viewport.scroll_by_delta_at(point(px(0.0), px(-40.0)), start);
+        assert!(
+            viewport.scroll_animation_active(),
+            "a qualifying notch did not arm the in-gesture tween"
+        );
+        assert_eq!(
+            viewport.scroll_position(),
+            point(px(0.0), px(0.0)),
+            "the wheel teleported instead of easing onto the target"
+        );
+
+        // Inside the idle window: no glide is armed, and the loop has to keep
+        // running so the gesture can still be decided.
+        assert!(!viewport.advance_wheel_glide(start + Duration::from_millis(50)));
+
+        // Half of the 80ms tween: quad(0.5) = 0.75, so 0 + 40 * 0.75 = 30px, and
+        // that is downward — a larger position means further down.
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(40)));
+        assert_eq!(viewport.scroll_position(), point(px(0.0), px(30.0)));
+
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(79)));
+        assert!(
+            viewport.scroll_animation_active(),
+            "the tween finished before TWEEN_MS = 80ms"
+        );
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(80)));
         assert_eq!(
             viewport.scroll_position(),
             point(px(0.0), px(40.0)),
-            "the wheel must track 1:1 with no delay"
+            "the eased notch did not land on the 40px it asked for"
         );
-
-        let start = Instant::now();
-        // Inside the idle window: nothing is armed, and the loop has to keep
-        // running so the gesture can still be decided.
-        assert!(!viewport.advance_wheel_glide(start + Duration::from_millis(50)));
         assert!(!viewport.scroll_animation_active());
+        // The tween is gone, but the gesture is still waiting out its idle
+        // window, so the loop is still legitimately alive.
         assert!(viewport.scroll_needs_frames());
 
-        let arm = start + Duration::from_millis(90);
+        let arm = start + IDLE_PROBE;
         assert!(!viewport.advance_wheel_glide(arm));
         assert!(!viewport.scroll_animation_active());
         assert_eq!(
             viewport.scroll_position(),
             point(px(0.0), px(40.0)),
-            "the declined gesture must leave the 1:1 position exactly as it was"
+            "the declined gesture must leave the eased position exactly as it was"
         );
         assert!(
             !viewport.scroll_needs_frames(),
@@ -2165,17 +2258,28 @@ mod tests {
         assert_eq!(viewport.scroll_position(), point(px(0.0), px(40.0)));
     }
 
-    /// A multi-event gesture that clears both gates arms exactly one glide,
-    /// tweened over exactly `GLIDE_MS`.
+    /// A multi-event gesture eases onto the accumulated travel, then arms exactly
+    /// one glide of the expected size and duration.
+    ///
+    /// This is the `N * X` test. Four notches of 50px must settle on 200px, and
+    /// the way they get there is the claim: each notch adds to the previous
+    /// *target* rather than to the live position, so the total is neither 50px
+    /// (only the last notch) nor anything less than 200px (the earlier notches'
+    /// un-flown travel thrown away).
     ///
     /// Sign convention: a negative `delta.y` scrolls DOWN, and a larger scroll
-    /// position also means further down. The accumulator is kept in the wheel's
-    /// sign space and negated into the position's, so a downward gesture glides
+    /// position also means further down. The target is kept in the position's
+    /// sign space, converted by negating the notch, so a downward gesture eases
     /// further DOWN. Getting that negation wrong is invisible to an arithmetic
     /// check and very visible to a user, so the direction is pinned here.
     ///
-    /// Arithmetic (four events of `delta.y = -50px` on a 0px start):
-    ///  - 1:1 puts the position at `4 * 50 = 200px`, row 10.
+    /// Arithmetic (four events of `delta.y = -50px` on a `0px` start, all armed at
+    /// `start`; the view cannot have moved between them, so every tween origin is
+    /// the live `0px` and only the target moves):
+    ///  - target after notch `n` is `0 + 50n`, so 50, 100, 150, and finally
+    ///    `4 * 50 = 200px`. The last tween runs `0px -> 200px` over
+    ///    `TWEEN_MS = 80ms` and the live position is still `0px` when the fourth
+    ///    event returns.
     ///  - accumulated = `-200px`, so `|accumulated| = 200 >= ARM_MIN_PX = 72`
     ///    and `events = 4 >= ARM_MIN_EVENTS = 2`: both gates pass.
     ///  - glide = `clamp(-(-200) * 0.25, ±120) = +50px`, so the tween runs
@@ -2190,16 +2294,49 @@ mod tests {
     #[test]
     fn significant_wheel_gesture_arms_a_glide_of_the_expected_size_and_duration() {
         let viewport = wheel_glide_viewport();
-        for _ in 0..4 {
-            viewport.scroll_by_delta(point(px(0.0), px(-50.0)));
-        }
-        assert_eq!(viewport.scroll_position().y, px(200.0));
-
         let start = Instant::now();
-        let arm = start + Duration::from_millis(90);
+        let mut update = None;
+        for _ in 0..4 {
+            update = Some(viewport.scroll_by_delta_at(point(px(0.0), px(-50.0)), start));
+        }
+        // The gesture is eased, not applied: the fourth notch armed a tween and
+        // the view has not moved at all.
+        assert!(viewport.scroll_animation_active());
+        assert_eq!(viewport.scroll_position().y, px(0.0));
+        assert_eq!(
+            viewport.top_visual_row(),
+            0,
+            "the live row moved before any frame"
+        );
+        // What the fourth notch *reported* is its destination: 4 * 50 = 200px is
+        // row 10 exactly. A 150px target would report row 7 and a 250px one row
+        // 12, so this pins the accumulated total without reading the position.
+        let update = update.expect("four notches were delivered");
+        assert!(update.changed);
+        assert_eq!(update.crossed_visual_rows, 10);
+        assert_eq!(update.top_visual_row, 10);
+        assert_eq!(update.offset_within_row, px(0.0));
+
+        // Land the in-gesture tween: 79ms is still in flight, 80ms is not, and
+        // it lands on exactly the accumulated 4 * 50 = 200px.
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(79)));
+        assert!(
+            viewport.scroll_animation_active(),
+            "the in-gesture tween finished before TWEEN_MS = 80ms"
+        );
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(80)));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(200.0),
+            "four notches of 50px did not land on 4 * 50 = 200px"
+        );
+        assert!(!viewport.scroll_animation_active());
+
+        let arm = start + IDLE_PROBE;
         assert!(viewport.advance_wheel_glide(arm));
         assert!(viewport.scroll_animation_active());
-        // Arming does not move anything: the glide is on top of the 1:1 position.
+        // Arming does not move anything: the glide goes on top of where the
+        // gesture already eased to.
         assert_eq!(viewport.scroll_position().y, px(200.0));
         // The tween keeps the loop alive now that the gesture is gone.
         assert!(viewport.scroll_needs_frames());
@@ -2222,7 +2359,7 @@ mod tests {
         assert_eq!(
             viewport.scroll_position().y,
             px(250.0),
-            "the glide did not land on clamp(200 * 0.25, ±120) = 50px past the 1:1 position"
+            "the glide did not land on clamp(200 * 0.25, ±120) = 50px past the eased position"
         );
         assert!(!viewport.scroll_animation_active());
         assert!(!viewport.scroll_needs_frames());
@@ -2237,37 +2374,56 @@ mod tests {
     /// gesture actually finished in.
     ///
     /// Sign convention: a negative `delta.y` scrolls DOWN (position increases), a
-    /// positive one scrolls UP. Confirmed by `single_wheel_event_does_not_glide`,
-    /// where `-40` lands the position at `+40px`.
+    /// positive one scrolls UP. Confirmed by
+    /// `single_wheel_event_glides_nothing_and_stops_the_frame_loop`, where `-40`
+    /// eases the position from `0px` to `+40px`.
     ///
     /// The gesture is parked at row 20 (`400px`) on purpose. A down-then-up flick
-    /// nets to zero 1:1 travel, so the glide has to be the only thing that moves the
-    /// view; if the start were `0px` the post-flip glide would point *up* and be
-    /// clamped away at the document top, leaving nothing observable to assert.
+    /// nets to zero travel, so the post-flip glide has to be the only thing that
+    /// moves the view; if the start were `0px` the post-flip glide would point
+    /// *up* and be clamped away at the document top, leaving nothing observable to
+    /// assert.
     ///
-    /// Arithmetic (`-100, -100, +100, +100` from `400px`):
-    ///  - 1:1 position: down 200, up 200, so `400 - 200 + 200 = 400px`, row 20.
-    ///  - accumulated after the first two events: `-200px`, `events = 2`.
+    /// Two accumulators are in play and they behave differently on a flip, which
+    /// is the point of walking through both.
+    ///
+    /// The **glide accumulator** lives in the wheel's sign space and is
+    /// `record_wheel_gesture`'s business:
+    ///  - after the first two events: `-200px`, `events = 2`.
     ///  - the third event flips the sign, so the accumulator is dropped and
     ///    restarted: `+100px`, `events = 1`. Netting would have left `-100px`.
     ///  - the fourth event keeps the sign: `+200px`, `events = 2`.
     ///  - `+200px` of accumulated travel means UP, so glide = `+50px` and the
-    ///    tween is `400px -> 350px` over 140ms.
+    ///    tween is `400px -> 350px` over 140ms. So the assertion below is the
+    ///    whole point: netting would have produced `|accumulated| = 0` and *no*
+    ///    glide, leaving the position at 400px.
     ///
-    /// So the assertion below is the whole point: netting would have produced
-    /// `|accumulated| = 0` and *no* glide, leaving the position at 400px.
+    /// The **target** lives in position space and is independent of that reset,
+    /// because a target is a position, not a direction:
+    ///  - `400 + 100 = 500`, then `600`, then `600 - 100 = 500`, then
+    ///    `500 - 100 = 400`.
+    ///  - the final target is the live position, so `resolve_scroll_tween` finds no
+    ///    distance, cancels, and no in-gesture tween survives. The view is
+    ///    therefore exactly where it started before the glide, and the glide is
+    ///    unambiguously the only motion in the test.
     #[test]
     fn direction_flip_resets_the_wheel_accumulator_instead_of_netting() {
         let viewport = wheel_glide_viewport();
         viewport.sync_from_helix_top_visual_row(20);
         assert_eq!(viewport.scroll_position().y, px(400.0));
+        let start = Instant::now();
         for delta in [-100.0, -100.0, 100.0, 100.0] {
-            viewport.scroll_by_delta(point(px(0.0), px(delta)));
+            viewport.scroll_by_delta_at(point(px(0.0), px(delta)), start);
         }
+        // The four targets net back onto the live position, so nothing is in
+        // flight and the position is untouched.
+        assert!(
+            !viewport.scroll_animation_active(),
+            "a target that nets onto the live position left a tween armed"
+        );
         assert_eq!(viewport.scroll_position().y, px(400.0));
 
-        let start = Instant::now();
-        let arm = start + Duration::from_millis(90);
+        let arm = start + IDLE_PROBE;
         assert!(
             viewport.advance_wheel_glide(arm),
             "the post-flip travel never armed a glide, so the accumulator netted"
@@ -2282,59 +2438,177 @@ mod tests {
         assert!(!viewport.scroll_animation_active());
     }
 
-    /// A new wheel event kills an in-flight glide and resumes 1:1 from wherever
-    /// the view actually is.
+    /// A notch arriving mid-flight retargets from the LIVE position onto the
+    /// accumulated destination, and the total is still `N * X`.
+    ///
+    /// Three ways to get this wrong, and the sample arithmetic tells all three
+    /// apart:
+    ///
+    ///  - **discard the remaining flight** (adding the notch to the live position
+    ///    instead of the target): the third notch would ask for `75 + 50 = 125px`,
+    ///    so the gesture would land at 125 rather than `3 * 50 = 150px` — less
+    ///    than the user asked for,
+    ///  - **restart from a stale origin** (re-anchoring onto the position the
+    ///    gesture started from rather than the live one): the 20ms sample below
+    ///    would read `0 + 150 * quad(0.25) = 65.625px`,
+    ///  - **correct**: ease from the live `75px` to the accumulated `150px`, which
+    ///    reads `75 + 75 * 0.4375 = 107.8125px` — neither of the other two.
+    ///
+    /// Arithmetic (three events of `delta.y = -50px`, rows of 20px, no clamp in
+    /// range):
+    ///  - notch 1 at `start`: target `0 + 50 = 50px`, tween `0 -> 50` over 80ms.
+    ///  - notch 2 at `start`: target `50 + 50 = 100px`, tween `0 -> 100` over 80ms.
+    ///  - sample at `start + 40ms`: `t = 0.5`, `quad(0.5) = 0.75`, so
+    ///    `y = 0 + 100 * 0.75 = 75px`.
+    ///  - notch 3 at `start + 40ms`: target `100 + 50 = 150px`, tween `75 -> 150`
+    ///    over 80ms from `start + 40ms`, i.e. a deadline of `start + 120ms`.
+    ///  - sample at `start + 60ms`: 20ms of that 80ms, `t = 0.25`,
+    ///    `quad(0.25) = 0.4375`, so `y = 75 + 75 * 0.4375 = 107.8125px`.
+    ///  - sample at `start + 119ms` (79ms of the 80ms) is still in flight; at
+    ///    `start + 120ms` it lands on exactly `3 * 50 = 150px`.
+    ///
+    /// Each notch gets a *fresh* full 80ms, which is what makes a notch feel
+    /// like a notch: the deadline is `arming instant + 80ms` every time, not the
+    /// original gesture's deadline, which would have expired before the third
+    /// notch arrived.
+    #[test]
+    fn wheel_notch_mid_flight_retargets_from_the_live_position_and_keeps_the_total() {
+        let viewport = wheel_glide_viewport();
+        let start = Instant::now();
+        viewport.scroll_by_delta_at(point(px(0.0), px(-50.0)), start);
+        let update = viewport.scroll_by_delta_at(point(px(0.0), px(-50.0)), start);
+
+        // Both notches accumulated onto one target of 2 * 50 = 100px and nothing
+        // has moved yet. 100px is row 5 exactly.
+        assert_eq!(viewport.scroll_position().y, px(0.0));
+        assert_eq!(update.top_visual_row, 5);
+        assert_eq!(update.offset_within_row, px(0.0));
+
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(40)));
+        assert_eq!(viewport.scroll_position().y, px(75.0));
+
+        // The third notch lands mid-flight.
+        let update = viewport.scroll_by_delta_at(
+            point(px(0.0), px(-50.0)),
+            start + Duration::from_millis(40),
+        );
+        // Reported against the destination, 3 * 50 = 150px = row 7, while the
+        // live position is 75px = row 3. 7 - 3 = 4 crossed.
+        assert!(update.changed);
+        assert_eq!(update.crossed_visual_rows, 4);
+        assert_eq!(update.top_visual_row, 7);
+        assert_eq!(update.offset_within_row, px(10.0));
+        assert_eq!(viewport.scroll_position().y, px(75.0));
+
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(60)));
+        assert!(
+            (viewport.scroll_position().y - px(107.8125)).abs() < px(0.01),
+            "20ms into the retarget read {:?}: 107.8125px eases from the LIVE 75px, \
+             65.625px would mean restarting from a stale origin, and 100px would \
+             mean discarding the remaining flight",
+            viewport.scroll_position().y
+        );
+
+        // The retarget's own deadline is `start + 40 + 80 = start + 120ms`, not
+        // the first notch's.
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(119)));
+        assert!(
+            viewport.scroll_animation_active(),
+            "the retargeted tween did not get its own full 80ms"
+        );
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(120)));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(150.0),
+            "three notches of 50px did not land on 3 * 50 = 150px"
+        );
+        assert!(!viewport.scroll_animation_active());
+    }
+
+    /// A new wheel event takes over an in-flight glide from where the view
+    /// actually is, not from where the glide was heading.
     ///
     /// The user's wheel is the only live input here, so it has to win
     /// immediately — including the "take over mid-flight" case, where resuming
     /// from the glide's *target* instead of its live position would teleport the
     /// viewport backwards by half the glide.
     ///
+    /// The new event starts a *fresh* gesture (`advance_wheel_glide` cleared the
+    /// old one), so its target begins from the live position and the tween eases
+    /// onto `live + 10px`.
+    ///
     /// Arithmetic (reuses the four-event gesture, then a `-10px` event):
-    ///  - glide armed at `arm`: `200px -> 250px` over 140ms, continuing downward
-    ///    because the accumulated wheel travel was `-200px` and the glide negates
-    ///    into the position's sign space.
-    ///  - at `arm + 70ms` the live position is `237.5px` (see the derivation in
-    ///    `significant_wheel_gesture_arms_a_glide_of_the_expected_size_and_duration`).
-    ///  - the new event cancels the tween and applies 1:1 from `237.5`, so the
-    ///    position is `237.5 + 10 = 247.5px`. Targeting 250 instead would have
-    ///    landed on `250 + 10 = 260px`.
-    ///  - the new gesture is a fresh accumulator (1 event, `10px` of travel), so
-    ///    it is below both gates, and the frame loop stops again.
+    ///  - four notches of 50px accumulate onto 200px; at `start + 40ms` of the
+    ///    80ms tween the live position is `0 + 200 * 0.75 = 150px`.
+    ///  - the glide arms at `start + IDLE_PROBE` from that live 150px: 200px of
+    ///    accumulated wheel travel glides 50px, so the tween is `150px -> 200px`
+    ///    over `GLIDE_MS = 140ms`. At `arm + 70ms` the live position is
+    ///    `150 + 50 * 0.75 = 187.5px`.
+    ///  - the new event cancels the glide and arms its own tween from the live
+    ///    `187.5px` to `187.5 + 10 = 197.5px` over 80ms. Resuming from the glide's
+    ///    *target* would have asked for `200 + 10 = 210px`, and keeping the glide
+    ///    would have asked for `200px`; the landing on exactly `197.5px` rules out
+    ///    both.
+    ///  - the replacement gesture is a fresh accumulator (1 event, 10px of travel),
+    ///    below both gates, so the frame loop stops again once the tween lands.
     #[test]
-    fn new_wheel_event_cancels_an_in_flight_glide_and_resumes_one_to_one() {
+    fn new_wheel_event_takes_over_an_in_flight_glide_from_its_live_position() {
         let viewport = wheel_glide_viewport();
-        for _ in 0..4 {
-            viewport.scroll_by_delta(point(px(0.0), px(-50.0)));
-        }
         let start = Instant::now();
-        let arm = start + Duration::from_millis(90);
+        for _ in 0..4 {
+            viewport.scroll_by_delta_at(point(px(0.0), px(-50.0)), start);
+        }
+        assert!(viewport.advance_scroll_animation_at(start + Duration::from_millis(40)));
+        assert_eq!(viewport.scroll_position().y, px(150.0));
+
+        let arm = start + IDLE_PROBE;
         assert!(viewport.advance_wheel_glide(arm));
-        assert!(viewport.advance_scroll_animation_at(arm + Duration::from_millis(70)));
-        assert_eq!(viewport.scroll_position().y, px(237.5));
-
-        viewport.scroll_by_delta(point(px(0.0), px(-10.0)));
-
-        assert!(
-            !viewport.scroll_animation_active(),
-            "the new wheel event left the glide tween in flight"
-        );
         assert_eq!(
             viewport.scroll_position().y,
-            px(247.5),
-            "1:1 did not resume from the live position"
+            px(150.0),
+            "arming the glide moved the view before the flight"
         );
-        // The tween is dead, not merely unflagged: sampling far past its
-        // deadline must move nothing.
-        assert!(!viewport.advance_scroll_animation_at(arm + Duration::from_millis(500)));
-        assert_eq!(viewport.scroll_position().y, px(247.5));
+        assert!(viewport.advance_scroll_animation_at(arm + Duration::from_millis(70)));
+        assert_eq!(viewport.scroll_position().y, px(187.5));
+
+        // The flight to 187.5px crossed seven whole rows and legitimately armed
+        // the live-position channel. Clearing it isolates the assertion below,
+        // which is about what the *wheel event* arms, not about the tween frames.
+        assert!(viewport.has_pending_view_sync());
+        viewport.clear_pending_view_sync();
+
+        let take = Instant::now();
+        let update = viewport.scroll_by_delta_at(point(px(0.0), px(-10.0)), take);
+
+        assert!(update.changed);
+        // 197.5px is row 9 with a 17.5px sub-row offset; the live 187.5px is also
+        // row 9, so this notch requests no row crossing and arms nothing.
+        assert_eq!(update.crossed_visual_rows, 0);
+        assert_eq!(update.top_visual_row, 9);
+        assert_eq!(update.offset_within_row, px(17.5));
+        assert!(
+            viewport.scroll_animation_active(),
+            "the new wheel event did not take over with its own tween"
+        );
+        assert!(
+            !viewport.has_pending_view_sync(),
+            "a tween-armed wheel event armed the live-position Helix channel before \
+             the view had crossed a row; that channel belongs to the tween frames"
+        );
+
+        assert!(viewport.advance_scroll_animation_at(take + Duration::from_millis(80)));
+        assert_eq!(
+            viewport.scroll_position().y,
+            px(197.5),
+            "the new event did not resume from the live 187.5px: 210px would be \
+             the glide's target, 200px would be the glide itself"
+        );
+        assert!(!viewport.scroll_animation_active());
 
         // The replacement gesture is below both gates, so the loop still ends.
         assert!(viewport.scroll_needs_frames());
-        let restart = Instant::now();
-        assert!(!viewport.advance_wheel_glide(restart + Duration::from_millis(90)));
+        assert!(!viewport.advance_wheel_glide(take + IDLE_PROBE));
         assert!(!viewport.scroll_needs_frames());
-        assert_eq!(viewport.scroll_position().y, px(247.5));
     }
 
     /// A hard fling is capped at `MAX_PX`, in both directions.
@@ -2345,26 +2619,35 @@ mod tests {
     /// has to reach `120 / 0.25 = 480px` before it can saturate.
     ///
     /// Sign convention: negative `delta.y` is DOWN, and a larger position is
-    /// further down. So a downward fling glides to a LARGER position.
+    /// further down. So a downward fling eases toward a LARGER position and glides
+    /// on to a larger one still.
     ///
-    /// Arithmetic (six events of 100px each; scroll range is 0..1200px):
-    ///  - down: 1:1 position `600px`; accumulated `-600px`, which clears both
-    ///    gates; `clamp(-(-600) * 0.25, ±120) = clamp(150, ±120) = 120px`, so the
+    /// Both halves are unchanged by the easing, because the in-gesture tween lands
+    /// on exactly the position the 1:1 path would have reached and the glide is
+    /// armed from there. Arithmetic (six events of 100px each; the scroll range is
+    /// `0..=1200px`, and every target below stays inside it, so nothing is clamped
+    /// by the range and the numbers are pure glide arithmetic):
+    ///  - down: the targets accumulate `100, 200, ... 600`, so the tween lands on
+    ///    `6 * 100 = 600px`; accumulated `-600px`, which clears both gates;
+    ///    `clamp(-(-600) * 0.25, ±120) = clamp(150, ±120) = 120px`, so the glide
     ///    tween is `600px -> 720px`. Without the cap it would have been 750px.
-    ///  - up: parked at row 50 (`1000px`) rather than near the top, because
-    ///    600px of upward travel has to fit below the position-0 clamp;
-    ///    1:1 position `1000 - 600 = 400px`, accumulated `+600px`,
+    ///  - up: parked at row 50 (`1000px`) rather than near the top, because 600px
+    ///    of upward travel has to fit below the position-0 clamp; the targets
+    ///    accumulate down to `1000 - 600 = 400px`, accumulated `+600px`,
     ///    `clamp(-(600) * 0.25, ±120) = clamp(-150, ±120) = -120px`, so the tween
     ///    is `400px -> 280px`, still inside the scroll range.
     #[test]
     fn wheel_glide_is_clamped_to_max_px_in_both_directions() {
         let down = wheel_glide_viewport();
+        let down_start = Instant::now();
         for _ in 0..6 {
-            down.scroll_by_delta(point(px(0.0), px(-100.0)));
+            down.scroll_by_delta_at(point(px(0.0), px(-100.0)), down_start);
         }
+        // The eased half lands on the same 600px the 1:1 path used to reach.
+        assert!(down.advance_scroll_animation_at(down_start + Duration::from_millis(80)));
         assert_eq!(down.scroll_position().y, px(600.0));
         let down_start = Instant::now();
-        let down_arm = down_start + Duration::from_millis(90);
+        let down_arm = down_start + IDLE_PROBE;
         assert!(down.advance_wheel_glide(down_arm));
         assert!(down.advance_scroll_animation_at(down_arm + Duration::from_millis(140)));
         assert_eq!(
@@ -2376,12 +2659,14 @@ mod tests {
         let up = wheel_glide_viewport();
         up.sync_from_helix_top_visual_row(50);
         assert_eq!(up.scroll_position().y, px(1000.0));
+        let up_start = Instant::now();
         for _ in 0..6 {
-            up.scroll_by_delta(point(px(0.0), px(100.0)));
+            up.scroll_by_delta_at(point(px(0.0), px(100.0)), up_start);
         }
+        assert!(up.advance_scroll_animation_at(up_start + Duration::from_millis(80)));
         assert_eq!(up.scroll_position().y, px(400.0));
         let up_start = Instant::now();
-        let up_arm = up_start + Duration::from_millis(90);
+        let up_arm = up_start + IDLE_PROBE;
         assert!(up.advance_wheel_glide(up_arm));
         assert!(up.advance_scroll_animation_at(up_arm + Duration::from_millis(140)));
         assert_eq!(
@@ -2391,15 +2676,28 @@ mod tests {
         );
     }
 
-    /// With the feature off, a gesture is exactly today's behaviour: 1:1, no
-    /// gesture recorded, no glide, and no frames requested.
+    /// With the feature off, a gesture is exactly today's behaviour: 1:1, instant,
+    /// no gesture recorded, no glide, and no frames requested.
     ///
-    /// The 1:1 position is the same number the enabled fixture produces for the
-    /// same four events (200px), which is the actual claim: the flag changes the
-    /// tail and nothing else. And because nothing is recorded,
-    /// `scroll_needs_frames()` never becomes true, so the frame loop is never
-    /// started in the first place — there is no window during which it could fail
-    /// to stop.
+    /// `wheel_glide` is the master switch for the whole wheel model, easing
+    /// included, so the tween engine is deliberately left *on* here: if the
+    /// in-gesture ease were gated on anything other than this key, the
+    /// `smooth_scrolling_enabled()` assertion below would catch it, and if it
+    /// were gated on both keys this is the configuration that turns it off.
+    ///
+    /// Arithmetic (four events of `delta.y = -50px` from `0px`): each event
+    /// subtracts, so the positions after each write are `50, 100, 150, 200px` —
+    /// `4 * 50 = 200px` exactly, and the same total the enabled fixture reaches
+    /// after letting its tweens land. 200px is row 10 with no sub-row offset, and
+    /// `200 < 1200` so the range never clamps. The claim is that the flag changes
+    /// the timing and the tail and nothing about where the gesture ends up.
+    ///
+    /// The two clock samples are the load-bearing part. `!scroll_animation_active()`
+    /// right after the events already rules out a tween that is armed and waiting,
+    /// because an armed tween keeps its state; the far-future sample rules out the
+    /// other failure, a tween that *was* armed and then finished without ever being
+    /// noticed, which is exactly what a silent stall of the frame loop would look
+    /// like from the outside.
     #[test]
     fn disabled_wheel_glide_glides_nothing_and_requests_no_frames() {
         let mut viewport = EditorViewport::new(px(20.0));
@@ -2407,24 +2705,36 @@ mod tests {
         viewport.set_smooth_scrolling(true);
         viewport.set_wheel_glide(false);
         assert!(!viewport.wheel_glide_enabled());
-
-        for _ in 0..4 {
-            viewport.scroll_by_delta(point(px(0.0), px(-50.0)));
-        }
-        assert_eq!(viewport.scroll_position().y, px(200.0));
+        assert!(
+            viewport.smooth_scrolling_enabled(),
+            "the tween engine must stay on here, or this test proves nothing about \
+             which key gates the easing"
+        );
 
         let start = Instant::now();
+        for _ in 0..4 {
+            viewport.scroll_by_delta_at(point(px(0.0), px(-50.0)), start);
+        }
+        assert_eq!(viewport.scroll_position().y, px(200.0));
+        assert!(
+            !viewport.scroll_animation_active(),
+            "a disabled glide still eased the first notch"
+        );
+
         assert!(
             !viewport.scroll_needs_frames(),
             "a disabled glide still started the frame loop"
         );
-        assert!(!viewport.advance_wheel_glide(start + Duration::from_millis(90)));
+        assert!(!viewport.advance_scroll_animation_at(start + IDLE_PROBE));
+        assert!(!viewport.advance_wheel_glide(start + IDLE_PROBE));
         assert!(!viewport.scroll_needs_frames());
         assert!(!viewport.scroll_animation_active());
         assert_eq!(viewport.scroll_position().y, px(200.0));
 
-        // No accumulator survived the disabled window, so nothing can fire later.
+        // No gesture survived the disabled window, so nothing can fire later, and
+        // no tween exists to be found by a clock far past any of their deadlines.
         assert!(!viewport.advance_wheel_glide(start + Duration::from_millis(500)));
+        assert!(!viewport.advance_scroll_animation_at(start + Duration::from_secs(5)));
         assert!(!viewport.scroll_needs_frames());
         assert!(!viewport.scroll_animation_active());
         assert_eq!(viewport.scroll_position().y, px(200.0));
@@ -2481,19 +2791,78 @@ mod tests {
         assert_eq!(viewport.scroll_position(), point(px(0.0), px(600.0)));
     }
 
+    /// A wheel notch takes over an in-flight scroll animation, and it takes over
+    /// with *its own* tween rather than by dropping the easing.
+    ///
+    /// The cancel is the original point of the test and is unchanged: a wheel is
+    /// a continuous user intent, so it must not fight a discrete jump to
+    /// completion. What changed is what replaces the cancelled tween. A notch is
+    /// now eased onto over `TWEEN_MS`, so the view must *not* be at the notch's
+    /// target the moment the event returns.
+    ///
+    /// The viewport is 100px tall with 20px rows, so `visible_visual_rows() = 5`
+    /// and one page is 5 rows. That matters for showing the old tween is gone:
+    ///  - `VisualPages(1)` arms `0px -> 5 * 20 = 100px` over
+    ///    `editor_jump_duration(5) = 60 + 6 * 5 = 90ms`. That flight is the one
+    ///    the notch has to destroy.
+    ///  - The notch is `delta.y = -5px` (down), so the target is
+    ///    `0 - (-5) = 5px` and the replacement tween is `0px -> 5px` over
+    ///    `TWEEN_MS = 80ms`. Live position is still `0px` on return.
+    ///  - At `take + 40ms`, `t = 40 / 80 = 0.5` and `ease_out_quad(0.5) = 0.75`,
+    ///    so `y = 0 + 5 * 0.75 = 3.75px`. This single sample is what pins the
+    ///    cancel *and* the replacement: the dead 90ms page tween would have been
+    ///    at `100 * 0.75 = 75px`, and the old 1:1 instant write would already have
+    ///    been at the full `5px`. `3.75px` is neither.
+    ///  - `5px` is a fifth of a row, so `crossed_visual_rows` is 0 and the top row
+    ///    is still 0 — the notch is sub-row, exactly like the old 1:1 arrival.
+    ///  - At `take + 80ms` the tween completes on exactly `5px`.
+    ///  - accumulated = `-5px`, so `|accumulated| = 5 < ARM_MIN_PX = 72` and
+    ///    `events = 1 < ARM_MIN_EVENTS = 2`: no glide. The frame loop still ends,
+    ///    at the gesture clear inside `IDLE_PROBE`.
     #[test]
     fn viewport_wheel_delta_cancels_an_in_flight_scroll_animation() {
         let mut viewport = EditorViewport::new(px(20.0));
         viewport.set_layout(px(20.0), size(px(100.0), px(100.0)), 50);
         viewport.set_smooth_scrolling(true);
+        assert_eq!(viewport.visible_visual_rows(), 5);
         viewport.apply_scroll_request(EditorViewportScrollRequest::VisualPages(1));
         assert!(viewport.scroll_animation_active());
+        assert_eq!(
+            editor_jump_duration(5),
+            Duration::from_millis(90),
+            "the cancelled page tween's duration moved; the sample below assumes 90ms"
+        );
 
-        let update = viewport.scroll_by_delta(point(px(0.0), px(-5.0)));
+        let take = Instant::now();
+        let update = viewport.scroll_by_delta_at(point(px(0.0), px(-5.0)), take);
 
         assert!(update.changed);
+        assert_eq!(update.crossed_visual_rows, 0);
+        assert_eq!(update.top_visual_row, 0);
+        assert_eq!(update.offset_within_row, px(5.0));
+        assert!(
+            viewport.scroll_animation_active(),
+            "the wheel notch did not take over with its own tween"
+        );
+        assert_eq!(
+            viewport.scroll_position(),
+            point(px(0.0), px(0.0)),
+            "the notch jumped straight to its target instead of easing onto it"
+        );
+
+        // The 90ms page tween is gone and a 5px/80ms one replaced it.
+        assert!(viewport.advance_scroll_animation_at(take + Duration::from_millis(40)));
+        assert_eq!(viewport.scroll_position().y, px(3.75));
+        assert!(viewport.scroll_animation_active());
+
+        assert!(viewport.advance_scroll_animation_at(take + Duration::from_millis(80)));
+        assert_eq!(viewport.scroll_position().y, px(5.0));
         assert!(!viewport.scroll_animation_active());
-        assert_eq!(viewport.scroll_position(), point(px(0.0), px(5.0)));
+
+        // One notch is below both glide gates, so the clear ends the frame loop.
+        assert!(viewport.scroll_needs_frames());
+        assert!(!viewport.advance_wheel_glide(take + IDLE_PROBE));
+        assert!(!viewport.scroll_needs_frames());
     }
 
     #[test]

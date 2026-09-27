@@ -249,8 +249,9 @@ pub struct EditorGuiConfig {
     #[serde(default = "default_true")]
     pub smooth_scrolling: bool,
 
-    /// Add an eased glide after a mouse-wheel gesture goes idle. The wheel
-    /// itself always tracks 1:1; this is only the extra glide on top of it.
+    /// Smooth mouse-wheel scrolling, including the glide after a gesture stops.
+    /// Each notch eases onto an accumulated destination, and an idle gesture adds
+    /// a short extra glide on top. Horizontal wheel scrolling stays 1:1.
     #[serde(default = "default_true")]
     pub wheel_glide: bool,
 }
