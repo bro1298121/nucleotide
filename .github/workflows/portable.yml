@@ -86,7 +86,7 @@ jobs:
 
       - name: Metal toolchain
         run: |
-          xcrun -sdk macosx metal -version || xcodebuild -downloadComponent metalToolchain
+          xcrun -sdk macosx metal --version || xcodebuild -downloadComponent metalToolchain
           brew install fontconfig pkg-config || true
 
       - name: Build
