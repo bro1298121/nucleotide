@@ -9,18 +9,13 @@ permissions:
   contents: read
 
 jobs:
-  # ------------------------------------------------------------------
-  # Linux x86_64
-  # ------------------------------------------------------------------
   linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Zig 0.15.2 (official)
+      - name: Install Zig 0.15.2
         run: |
           set -euo pipefail
           curl -fSL --retry 5 --retry-all-errors \
@@ -28,7 +23,9 @@ jobs:
             https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
           tar -xf zig.tar.xz
           echo "$PWD/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
-          zig version
+
+      - name: Verify Zig
+        run: zig version
 
       - name: Linux deps
         run: |
@@ -67,20 +64,15 @@ jobs:
           path: nucleotide-linux-x86_64.tar.gz
           if-no-files-found: error
 
-  # ------------------------------------------------------------------
-  # macOS arm64
-  # ------------------------------------------------------------------
   macos:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
 
-      - name: Install Zig 0.15.2 (official)
+      - name: Install Zig 0.15.2
         run: |
           set -euo pipefail
           curl -fSL --retry 5 --retry-all-errors \
@@ -88,7 +80,9 @@ jobs:
             https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
           tar -xf zig.tar.xz
           echo "$PWD/zig-aarch64-macos-0.15.2" >> "$GITHUB_PATH"
-          zig version
+
+      - name: Verify Zig
+        run: zig version
 
       - name: Metal toolchain
         run: |
