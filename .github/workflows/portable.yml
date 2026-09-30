@@ -5,15 +5,30 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  # ------------------------------------------------------------------
+  # Linux x86_64
+  # ------------------------------------------------------------------
   linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: 0.15.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Zig 0.15.2 (official)
+        run: |
+          set -euo pipefail
+          curl -fSL --retry 5 --retry-all-errors \
+            -o zig.tar.xz \
+            https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+          tar -xf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
+          zig version
 
       - name: Linux deps
         run: |
@@ -30,6 +45,7 @@ jobs:
 
       - name: Fetch Helix runtime
         run: |
+          set -euo pipefail
           HELIX_REV="$(sed -n 's/.*helix-loader = .*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml | head -n 1)"
           git clone --depth 1 https://github.com/helix-editor/helix.git helix-temp
           if [ -n "$HELIX_REV" ]; then
@@ -49,28 +65,42 @@ jobs:
         with:
           name: nucleotide-linux-x86_64
           path: nucleotide-linux-x86_64.tar.gz
+          if-no-files-found: error
 
+  # ------------------------------------------------------------------
+  # macOS arm64
+  # ------------------------------------------------------------------
   macos:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: 0.15.2
+
+      - name: Install Zig 0.15.2 (official)
+        run: |
+          set -euo pipefail
+          curl -fSL --retry 5 --retry-all-errors \
+            -o zig.tar.xz \
+            https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
+          tar -xf zig.tar.xz
+          echo "$PWD/zig-aarch64-macos-0.15.2" >> "$GITHUB_PATH"
+          zig version
 
       - name: Metal toolchain
         run: |
-          xcrun -sdk macosx metal --version || xcodebuild -downloadComponent metalToolchain
+          xcrun -sdk macosx metal -version || xcodebuild -downloadComponent metalToolchain
           brew install fontconfig pkg-config || true
 
       - name: Build
         run: cargo build --release --target aarch64-apple-darwin --bin nucl --bin nucl-grammar
 
-      - name: Runtime
+      - name: Fetch Helix runtime
         run: |
+          set -euo pipefail
           HELIX_REV="$(sed -n 's/.*helix-loader = .*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml | head -n 1)"
           git clone --depth 1 https://github.com/helix-editor/helix.git helix-temp
           if [ -n "$HELIX_REV" ]; then
@@ -83,6 +113,7 @@ jobs:
 
       - name: Bundle .app
         run: |
+          set -euo pipefail
           NUCL_BINARY="target/aarch64-apple-darwin/release/nucl" \
           ./scripts/bundle-mac.sh
           tar -czf Nucleotide-aarch64.app.tar.gz Nucleotide.app
@@ -91,3 +122,4 @@ jobs:
         with:
           name: nucleotide-macos-aarch64
           path: Nucleotide-aarch64.app.tar.gz
+          if-no-files-found: error
