@@ -1,912 +1,143 @@
-name: Release
+name: release
 
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Release tag (e.g., v0.1.0)'
-        required: true
-        type: string
+      - "v*"
 
 permissions:
-  contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  VPK_VERSION: '1.2.0'
+  contents: write
 
 jobs:
-  prepare-release:
-    name: Prepare Release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      release_ref: ${{ steps.release.outputs.release_ref }}
-      release_sha: ${{ steps.verify.outputs.release_sha }}
-      version: ${{ steps.release.outputs.version }}
-
-    steps:
-      - name: Resolve release tag
-        id: release
-        env:
-          REQUESTED_TAG: ${{ github.event.inputs.tag }}
-        run: |
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            version="${REQUESTED_TAG}"
-          else
-            version="${GITHUB_REF#refs/tags/}"
-          fi
-
-          if ! printf '%s' "${version}" | grep -Eq '^v[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$'; then
-            echo "Invalid release tag: ${version}" >&2
-            exit 1
-          fi
-
-          printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
-          printf 'release_ref=refs/tags/%s\n' "${version}" >> "${GITHUB_OUTPUT}"
-
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          persist-credentials: false
-          ref: ${{ steps.release.outputs.release_ref }}
-          fetch-depth: 0
-
-      - name: Verify release ref
-        id: verify
-        env:
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          tag_sha="$(git rev-list -n 1 "${RELEASE_VERSION}^{commit}")"
-          head_sha="$(git rev-parse HEAD)"
-
-          if [ "${head_sha}" != "${tag_sha}" ]; then
-            echo "Checked out ${head_sha}, but ${RELEASE_VERSION} resolves to ${tag_sha}" >&2
-            exit 1
-          fi
-
-          printf 'release_sha=%s\n' "${head_sha}" >> "${GITHUB_OUTPUT}"
-
-      - name: Verify tag matches workspace version
-        env:
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          workspace_version="$(sed -n '/^\[workspace.package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
-          test -n "${workspace_version}"
-          if [ "${RELEASE_VERSION#v}" != "${workspace_version}" ]; then
-            echo "Release tag ${RELEASE_VERSION} does not match workspace version ${workspace_version}" >&2
-            exit 1
-          fi
-
-  build-linux:
-    name: Build Linux
-    runs-on: ubuntu-latest
-    needs: prepare-release
-    
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          persist-credentials: false
-          ref: ${{ needs.prepare-release.outputs.release_ref }}
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: 1.96.0
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
-        with:
-          version: 0.15.2
-          use-cache: false
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-        with:
-          key: linux-release
-          cache-workspace-crates: true
-          save-if: false
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@a7ad9c4f0c65208097f4d34f3cfa1913b80cce5c
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libxcb-xfixes0-dev \
-            libxcb-shape0-dev \
-            libxrandr-dev \
-            libxi-dev \
-            libgl1-mesa-dev \
-            libvulkan-dev \
-            libfreetype6-dev \
-            libfontconfig1-dev
-      
-      - name: Build release
-        run: |
-          cargo build --release -p nucleotide --bins -p nucleotide-remote
-          nix develop .#ci --command build-remote-helpers
-      
-      - name: Prepare distribution
-        run: |
-          # Fetch the Cargo-pinned Helix revision for runtime files.
-          HELIX_REV="$(sed -n 's/.*helix-loader = .*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml | head -n 1)"
-          test -n "${HELIX_REV}"
-          git init helix-temp
-          git -C helix-temp remote add origin https://github.com/helix-editor/helix.git
-          git -C helix-temp fetch --depth 1 origin "${HELIX_REV}"
-          git -C helix-temp checkout --detach FETCH_HEAD
-          
-          # Create distribution
-          mkdir -p nucleotide-linux/bin
-          mkdir -p nucleotide-linux/share/nucleotide/runtime
-          mkdir -p target/remote-helpers
-          
-          cp target/release/nucl nucleotide-linux/bin/
-          cp target/release/nucleotide-remote nucleotide-linux/bin/nucleotide-remote
-          cp target/remote-helpers/nucleotide-remote-linux-x86_64 nucleotide-linux/bin/
-          cp target/remote-helpers/nucleotide-remote-linux-aarch64 nucleotide-linux/bin/
-          cp -r helix-temp/runtime/* nucleotide-linux/share/nucleotide/runtime/
-          cp README.md LICENSE nucleotide-linux/ 2>/dev/null || true
-          
-          # Create tarball
-          tar czf nucleotide-linux-x86_64.tar.gz nucleotide-linux
-          
-          rm -rf helix-temp
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: linux-build
-          path: nucleotide-linux-x86_64.tar.gz
-          retention-days: 1
-
-      - name: Upload Linux remote helpers
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: linux-remote-helpers
-          path: target/remote-helpers/nucleotide-remote-linux-*
-          retention-days: 1
-
-  build-macos:
-    name: Build macOS ARM64
-    runs-on: macos-15
-    needs: [prepare-release, build-linux]
-    
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          persist-credentials: false
-          ref: ${{ needs.prepare-release.outputs.release_ref }}
-
-      - name: Download Linux remote helpers
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: linux-remote-helpers
-          path: target/remote-helpers
-
-      - name: Verify Linux remote helpers
-        run: |
-          test -f target/remote-helpers/nucleotide-remote-linux-x86_64
-          test -f target/remote-helpers/nucleotide-remote-linux-aarch64
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: 1.96.0
-          targets: aarch64-apple-darwin
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
-        with:
-          version: 0.15.2
-          use-cache: false
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-        with:
-          key: macos-aarch64-release
-          cache-workspace-crates: true
-          save-if: false
-
-      - name: Install Metal Toolchain
-        run: |
-          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
-            xcodebuild -downloadComponent metalToolchain
-          fi
-          xcrun -sdk macosx metal --version
-      
-      - name: Build release with precompiled Metal shaders
-        run: |
-          cargo build --release --target aarch64-apple-darwin \
-            --no-default-features \
-            --features git,terminal-emulator,update-smoke-test \
-            --bin nucl \
-            --bin nucl-grammar \
-            --bin nucleotide-update-smoke
-
-      - name: Verify macOS binaries are portable
-        run: |
-          for binary in \
-            target/aarch64-apple-darwin/release/nucl \
-            target/aarch64-apple-darwin/release/nucleotide-update-smoke
-          do
-            dependencies="$(otool -L "${binary}")"
-            printf '%s\n' "${dependencies}"
-            if [[ "${dependencies}" == *"/nix/store/"* ]]; then
-              echo "macOS release binary contains a non-portable Nix store dependency: ${binary}" >&2
-              exit 1
-            fi
-          done
-      
-      - name: Prepare runtime
-        run: |
-          HELIX_REV="$(sed -n 's/.*helix-loader = .*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml | head -n 1)"
-          test -n "${HELIX_REV}"
-          git init helix-temp
-          git -C helix-temp remote add origin https://github.com/helix-editor/helix.git
-          git -C helix-temp fetch --depth 1 origin "${HELIX_REV}"
-          git -C helix-temp checkout --detach FETCH_HEAD
-          mkdir -p runtime
-          cp -r helix-temp/runtime/* runtime/
-          rm -rf helix-temp
-      
-      - name: Create app bundle
-        run: |
-          chmod +x scripts/bundle-mac.sh
-          NUCL_REMOTE_HELPER_DIR="target/remote-helpers" \
-            NUCL_REQUIRE_REMOTE_HELPERS=1 \
-            NUCL_PREBUILT_REMOTE_HELPERS=1 \
-            NUCL_BINARY="target/aarch64-apple-darwin/release/nucl" \
-            ./scripts/bundle-mac.sh
-
-          tar -czf Nucleotide-aarch64.app.tar.gz Nucleotide.app
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: macos-aarch64-app
-          path: |
-            Nucleotide-aarch64.app.tar.gz
-            target/aarch64-apple-darwin/release/nucleotide-update-smoke
-          retention-days: 1
-
-  package-macos:
-    name: Package macOS ARM64
-    runs-on: macos-15
-    needs: [prepare-release, build-macos]
-    
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          persist-credentials: false
-          ref: ${{ needs.prepare-release.outputs.release_ref }}
-      
-      - name: Download artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: macos-aarch64-app
-          path: aarch64
-
-      - name: Install .NET SDK
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
-        with:
-          dotnet-version: 8.0.x
-
-      - name: Install Velopack CLI
-        run: |
-          dotnet tool update -g vpk --version "${VPK_VERSION}"
-          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
-
-      - name: Download previous macOS release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p target/release/bundle/velopack-macos
-          vpk download github \
-            --repoUrl "https://github.com/${GITHUB_REPOSITORY}" \
-            --token "${GH_TOKEN}" \
-            --channel macos \
-            --outputDir target/release/bundle/velopack-macos \
-            || echo "No previous macOS Velopack release was available; building a full package only."
-
-      - name: Generate release notes
-        run: ./scripts/generate-release-notes.sh release-notes.md "${{ needs.prepare-release.outputs.version }}"
-
-      - name: Configure Apple signing and notarization
-        env:
-          BUILD_CERTIFICATE_BASE64: ${{ secrets.MACOS_BUILD_CERTIFICATE_BASE64 }}
-          INSTALLER_CERTIFICATE_BASE64: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_BASE64 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          SIGN_APP_IDENTITY: ${{ secrets.MACOS_SIGN_APP_IDENTITY }}
-          SIGN_INSTALL_IDENTITY: ${{ secrets.MACOS_SIGN_INSTALL_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          signing_variables=(
-            BUILD_CERTIFICATE_BASE64
-            INSTALLER_CERTIFICATE_BASE64
-            CERTIFICATE_PASSWORD
-            SIGN_APP_IDENTITY
-            SIGN_INSTALL_IDENTITY
-            APPLE_ID
-            APPLE_APP_PASSWORD
-            APPLE_TEAM_ID
-          )
-          configured_variables=()
-          missing_variables=()
-          for variable in "${signing_variables[@]}"; do
-            if [ -n "${!variable:-}" ]; then
-              configured_variables+=("${variable}")
-            else
-              missing_variables+=("${variable}")
-            fi
-          done
-
-          if [ "${#configured_variables[@]}" -eq 0 ]; then
-            echo "::warning::Apple signing and notarization secrets are not configured; producing unsigned macOS packages."
-            exit 0
-          fi
-          if [ "${#missing_variables[@]}" -ne 0 ]; then
-            printf 'Apple signing and notarization must be fully configured or fully omitted. Missing: %s\n' \
-              "${missing_variables[*]}" >&2
-            exit 1
-          fi
-
-          keychain="${RUNNER_TEMP}/nucleotide-signing.keychain-db"
-          build_certificate="${RUNNER_TEMP}/nucleotide-build.p12"
-          installer_certificate="${RUNNER_TEMP}/nucleotide-installer.p12"
-          printf '%s' "${BUILD_CERTIFICATE_BASE64}" | base64 -D > "${build_certificate}"
-          printf '%s' "${INSTALLER_CERTIFICATE_BASE64}" | base64 -D > "${installer_certificate}"
-
-          security create-keychain -p "${CERTIFICATE_PASSWORD}" "${keychain}"
-          security set-keychain-settings -lut 21600 "${keychain}"
-          security unlock-keychain -p "${CERTIFICATE_PASSWORD}" "${keychain}"
-          security import "${build_certificate}" -P "${CERTIFICATE_PASSWORD}" -A -t cert -f pkcs12 -k "${keychain}"
-          security import "${installer_certificate}" -P "${CERTIFICATE_PASSWORD}" -A -t cert -f pkcs12 -k "${keychain}"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "${CERTIFICATE_PASSWORD}" "${keychain}"
-          security list-keychains -d user -s "${keychain}"
-
-          xcrun notarytool store-credentials nucleotide-ci \
-            --apple-id "${APPLE_ID}" \
-            --team-id "${APPLE_TEAM_ID}" \
-            --password "${APPLE_APP_PASSWORD}" \
-            --keychain "${keychain}"
-
-          printf 'NUCL_VELOPACK_KEYCHAIN=%s\n' "${keychain}" >> "${GITHUB_ENV}"
-          printf 'NUCL_VELOPACK_NOTARY_PROFILE=nucleotide-ci\n' >> "${GITHUB_ENV}"
-      
-      - name: Prepare ARM64 app
-        run: |
-          tar -xzf aarch64/Nucleotide-aarch64.app.tar.gz
-          test "$(lipo -archs Nucleotide.app/Contents/MacOS/Nucleotide)" = "arm64"
-          test -x Nucleotide.app/Contents/MacOS/nucleotide-remote-linux-x86_64
-          test -x Nucleotide.app/Contents/MacOS/nucleotide-remote-linux-aarch64
-
-          cp aarch64/target/aarch64-apple-darwin/release/nucleotide-update-smoke \
-            nucleotide-update-smoke
-          test "$(lipo -archs nucleotide-update-smoke)" = "arm64"
-
-      - name: Exercise a packaged macOS update
-        env:
-          SIGN_APP_IDENTITY: ${{ secrets.MACOS_SIGN_APP_IDENTITY }}
-          SIGN_INSTALL_IDENTITY: ${{ secrets.MACOS_SIGN_INSTALL_IDENTITY }}
-        run: |
-          smoke_app="NucleotideUpdateSmoke.app"
-          smoke_output="${RUNNER_TEMP}/nucleotide-update-smoke-macos"
-          mkdir -p "${smoke_app}/Contents/MacOS" "${smoke_app}/Contents/Resources" "${smoke_output}"
-          cp nucleotide-update-smoke "${smoke_app}/Contents/MacOS/NucleotideUpdateSmoke"
-          chmod +x "${smoke_app}/Contents/MacOS/NucleotideUpdateSmoke"
-          plutil -create xml1 "${smoke_app}/Contents/Info.plist"
-          plutil -insert CFBundleExecutable -string NucleotideUpdateSmoke "${smoke_app}/Contents/Info.plist"
-          plutil -insert CFBundleIdentifier -string org.spiralpoint.nucleotide.smoke.macos "${smoke_app}/Contents/Info.plist"
-          plutil -insert CFBundleName -string NucleotideUpdateSmoke "${smoke_app}/Contents/Info.plist"
-          plutil -insert CFBundlePackageType -string APPL "${smoke_app}/Contents/Info.plist"
-          plutil -insert CFBundleShortVersionString -string 9000.0.0 "${smoke_app}/Contents/Info.plist"
-
-          pack_smoke() {
-            vpk_args=(
-              pack
-              --packId org.spiralpoint.nucleotide.smoke.macos
-              --packTitle NucleotideUpdateSmoke
-              --packVersion "$1"
-              --packDir "${smoke_app}"
-              --mainExe NucleotideUpdateSmoke
-              --outputDir "${smoke_output}"
-              --channel smoke-macos
-            )
-            if [ -n "${SIGN_APP_IDENTITY:-}" ]; then
-              vpk_args+=(--signAppIdentity "${SIGN_APP_IDENTITY}")
-            fi
-            if [ -n "${SIGN_INSTALL_IDENTITY:-}" ]; then
-              vpk_args+=(--signInstallIdentity "${SIGN_INSTALL_IDENTITY}")
-            fi
-            if [ -n "${NUCL_VELOPACK_KEYCHAIN:-}" ]; then
-              vpk_args+=(--keychain "${NUCL_VELOPACK_KEYCHAIN}")
-            fi
-
-            vpk "${vpk_args[@]}"
-          }
-
-          pack_smoke 9000.0.0
-          smoke_installer="$(find "${smoke_output}" -maxdepth 1 -name '*.pkg' -print -quit)"
-          test -n "${smoke_installer}"
-          installer -pkg "${smoke_installer}" -target CurrentUserHomeDirectory
-
-          pack_smoke 9000.0.1
-          result="${RUNNER_TEMP}/nucleotide-update-smoke-result"
-          source="$(cd "${smoke_output}" && pwd)"
-          "${HOME}/Applications/NucleotideUpdateSmoke.app/Contents/MacOS/NucleotideUpdateSmoke" \
-            apply "${source}" "${result}" 9000.0.0 9000.0.1
-          for _ in $(seq 1 90); do
-            if [ -f "${result}" ]; then
-              break
-            fi
-            sleep 1
-          done
-          test "$(cat "${result}")" = 9000.0.1
-
-          pack_smoke 9000.0.2
-          corrupt_packages="$(find "${smoke_output}" -maxdepth 1 -name '*-9000.0.2-*.nupkg' -print)"
-          test -n "${corrupt_packages}"
-          while IFS= read -r corrupt_package; do
-            printf 'corrupt' >> "${corrupt_package}"
-          done <<<"${corrupt_packages}"
-          corrupt_result="${RUNNER_TEMP}/nucleotide-update-corrupt-result"
-          "${HOME}/Applications/NucleotideUpdateSmoke.app/Contents/MacOS/NucleotideUpdateSmoke" \
-            reject-corrupt "${source}" "${corrupt_result}" 9000.0.2
-          for _ in $(seq 1 90); do
-            if [ -f "${corrupt_result}" ]; then
-              break
-            fi
-            sleep 1
-          done
-          test -f "${corrupt_result}"
-          test "$(cat "${corrupt_result}")" = rejected
-
-      - name: Build macOS Velopack package
-        env:
-          NUCL_VELOPACK_SIGN_APP_IDENTITY: ${{ secrets.MACOS_SIGN_APP_IDENTITY }}
-          NUCL_VELOPACK_SIGN_INSTALL_IDENTITY: ${{ secrets.MACOS_SIGN_INSTALL_IDENTITY }}
-          NUCL_VELOPACK_RELEASE_NOTES: release-notes.md
-        run: |
-          chmod +x scripts/package-velopack.sh
-          NUCL_VELOPACK_VERSION="${{ needs.prepare-release.outputs.version }}" \
-            NUCL_VELOPACK_PACK_DIR="Nucleotide.app" \
-            NUCL_VELOPACK_OUTPUT_DIR="target/release/bundle/velopack-macos" \
-            NUCL_VELOPACK_PACK_ID="org.spiralpoint.nucleotide.macos" \
-            NUCL_VELOPACK_CHANNEL="macos" \
-            NUCL_VELOPACK_RUNTIME="" \
-            ./scripts/package-velopack.sh
-
-          test -f target/release/bundle/velopack-macos/releases.macos.json
-          test -f target/release/bundle/velopack-macos/assets.macos.json
-          test -n "$(find target/release/bundle/velopack-macos -maxdepth 1 -name '*-full.nupkg' -print -quit)"
-          test -n "$(find target/release/bundle/velopack-macos -maxdepth 1 -name '*.pkg' -print -quit)"
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: macos-velopack
-          path: target/release/bundle/velopack-macos/*
-          retention-days: 1
-
-      - name: Remove Apple signing keychain
-        if: always()
-        run: |
-          if [ -n "${NUCL_VELOPACK_KEYCHAIN:-}" ]; then
-            security delete-keychain "${NUCL_VELOPACK_KEYCHAIN}" || true
-          fi
-
   build-windows:
-    name: Build Windows
     runs-on: windows-latest
-    needs: [prepare-release, build-linux]
-
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          persist-credentials: false
-          ref: ${{ needs.prepare-release.outputs.release_ref }}
-
-      - name: Download Linux remote helpers
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: linux-remote-helpers
-          path: target/remote-helpers
-
-      - name: Verify Linux remote helpers
-        shell: pwsh
-        run: |
-          foreach ($helper in @("nucleotide-remote-linux-x86_64", "nucleotide-remote-linux-aarch64")) {
-            $path = Join-Path "target\remote-helpers" $helper
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-              throw "Linux remote helper not found: $path"
-            }
-          }
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: 1.96.0
+      - uses: actions/checkout@v4
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        uses: mlugg/setup-zig@v1
         with:
           version: 0.15.2
-          use-cache: false
 
-      - name: Install .NET SDK
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install .NET 8
+        uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: "8.x"
 
-      - name: Install Velopack CLI
+      - name: Install Velopack
+        run: dotnet tool update -g vpk --version 1.2.0
+
+      - name: Build
+        run: cargo build --release -p nucleotide --bins
+
+      - name: Clone Helix runtime
         shell: pwsh
         run: |
-          dotnet tool update -g vpk --version $env:VPK_VERSION
-          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Download previous Windows release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          New-Item -ItemType Directory -Path "target\release\bundle\velopack-windows" -Force | Out-Null
-          & vpk download github `
-            --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" `
-            --token $env:GH_TOKEN `
-            --channel windows `
-            --outputDir "target\release\bundle\velopack-windows"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "No previous Windows Velopack release was available; building a full package only."
-          }
-
-      - name: Generate release notes
-        shell: pwsh
-        run: bash ./scripts/generate-release-notes.sh release-notes.md "${{ needs.prepare-release.outputs.version }}"
-
-      - name: Configure Windows signing
-        shell: pwsh
-        env:
-          SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
-          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
-        run: |
-          $hasCertificate = -not [string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_BASE64)
-          $hasPassword = -not [string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_PASSWORD)
-
-          if ($hasCertificate -ne $hasPassword) {
-            throw "WINDOWS_SIGNING_CERTIFICATE_BASE64 and WINDOWS_SIGNING_CERTIFICATE_PASSWORD must both be configured or both be omitted."
-          }
-          if (-not $hasCertificate) {
-            Write-Warning "Windows signing secrets are not configured; producing unsigned Windows packages."
-            exit 0
-          }
-
-          $certificatePath = Join-Path $env:RUNNER_TEMP "nucleotide-signing.pfx"
-          [IO.File]::WriteAllBytes(
-            $certificatePath,
-            [Convert]::FromBase64String($env:SIGNING_CERTIFICATE_BASE64)
-          )
-          $password = ConvertTo-SecureString $env:SIGNING_CERTIFICATE_PASSWORD -AsPlainText -Force
-          $certificate = Import-PfxCertificate `
-            -FilePath $certificatePath `
-            -CertStoreLocation Cert:\CurrentUser\My `
-            -Password $password
-          if (-not $certificate.HasPrivateKey) {
-            throw "The imported Windows signing certificate does not contain a private key."
-          }
-
-          "NUCL_WINDOWS_CERTIFICATE_PATH=$certificatePath" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "NUCL_WINDOWS_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "NUCL_WINDOWS_SIGN_PARAMS=/sha1 $($certificate.Thumbprint) /fd sha256 /td sha256 /tr http://timestamp.digicert.com" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Cache cargo dependencies
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-        with:
-          key: windows-release
-          cache-workspace-crates: true
-          save-if: false
-
-      - name: Build release binary
-        run: >-
-          cargo build --release -p nucleotide
-          --features update-smoke-test
-          --bin nucl
-          --bin nucl-grammar
-          --bin nucleotide-update-smoke
-
-      - name: Prepare bundled runtime
-        shell: pwsh
-        run: |
-          .\scripts\clone-helix-runtime.ps1 -Destination helix-temp
+          git clone --depth 1 --branch 25.07.1 https://github.com/helix-editor/helix.git helix-temp
           try {
-            .\scripts\setup-windows-runtime.ps1 -RuntimeSource helix-temp\runtime -NuclExe target\release\nucl-grammar.exe -AllowGrammarFailures
+            .\scripts\setup-windows-runtime.cmd -RuntimeSource helix-temp\runtime -NuclExe target\release\nucl-grammar.exe
           } finally {
             Remove-Item -LiteralPath helix-temp -Recurse -Force
           }
 
-      - name: Build Windows Velopack package
+      - name: Package portable zip
         shell: pwsh
         run: |
-          .\scripts\package-velopack.ps1 `
-            -Version "${{ needs.prepare-release.outputs.version }}" `
-            -OutputDir "target\release\bundle\velopack-windows" `
-            -PackId "org.spiralpoint.nucleotide.windows" `
-            -Channel "windows" `
-            -Runtime "win-x64" `
-            -ReleaseNotes "release-notes.md" `
-            -SignParams $env:NUCL_WINDOWS_SIGN_PARAMS `
-            -RequireRemoteHelpers
-
-          if (-not (Test-Path "target\release\bundle\velopack-windows\releases.windows.json" -PathType Leaf)) {
-            throw "Velopack Windows release feed was not created."
-          }
-          if (-not (Test-Path "target\release\bundle\velopack-windows\assets.windows.json" -PathType Leaf)) {
-            throw "Velopack Windows upload manifest was not created."
-          }
-          if (-not (Get-ChildItem "target\release\bundle\velopack-windows" -Filter "*-full.nupkg" -File | Select-Object -First 1)) {
-            throw "Velopack Windows full package was not created."
-          }
-          if (-not (Get-ChildItem "target\release\bundle\velopack-windows" -Filter "*-Portable.zip" -File | Select-Object -First 1)) {
-            throw "Velopack Windows portable bundle was not created."
-          }
-          $installers = Get-ChildItem "target\release\bundle\velopack-windows" -File |
-            Where-Object { $_.Name -like "*Setup.exe" -or $_.Extension -eq ".msi" }
-          if ($installers) {
-            throw "Velopack produced a non-portable Windows installer: $($installers.Name -join ', ')"
-          }
-
-      - name: Exercise a packaged Windows update
-        shell: pwsh
-        run: |
-          $smokePack = Join-Path $env:RUNNER_TEMP "nucleotide-update-smoke-pack"
-          $smokeOutput = Join-Path $env:RUNNER_TEMP "nucleotide-update-smoke-windows"
-          $installDir = Join-Path $env:RUNNER_TEMP "nucleotide-update-smoke-install"
-          New-Item -ItemType Directory -Path $smokePack, $smokeOutput -Force | Out-Null
-          Copy-Item target\release\nucleotide-update-smoke.exe $smokePack\NucleotideUpdateSmoke.exe
-
-          function Pack-Smoke([string]$Version) {
-            $vpkArgs = @(
-              "pack",
-              "--packId", "org.spiralpoint.nucleotide.smoke.windows",
-              "--packTitle", "NucleotideUpdateSmoke",
-              "--packVersion", $Version,
-              "--packDir", $smokePack,
-              "--mainExe", "NucleotideUpdateSmoke.exe",
-              "--outputDir", $smokeOutput,
-              "--channel", "smoke-windows",
-              "--shortcuts", "None",
-              "--noInst"
-            )
-            if ($env:NUCL_WINDOWS_SIGN_PARAMS) {
-              $vpkArgs += @("--signParams", $env:NUCL_WINDOWS_SIGN_PARAMS)
-            }
-
-            & vpk @vpkArgs
-            if ($LASTEXITCODE -ne 0) {
-              throw "Failed to package smoke-test version $Version."
-            }
-          }
-
-          Pack-Smoke "9000.0.0"
-          $portable = Get-ChildItem $smokeOutput -Filter "*-Portable.zip" -File | Select-Object -First 1
-          if (-not $portable) {
-            throw "Smoke-test portable bundle was not created."
-          }
-          if (Get-ChildItem $smokeOutput -Filter "*Setup.exe" -File | Select-Object -First 1) {
-            throw "Smoke-test packaging produced a non-portable installer."
-          }
-          Expand-Archive -LiteralPath $portable.FullName -DestinationPath $installDir
-
-          $installedExe = Join-Path $installDir "NucleotideUpdateSmoke.exe"
-          if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
-            throw "Smoke-test portable launcher was not found after extraction."
-          }
-
-          Pack-Smoke "9000.0.1"
-          $result = Join-Path $env:RUNNER_TEMP "nucleotide-update-smoke-result"
-          & $installedExe apply $smokeOutput $result "9000.0.0" "9000.0.1"
-          for ($attempt = 0; $attempt -lt 90 -and -not (Test-Path $result); $attempt++) {
-            Start-Sleep -Seconds 1
-          }
-          if ((Get-Content -Raw $result).Trim() -ne "9000.0.1") {
-            throw "The packaged N to N+1 update did not restart at version 9000.0.1."
-          }
-
-          Pack-Smoke "9000.0.2"
-          $corruptPackages = Get-ChildItem $smokeOutput -Filter "*-9000.0.2-*.nupkg" -File
-          if (-not $corruptPackages) {
-            throw "Smoke-test corrupt package target was not created."
-          }
-          foreach ($corruptPackage in $corruptPackages) {
-            Add-Content -LiteralPath $corruptPackage.FullName -Value "corrupt" -NoNewline
-          }
-          $corruptResult = Join-Path $env:RUNNER_TEMP "nucleotide-update-corrupt-result"
-          & $installedExe reject-corrupt $smokeOutput $corruptResult "9000.0.2"
-          for ($attempt = 0; $attempt -lt 90 -and -not (Test-Path $corruptResult); $attempt++) {
-            Start-Sleep -Seconds 1
-          }
-          if (-not (Test-Path $corruptResult)) {
-            throw "The corrupt-package update check did not produce a result."
-          }
-          if ((Get-Content -Raw $corruptResult).Trim() -ne "rejected") {
-            throw "The corrupt Velopack package was not rejected."
-          }
+          # 按 README 的说明，portable zip 是唯一 Windows 产物
+          .\scripts\package-velopack.ps1 -RequireRemoteHelpers
 
       - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@v4
         with:
-          name: windows-build
-          path: target/release/bundle/velopack-windows/*
-          retention-days: 1
+          name: windows-portable
+          path: |
+            **/*Portable*.zip
+            **/*-Portable.zip
 
-      - name: Remove Windows signing certificate
-        if: always()
-        shell: pwsh
-        run: |
-          if ($env:NUCL_WINDOWS_CERTIFICATE_THUMBPRINT) {
-            Remove-Item `
-              -LiteralPath "Cert:\CurrentUser\My\$env:NUCL_WINDOWS_CERTIFICATE_THUMBPRINT" `
-              -Force `
-              -ErrorAction SilentlyContinue
-          }
-          if ($env:NUCL_WINDOWS_CERTIFICATE_PATH) {
-            Remove-Item -LiteralPath $env:NUCL_WINDOWS_CERTIFICATE_PATH -Force -ErrorAction SilentlyContinue
-          }
-
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    needs: [prepare-release, build-linux, package-macos, build-windows]
-    permissions:
-      actions: read
-      contents: write
-      attestations: write
-      id-token: write
-    environment: release
-    
+  build-macos:
+    runs-on: macos-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
         with:
-          persist-credentials: false
-          ref: ${{ needs.prepare-release.outputs.release_ref }}
-      
-      - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+          version: 0.15.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install deps
+        run: brew install fontconfig pkg-config
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Bundle .app
+        run: ./scripts/bundle-mac.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: Nucleotide.app
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libxkbcommon-dev libwayland-dev libvulkan-dev pkg-config
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          mkdir -p dist/runtime
+          cp target/release/nucl dist/
+          cp -r runtime/* dist/runtime/
+          tar -czf nucl-linux-x86_64.tar.gz -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-portable
+          path: nucl-linux-x86_64.tar.gz
+
+  publish:
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Install .NET SDK
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -type f -exec sha256sum {} \; > ../SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
         with:
-          dotnet-version: 8.0.x
-
-      - name: Install Velopack CLI
-        run: |
-          dotnet tool update -g vpk --version "${VPK_VERSION}"
-          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
-      
-      - name: Prepare release files
-        run: |
-          mkdir -p release attest
-          cp artifacts/linux-build/nucleotide-linux-x86_64.tar.gz release/
-          cp artifacts/linux-remote-helpers/nucleotide-remote-linux-* release/
-
-          cp release/* attest/
-          find artifacts/macos-velopack -maxdepth 1 -type f -exec cp {} attest/ \;
-          find artifacts/windows-build -maxdepth 1 -type f -exec cp {} attest/ \;
-          (
-            cd attest
-            sha256sum -- * > ../release/SHA256SUMS
-          )
-
-          echo "Release files:"
-          ls -lh attest/
-
-      - name: Attest release artifacts
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
-        with:
-          subject-path: attest/*
-
-      - name: Reset existing draft assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.prepare-release.outputs.version }}
-          RELEASE_SHA: ${{ needs.prepare-release.outputs.release_sha }}
-        run: |
-          if release_json="$(gh release view "${RELEASE_TAG}" --json isDraft,assets 2>/dev/null)"; then
-            if [ "$(jq -r '.isDraft' <<<"${release_json}")" != true ]; then
-              echo "Refusing to modify published release ${RELEASE_TAG}" >&2
-              exit 1
-            fi
-
-            gh release edit "${RELEASE_TAG}" --target "${RELEASE_SHA}"
-
-            jq -r '.assets[].name' <<<"${release_json}" | while IFS= read -r asset; do
-              gh release delete-asset "${RELEASE_TAG}" "${asset}" --yes
-            done
-          fi
-
-      - name: Upload macOS update assets to draft release
-        env:
-          VPK_TOKEN: ${{ github.token }}
-        run: |
-          vpk upload github \
-            --repoUrl "https://github.com/${GITHUB_REPOSITORY}" \
-            --token "${VPK_TOKEN}" \
-            --outputDir artifacts/macos-velopack \
-            --channel macos \
-            --tag "${{ needs.prepare-release.outputs.version }}" \
-            --releaseName "Nucleotide ${{ needs.prepare-release.outputs.version }}" \
-            --targetCommitish "${{ needs.prepare-release.outputs.release_sha }}" \
-            --merge
-
-      - name: Merge Windows update assets into draft release
-        env:
-          VPK_TOKEN: ${{ github.token }}
-        run: |
-          vpk upload github \
-            --repoUrl "https://github.com/${GITHUB_REPOSITORY}" \
-            --token "${VPK_TOKEN}" \
-            --outputDir artifacts/windows-build \
-            --channel windows \
-            --tag "${{ needs.prepare-release.outputs.version }}" \
-            --releaseName "Nucleotide ${{ needs.prepare-release.outputs.version }}" \
-            --targetCommitish "${{ needs.prepare-release.outputs.release_sha }}" \
-            --merge
-
-      - name: Upload Linux assets and checksums
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ needs.prepare-release.outputs.version }}" release/* --clobber
-
-      - name: Verify draft release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.prepare-release.outputs.version }}
-          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: |
-          release_json="$(gh release view "${RELEASE_TAG}" --json isDraft,assets)"
-          test "$(jq -r '.isDraft' <<<"${release_json}")" = true
-
-          assets="$(jq -r '.assets[].name' <<<"${release_json}")"
-          version="${RELEASE_VERSION#v}"
-          for required in \
-            releases.macos.json \
-            releases.windows.json \
-            nucleotide-linux-x86_64.tar.gz \
-            nucleotide-remote-linux-x86_64 \
-            nucleotide-remote-linux-aarch64 \
-            "org.spiralpoint.nucleotide.macos-${version}-macos-full.nupkg" \
-            org.spiralpoint.nucleotide.macos-macos-Portable.zip \
-            org.spiralpoint.nucleotide.macos-macos-Setup.pkg \
-            "org.spiralpoint.nucleotide.windows-${version}-windows-full.nupkg" \
-            org.spiralpoint.nucleotide.windows-windows-Portable.zip \
-            SHA256SUMS; do
-            grep -Fxq "${required}" <<<"${assets}"
-          done
-
-          if grep -Eq '(Setup[.]exe|[.]msi)$' <<<"${assets}"; then
-            echo "Draft contains a non-portable Windows installer" >&2
-            exit 1
-          fi
-
-      - name: Publish verified release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.prepare-release.outputs.version }}
-        run: gh release edit "${RELEASE_TAG}" --draft=false --prerelease=false
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+            artifacts/**/*.app
+            SHA256SUMS

@@ -1,0 +1,93 @@
+name: Portable Linux + macOS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libfontconfig-dev libfreetype-dev \
+            libwayland-dev wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxrandr-dev libxi-dev libvulkan-dev libgl1-mesa-dev libssl-dev
+
+      - name: Build
+        run: cargo build --release -p nucleotide --bins -p nucleotide-remote
+
+      - name: Fetch Helix runtime
+        run: |
+          HELIX_REV="$(sed -n 's/.*helix-loader = .*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          git clone --depth 1 https://github.com/helix-editor/helix.git helix-temp
+          if [ -n "$HELIX_REV" ]; then
+            git -C helix-temp fetch --depth 1 origin "$HELIX_REV"
+            git -C helix-temp checkout --detach FETCH_HEAD
+          fi
+          mkdir -p nucleotide-linux/bin nucleotide-linux/share/nucleotide/runtime
+          cp target/release/nucl nucleotide-linux/bin/
+          cp target/release/nucleotide-remote nucleotide-linux/bin/ || true
+          cp -r helix-temp/runtime/* nucleotide-linux/share/nucleotide/runtime/
+          rm -rf helix-temp
+
+      - name: Tarball
+        run: tar -czf nucleotide-linux-x86_64.tar.gz nucleotide-linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nucleotide-linux-x86_64
+          path: nucleotide-linux-x86_64.tar.gz
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Metal toolchain
+        run: |
+          xcrun -sdk macosx metal --version || xcodebuild -downloadComponent metalToolchain
+          brew install fontconfig pkg-config || true
+
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin --bin nucl --bin nucl-grammar
+
+      - name: Runtime
+        run: |
+          HELIX_REV="$(sed -n 's/.*helix-loader = .*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          git clone --depth 1 https://github.com/helix-editor/helix.git helix-temp
+          if [ -n "$HELIX_REV" ]; then
+            git -C helix-temp fetch --depth 1 origin "$HELIX_REV"
+            git -C helix-temp checkout --detach FETCH_HEAD
+          fi
+          mkdir -p runtime
+          cp -r helix-temp/runtime/* runtime/
+          rm -rf helix-temp
+
+      - name: Bundle .app
+        run: |
+          NUCL_BINARY="target/aarch64-apple-darwin/release/nucl" \
+          ./scripts/bundle-mac.sh
+          tar -czf Nucleotide-aarch64.app.tar.gz Nucleotide.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nucleotide-macos-aarch64
+          path: Nucleotide-aarch64.app.tar.gz
