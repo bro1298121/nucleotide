@@ -9648,6 +9648,10 @@ impl Workspace {
         let ui_font = config.ui_font();
         let editor_smooth_scrolling = config.editor_smooth_scrolling();
         let editor_wheel_glide = config.editor_wheel_glide();
+        let editor_cursor_trail = config.editor_cursor_trail();
+        let editor_cursor_trail_size = config.editor_cursor_trail_size();
+        let editor_cursor_animation_length = config.editor_cursor_animation_length();
+        let editor_cursor_short_animation_length = config.editor_cursor_short_animation_length();
         let ui_chrome_style = config.ui_chrome_style();
         let previous_ui_chrome_style = cx.global::<crate::ThemeManager>().ui_chrome_style();
         let ui_chrome_style_changed = previous_ui_chrome_style != ui_chrome_style;
@@ -9655,6 +9659,10 @@ impl Workspace {
         let editor_scroll_config = cx.global_mut::<nucleotide_types::EditorScrollConfig>();
         editor_scroll_config.smooth_scrolling = editor_smooth_scrolling;
         editor_scroll_config.wheel_glide = editor_wheel_glide;
+        editor_scroll_config.cursor_trail = editor_cursor_trail;
+        editor_scroll_config.cursor_trail_size = editor_cursor_trail_size;
+        editor_scroll_config.cursor_animation_length = editor_cursor_animation_length;
+        editor_scroll_config.cursor_short_animation_length = editor_cursor_short_animation_length;
 
         let editor_font_config = cx.global_mut::<crate::types::EditorFontConfig>();
         editor_font_config.family = editor_font.family.clone();

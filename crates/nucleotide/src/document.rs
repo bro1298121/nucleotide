@@ -555,9 +555,34 @@ impl Render for DocumentView {
         // the glide immediately, with no config reload. It is *additional*
         // motion tweened on top of the 1:1 wheel path, so it is gated on its own
         // key and never on the wheel path itself, which is not animated at all.
-        let (configured_smooth_scrolling, configured_wheel_glide) = {
+        //
+        // The cursor trail is gated the same way: its own key, ANDed with the
+        // global animation flag here so the runtime toggle stops it immediately.
+        // It is intentionally independent of the viewport keys above — the trail
+        // animates the cursor, not the viewport. Its three feel values
+        // (`cursor_trail_size`, `cursor_animation_length`,
+        // `cursor_short_animation_length`) are applied at this same per-render
+        // site, so a live config reload reaches the trail on the next render
+        // with no restart. The values are set before `set_enabled` so a
+        // disabled trail still holds the configured values the moment the
+        // runtime animation toggle re-enables it.
+        let (
+            configured_smooth_scrolling,
+            configured_wheel_glide,
+            configured_cursor_trail,
+            configured_cursor_trail_size,
+            configured_cursor_animation_length,
+            configured_cursor_short_animation_length,
+        ) = {
             let scroll_config = cx.global::<nucleotide_types::EditorScrollConfig>();
-            (scroll_config.smooth_scrolling, scroll_config.wheel_glide)
+            (
+                scroll_config.smooth_scrolling,
+                scroll_config.wheel_glide,
+                scroll_config.cursor_trail,
+                scroll_config.cursor_trail_size,
+                scroll_config.cursor_animation_length,
+                scroll_config.cursor_short_animation_length,
+            )
         };
         let animations_enabled = nucleotide_ui::animations_enabled(cx);
         self.editor_state
@@ -566,6 +591,19 @@ impl Render for DocumentView {
         self.editor_state
             .viewport()
             .set_wheel_glide(configured_wheel_glide && animations_enabled);
+        {
+            // `cursor_trail()` hands back a fresh `Rc` handle by value, so the
+            // handle itself has to outlive the `RefMut` taken from it. Chaining
+            // `.borrow_mut()` onto the call borrows a temporary that is dropped
+            // at the end of the statement (E0716). The enclosing block already
+            // scopes the borrow to just these four writes.
+            let trail_cell = self.editor_state.cursor_trail();
+            let mut trail = trail_cell.borrow_mut();
+            trail.set_trail_size(configured_cursor_trail_size);
+            trail.set_animation_length(configured_cursor_animation_length);
+            trail.set_short_animation_length(configured_cursor_short_animation_length);
+            trail.set_enabled(configured_cursor_trail && animations_enabled);
+        }
 
         let markdown_document = markdown_document_info(&self.core, self.view_id, cx);
         let markdown_mode = markdown_document

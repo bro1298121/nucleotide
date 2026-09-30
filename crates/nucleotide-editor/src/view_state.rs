@@ -21,6 +21,7 @@ use crate::{
     begin_editor_pointer_selection_at_event, update_editor_pointer_selection_at_event,
     update_editor_pointer_selection_at_event_outcome,
 };
+use crate::cursor_trail::CursorTrail;
 
 #[derive(Clone)]
 pub struct EditorViewState {
@@ -34,6 +35,11 @@ pub struct EditorViewState {
     gutter_extra_columns: Rc<Cell<u16>>,
     gutter_run_button_lines: Rc<RefCell<Vec<usize>>>,
     cursor_reveal_armed_motion: Rc<Cell<bool>>,
+    /// Neovide-style cursor trail, shared by reference with the render driver
+    /// and the document paint harness (which pushes it into the ambient
+    /// cursor-trail scope during paint). Rc-shared so every clone of the view
+    /// state advances and observes the identical trail.
+    cursor_trail: Rc<RefCell<CursorTrail>>,
 }
 
 pub struct EditorViewFrameState {
@@ -83,6 +89,7 @@ impl EditorViewState {
             gutter_extra_columns: Rc::new(Cell::new(0)),
             gutter_run_button_lines: Rc::new(RefCell::new(Vec::new())),
             cursor_reveal_armed_motion: Rc::new(Cell::new(false)),
+            cursor_trail: Rc::new(RefCell::new(CursorTrail::new())),
         }
     }
 
@@ -145,6 +152,11 @@ impl EditorViewState {
     /// the state, matching the rest of the render-phase state.
     pub fn cursor_reveal_armed_motion(&self) -> bool {
         self.cursor_reveal_armed_motion.get()
+    }
+
+    /// Shares the cursor trail with the frame driver and paint harness.
+    pub fn cursor_trail(&self) -> Rc<RefCell<CursorTrail>> {
+        self.cursor_trail.clone()
     }
 
     pub fn clear_cursor_reveal_request(&self) {

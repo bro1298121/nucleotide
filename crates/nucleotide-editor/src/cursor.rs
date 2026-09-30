@@ -22,6 +22,7 @@ use nucleotide_logging::error;
 
 use crate::{
     cursor_has_reversed_modifier,
+    cursor_trail,
     geometry::EditorSurfaceGeometry,
     highlight::text_style_at_position,
     line_cache::LineLayout,
@@ -85,6 +86,29 @@ impl EditorCursor {
 
     pub fn paint(&mut self, origin: Point<Pixels>, window: &mut Window, cx: &mut App) {
         let bounds = self.bounds(origin);
+
+        // Ambience: a Neovide-style cursor trail. The document paint harness
+        // pushes a thread-local scope (trail + live scroll + cell width)
+        // around this paint call, so the smear is drawn here, beneath the
+        // cursor rect and glyph, in the correct z-order. Outside that harness
+        // the scope is empty and the trail simply isn't drawn.
+        let kind = self.kind;
+        let hollow = self.hollow;
+        let color = self.color;
+        let line_height = self.line_height;
+        let _ = cursor_trail::with_active_scope(|trail, scroll, cell_width| {
+            trail.borrow_mut().paint_and_update(
+                bounds,
+                kind,
+                hollow,
+                color,
+                cell_width,
+                line_height,
+                scroll,
+                window,
+            );
+        });
+
         if self.hollow && matches!(self.kind, CursorKind::Block) {
             window.paint_quad(quad(
                 bounds,

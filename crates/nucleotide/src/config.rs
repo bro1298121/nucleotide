@@ -254,6 +254,25 @@ pub struct EditorGuiConfig {
     /// a short extra glide on top. Horizontal wheel scrolling stays 1:1.
     #[serde(default = "default_true")]
     pub wheel_glide: bool,
+
+    /// Animate the cursor with a short trail as it moves and scrolls.
+    #[serde(default = "default_true")]
+    pub cursor_trail: bool,
+
+    /// How far the cursor trail stretches behind the cursor, `0.0..=1.0`.
+    /// Larger means more trail. Default: 0.9.
+    #[serde(default = "default_cursor_trail_size")]
+    pub cursor_trail_size: f32,
+
+    /// Cursor trail glide length in seconds, `> 0`, capped at 0.5.
+    /// Default: 0.120.
+    #[serde(default = "default_cursor_animation_length")]
+    pub cursor_animation_length: f32,
+
+    /// Cursor trail short-hop length in seconds, `> 0` and at most
+    /// `cursor_animation_length`. Default: 0.035.
+    #[serde(default = "default_cursor_short_animation_length")]
+    pub cursor_short_animation_length: f32,
 }
 
 impl Default for EditorGuiConfig {
@@ -262,6 +281,10 @@ impl Default for EditorGuiConfig {
             font: None,
             smooth_scrolling: true,
             wheel_glide: true,
+            cursor_trail: true,
+            cursor_trail_size: 0.9,
+            cursor_animation_length: 0.120,
+            cursor_short_animation_length: 0.035,
         }
     }
 }
@@ -873,6 +896,21 @@ const fn default_true() -> bool {
     true
 }
 
+/// `0.9`, for `#[serde(default = "...")]` on the cursor trail size.
+const fn default_cursor_trail_size() -> f32 {
+    0.9
+}
+
+/// `0.120`, for `#[serde(default = "...")]` on the cursor trail glide length.
+const fn default_cursor_animation_length() -> f32 {
+    0.120
+}
+
+/// `0.035`, for `#[serde(default = "...")]` on the cursor trail short-hop length.
+const fn default_cursor_short_animation_length() -> f32 {
+    0.035
+}
+
 /// Application update behaviour.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdatesConfig {
@@ -1109,6 +1147,38 @@ impl Config {
     /// read site so runtime reduced-motion / animation toggles apply without a reload.
     pub fn editor_wheel_glide(&self) -> bool {
         self.gui.editor.wheel_glide
+    }
+
+    /// Whether the cursor trail animation is enabled.
+    ///
+    /// This is the raw configured preference; the effective value is resolved at the
+    /// read site so runtime reduced-motion / animation toggles apply without a reload.
+    pub fn editor_cursor_trail(&self) -> bool {
+        self.gui.editor.cursor_trail
+    }
+
+    /// The cursor trail stretch, `0.0..=1.0`; larger means more trail.
+    ///
+    /// This is the raw configured preference; the effective value is resolved at the
+    /// read site so runtime reloads apply without a restart.
+    pub fn editor_cursor_trail_size(&self) -> f32 {
+        self.gui.editor.cursor_trail_size
+    }
+
+    /// The cursor trail glide length in seconds.
+    ///
+    /// This is the raw configured preference; the effective value is resolved at the
+    /// read site so runtime reloads apply without a restart.
+    pub fn editor_cursor_animation_length(&self) -> f32 {
+        self.gui.editor.cursor_animation_length
+    }
+
+    /// The cursor trail short-hop length in seconds.
+    ///
+    /// This is the raw configured preference; the effective value is resolved at the
+    /// read site so runtime reloads apply without a restart.
+    pub fn editor_cursor_short_animation_length(&self) -> f32 {
+        self.gui.editor.cursor_short_animation_length
     }
 
     /// Get the UI chrome style used by nucleotide-ui.

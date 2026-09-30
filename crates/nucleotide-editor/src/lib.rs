@@ -9,6 +9,7 @@ pub const EDITOR_MINIMUM_VIEWPORT_COLUMNS: u16 = 10;
 
 pub mod cursor;
 pub mod cursor_style;
+pub mod cursor_trail;
 pub mod diagnostics;
 pub mod document_element;
 pub mod document_frame;

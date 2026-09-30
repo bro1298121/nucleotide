@@ -11,6 +11,7 @@ use gpui::{
 use crate::{
     CursorOverlayPlan, EditorDocumentElement, EditorLayout, EditorScrollbarMarker, EditorSurface,
     EditorSurfacePointerEvent, EditorViewState, EditorViewport, ViewportScrollUpdate,
+    cursor_trail,
     selection::EditorPointerSelectionPhase,
 };
 
@@ -253,10 +254,27 @@ where
         // from ever becoming a second loop: the loop runs exactly as long as
         // `scroll_needs_frames()` says it should, and all three terms of that
         // predicate are deadlines.
-        if editor_state.viewport().scroll_needs_frames() {
-            editor_state.viewport().advance_scroll_animation();
-            editor_state.viewport().advance_wheel_glide(Instant::now());
-            editor_state.viewport().advance_scrolloff_inertia(Instant::now());
+        //
+        // The cursor trail rides the same loop, next to the scroll driver. Its
+        // liveness is exactly `last_advance.is_some()` (`needs_frames()`): the
+        // clock is started by the paint path when a retarget arms the springs
+        // and cleared when every spring snaps (`|position| < 0.01`). Advancing
+        // it here, *after* the scroll terms, lets a trail settle on frames
+        // where the cursor is not painted without ever feeding scroll motion
+        // into the springs — scroll is applied rigidly to the trail's positions
+        // at observe time, and the two loops share only the notify/raf tick.
+        let scroll_needs_frames = editor_state.viewport().scroll_needs_frames();
+        let trail = editor_state.cursor_trail();
+        let trail_needs_frames = trail.borrow().needs_frames();
+        if scroll_needs_frames || trail_needs_frames {
+            if scroll_needs_frames {
+                editor_state.viewport().advance_scroll_animation();
+                editor_state.viewport().advance_wheel_glide(Instant::now());
+                editor_state.viewport().advance_scrolloff_inertia(Instant::now());
+            }
+            if trail_needs_frames {
+                trail.borrow_mut().advance(Instant::now());
+            }
             cx.notify(view_entity_id);
             window.request_animation_frame();
         }
@@ -272,7 +290,33 @@ where
             EditorDocumentElement::new(text_style, move |bounds, after_layout, window, cx| {
                 let rerender_snapshot_before =
                     EditorSurfaceRerenderSnapshot::from_state(&paint_editor_state);
+
+                // Cursor trail ambience. The cursor painter draws the smear
+                // beneath the cursor rect, but it has no channel for the live
+                // scroll position or the grid cell width — those live in the
+                // view state, and scroll is applied by the caret painter at
+                // paint time. Push an ambient scope (trail + scroll + cell
+                // width) for the duration of this paint; `EditorCursor::paint`
+                // reads it and drives the trail's observe/draw. The scope is
+                // dropped immediately after paint so no stale trail ever bleeds
+                // into a later paint in the same frame.
+                let trail = paint_editor_state.cursor_trail();
+                let trail_needs_frames_before = trail.borrow().needs_frames();
+                let trail_scroll = paint_editor_state.viewport().scroll_position();
+                let trail_cell_width = paint_editor_state.surface_metrics().get().cell_width;
+                let trail_scope =
+                    cursor_trail::enter(trail.clone(), trail_scroll, trail_cell_width);
                 let overlay_plan = paint(&mut paint_editor_state, bounds, after_layout, window, cx);
+                drop(trail_scope);
+
+                if overlay_plan.is_none() {
+                    // No cursor painted this frame (hidden, unfocused overlay,
+                    // etc.). Zero the trail and forget its shape identity so the
+                    // next visible cursor snaps in instead of dragging a smear
+                    // from the last position it was drawn at.
+                    trail.borrow_mut().reset();
+                }
+
                 let rerender_snapshot_after =
                     EditorSurfaceRerenderSnapshot::from_state(&paint_editor_state);
                 if rerender_snapshot_before.requires_rerender_after(rerender_snapshot_after) {
@@ -308,6 +352,22 @@ where
                     // value" the first time a cursor reveal eases. The driver's
                     // own call is safe because it happens during `render`, with
                     // the stack populated.
+                    cx.defer(move |cx| {
+                        cx.notify(view_entity_id);
+                    });
+                }
+
+                if !trail_needs_frames_before && trail.borrow().needs_frames() {
+                    // Exactly the same trap as `armed_scroll_motion` above,
+                    // for the cursor trail: the frame driver consulted
+                    // `needs_frames()` before this paint ran, so on the first
+                    // frame this paint retargets a spring (the trail's clock
+                    // starts here, not in the driver) the `request_animation_frame`
+                    // inside the driver's `if` has already been decided. A bare
+                    // `cx.notify` restarts the loop and the next render's driver
+                    // sees `needs_frames() == true` and requests the frame itself.
+                    // Same rule applies: no `request_animation_frame` from inside
+                    // a defer (gpui `window.rs:4315` panics).
                     cx.defer(move |cx| {
                         cx.notify(view_entity_id);
                     });
