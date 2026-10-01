@@ -112,3 +112,7 @@ nucleotide-linux.tar.gz
 
 # Local deepwork progress state
 .slim/deepwork/
+
+# Local diagnostic scratch (test fixtures, trace logs)
+.slim/
+logs/
