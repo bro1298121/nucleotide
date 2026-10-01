@@ -6285,36 +6285,6 @@ impl Application {
             "Preparing LSP completion futures for event-driven system"
         );
 
-        // Guarantee the invariant "this document has been announced to the server before
-        // we send it any textDocument request", right here where the request is built.
-        //
-        // Nucleotide opens documents with `launch_language_servers: false`
-        // (application/mod.rs:8559 and :8600) because the LSP bridge owns server
-        // lifecycle ("Helix owns server lifecycle", :6160). That disables the only
-        // path that announced documents at open time — `Editor::launch_language_servers`
-        // sends `textDocument/didOpen` at vendor/helix-view/src/editor.rs:1968, but it is
-        // gated on `options.launch_language_servers` at editor.rs:2203.
-        //
-        // The replacement, `ensure_document_tracked_by_running_servers`, reaches
-        // `Editor::ensure_document_tracked_by_language_server`, which does send
-        // `didOpen` (editor.rs:1699) before recording the server (editor.rs:1700). But
-        // every call site gated it on `WorkspaceIdentity::Remote(_)` because Helix cannot
-        // spawn on the remote side, so on a local workspace no code path ever announced
-        // the document.
-        //
-        // Symptom: the server rejects every request for the document. Observed with
-        // clangd, which returned `-32602: trying to get preamble for non-added document`
-        // for textDocument/completion and logged `Trying to incrementally change
-        // non-added document`; the application log contained no didOpen at all. This
-        // affects completion plus every other feature that addresses a document through
-        // `language_servers_with_feature` (hover, goto, code action, inlay hints, symbols),
-        // none of which can work before the server knows the document exists.
-        //
-        // The call is idempotent: `ensure_document_tracked_by_language_server` returns true
-        // without resending anything when the document is already tracked by a server with
-        // the same id (editor.rs:1690-1696).
-        self.ensure_document_tracked_by_running_servers(doc_id);
-
         // Try to get the document
         let doc = match self.editor.documents.get(&doc_id) {
             Some(doc) => doc,
