@@ -53,7 +53,7 @@
         ];
 
         # Keep Cargo metadata, local development, Nix, and CI on one compiler.
-        rustVersion = "1.96.0";
+        rustVersion = "1.98.0";
         rustToolchain = pkgs.rust-bin.stable.${rustVersion}.default.override {
           extensions = [
             "clippy"

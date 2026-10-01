@@ -4,7 +4,7 @@ This guide is based on the checked-in workspace manifest, toolchain/CI configura
 
 ## Project and toolchain
 
-- This is a Rust 2024 Cargo workspace. `rust-toolchain.toml` pins Rust `1.96.0` and installs `clippy`, `rustfmt`, and `rust-src`; `Cargo.lock` is committed.
+- This is a Rust 2024 Cargo workspace. `rust-toolchain.toml` pins Rust `1.98.0` and installs `clippy`, `rust-analyzer`, `rustfmt`, and `rust-src`; `Cargo.lock` is committed. `rust-analyzer` is required because the editor spawns it for Rust language-server features; without the component the rustup shim exits with "Unknown binary" and the LSP session fails to initialize.
 - `crates/nucleotide` is the application and composition root. Its default binary is `nucl`; it also builds `nucl-grammar`. `nucleotide-update-smoke` requires `--features update-smoke-test`.
 - Other workspace crates provide types, events, logging, appearance, core/editor/LSP, UI, projects, environments, processes, workspaces, VCS, remote support, and terminal support. `vendor/helix-stdx` and `vendor/helix-view` are workspace members; the root `exclude` list covers `vendor/block-0.1.6`, `vendor/velopack-1.2.0`, and `vendor/zed`.
 - GPUI is path-vendored under `vendor/zed`. Helix dependencies use the revision and patches in the root `Cargo.toml`; use those manifests and `Cargo.lock` rather than guessing dependency versions.
