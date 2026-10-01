@@ -3644,6 +3644,25 @@ impl Application {
                             debug!(server = %server_name, "DIAG: No config available to send in didChangeConfiguration");
                         }
                         debug!(server_id = ?server_id, "LSP server initialized");
+
+                        // Upstream Helix dispatches this from the same place in
+                        // `helix-term`'s `Application::handle_language_server_message`
+                        // (helix-term/src/application.rs:813-828). That entrypoint is not
+                        // used here, so `LanguageServerInitialized` was never dispatched and
+                        // the `didOpen` re-announce hook in `helix-view::handlers::lsp`
+                        // (:392-410) never ran.
+                        //
+                        // That hook calls `text_document_did_open` directly rather than via
+                        // `ensure_document_tracked_by_language_server`, so it re-announces
+                        // even when `doc.language_servers` already claims the server. That is
+                        // required: documents attached before the `initialize` handshake
+                        // completed are recorded locally but never actually reach the
+                        // server, because `vendor/helix-lsp/src/transport.rs:452-464`
+                        // discards notifications (not requests) sent before initialization.
+                        helix_event::dispatch(helix_view::events::LanguageServerInitialized {
+                            editor: &mut self.editor,
+                            server_id,
+                        });
                     }
                     Notification::PublishDiagnostics(params) => {
                         let lsp::PublishDiagnosticsParams {
