@@ -81,11 +81,23 @@ fn analyze_change_type(changes: &ChangeSet) -> ChangeType {
     let mut operation_count = 0;
 
     for operation in operations {
-        operation_count += 1;
         match operation {
-            Operation::Insert(_) => has_insert = true,
-            Operation::Delete(_) => has_delete = true,
-            Operation::Retain(_) => {} // Just positioning, doesn't count as change
+            Operation::Insert(_) => {
+                has_insert = true;
+                operation_count += 1;
+            }
+            Operation::Delete(_) => {
+                has_delete = true;
+                operation_count += 1;
+            }
+            // `Retain` is positional padding, not a content edit, so it must not be counted.
+            // `ChangeSet` appends a trailing `retain(len - last)` so the change set spans the
+            // whole document, which means typing one character with the cursor mid-document
+            // produces `[Retain(n), Insert(c), Retain(m)]`. Counting that padding pushed a
+            // single keystroke to three operations, past the `> 2` bulk threshold, so every
+            // keystroke was classified `Bulk` and `maybe_trigger_auto_completion` silently
+            // skipped the trigger: the completion popup never appeared at all.
+            Operation::Retain(_) => {}
         }
     }
 
@@ -261,7 +273,24 @@ pub fn create_bridge_channel() -> (mpsc::UnboundedSender<HelixEvent>, HelixEvent
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helix_core::Transaction;
+    use helix_core::{Tendril, Transaction};
+
+    /// Build a `ChangeSet` the way production does: a `Transaction` constructed over a real
+    /// `Rope` and then applied to it.
+    ///
+    /// Going through `Transaction` is the whole point of this helper. `ChangeSet::from_changes`
+    /// appends the trailing `Retain` padding that spans the rest of the document, so a
+    /// hand-written operation list would hide the bug these tests guard against.
+    fn change_set(
+        text: &str,
+        changes: impl Iterator<Item = (usize, usize, Option<Tendril>)>,
+    ) -> ChangeSet {
+        let rope = Rope::from(text);
+        let transaction = Transaction::change(&rope, changes);
+        let mut new_text = rope.clone();
+        assert!(transaction.apply(&mut new_text), "transaction should apply");
+        transaction.changes().clone()
+    }
 
     #[test]
     fn document_line_change_tracks_inserted_lines() {
@@ -295,5 +324,152 @@ mod tests {
                 new_lines: 1..2,
             }
         );
+    }
+
+    /// Regression guard for the dead auto-trigger popup.
+    ///
+    /// The cursor sits mid-document, so `ChangeSet::from_changes` emits
+    /// `[Retain(14), Insert("x"), Retain(12)]`: the trailing retain covers the remaining 12
+    /// characters so the change set spans all 26. Counting that padding made the operation count
+    /// 3, past the `> 2` bulk threshold, so every keystroke was classified `Bulk` and
+    /// `maybe_trigger_auto_completion` dropped the trigger.
+    ///
+    /// Ignoring both retains leaves `has_insert = true`, `has_delete = false`,
+    /// `operation_count = 1`, so the `(true, false, false)` arm applies: `Insert`.
+    #[test]
+    fn analyze_change_type_counts_mid_document_keystroke_as_insert() {
+        const TEXT: &str = "alpha\nbravo\ncharlie\ndelta\n";
+        assert_eq!(Rope::from(TEXT).len_chars(), 26, "document length in characters");
+
+        let changes = change_set(TEXT, [(14, 14, Some(Tendril::from("x")))].into_iter());
+
+        // Pin the reproduction: the leading *and* trailing retains must be present and
+        // non-empty. On a document ending at the cursor there is no trailing padding, and the
+        // test would pass for the wrong reason.
+        let expected: &[Operation] = &[
+            Operation::Retain(14),
+            Operation::Insert(Tendril::from("x")),
+            Operation::Retain(12),
+        ];
+        assert_eq!(changes.changes(), expected);
+
+        assert!(matches!(analyze_change_type(&changes), ChangeType::Insert));
+    }
+
+    /// Typing at the very end appends nothing after the insertion (`retain(0)` is a no-op), so
+    /// the operation list is `[Retain(12), Insert("x")]` and only the leading padding is
+    /// ignored. `has_insert = true`, `has_delete = false`, `operation_count = 1`, so
+    /// `(true, false, false)` gives `Insert`.
+    ///
+    /// This case was already classified correctly before the fix; it is here to pin the
+    /// boundary against the padding behaviour that broke the mid-document case.
+    #[test]
+    fn analyze_change_type_counts_keystroke_at_end_of_document_as_insert() {
+        const TEXT: &str = "alpha\nbravo\n";
+        assert_eq!(Rope::from(TEXT).len_chars(), 12, "document length in characters");
+
+        let changes = change_set(TEXT, [(12, 12, Some(Tendril::from("x")))].into_iter());
+
+        let operations = changes.changes();
+        assert_eq!(operations.len(), 2, "no padding after an insert at the end");
+        assert!(matches!(operations[0], Operation::Retain(12)));
+        assert!(matches!(operations[1], Operation::Insert(_)));
+
+        assert!(matches!(analyze_change_type(&changes), ChangeType::Insert));
+    }
+
+    /// A deletion expands to `[Retain(2), Delete(3), Retain(15)]`. Ignoring the padding leaves
+    /// `has_insert = false`, `has_delete = true`, `operation_count = 1`, so the
+    /// `(false, true, false)` arm applies: `Delete`.
+    #[test]
+    fn analyze_change_type_counts_single_deletion_as_delete() {
+        const TEXT: &str = "alpha\nbravo\ncharlie\n";
+        assert_eq!(Rope::from(TEXT).len_chars(), 20, "document length in characters");
+
+        let changes = change_set(TEXT, [(2, 5, None::<Tendril>)].into_iter());
+
+        let expected: &[Operation] = &[
+            Operation::Retain(2),
+            Operation::Delete(3),
+            Operation::Retain(15),
+        ];
+        assert_eq!(changes.changes(), expected);
+
+        assert!(matches!(analyze_change_type(&changes), ChangeType::Delete));
+    }
+
+    /// Replacing a span emits both an `Insert` and a `Delete` for the same range, plus padding
+    /// between and after the two edits. `has_insert` and `has_delete` are both true, so the
+    /// leading `(true, true, _)` arm applies regardless of the count: `Replace`.
+    #[test]
+    fn analyze_change_type_counts_insert_with_delete_as_replace() {
+        const TEXT: &str = "alpha\nbravo\ncharlie\ndelta\n";
+        assert_eq!(Rope::from(TEXT).len_chars(), 26, "document length in characters");
+
+        let changes = change_set(
+            TEXT,
+            [(2, 5, Some(Tendril::from("X"))), (14, 18, None::<Tendril>)].into_iter(),
+        );
+
+        let expected: &[Operation] = &[
+            Operation::Retain(2),
+            Operation::Insert(Tendril::from("X")),
+            Operation::Delete(3),
+            Operation::Retain(9),
+            Operation::Delete(4),
+            Operation::Retain(8),
+        ];
+        assert_eq!(changes.changes(), expected);
+
+        assert!(matches!(analyze_change_type(&changes), ChangeType::Replace));
+    }
+
+    /// Three cursors editing at once, as a multi-cursor insert produces, give three `Insert`
+    /// operations separated by `Retain` padding: `[Retain(2), Insert("a"), Retain(6),
+    /// Insert("b"), Retain(6), Insert("c"), Retain(12)]`. This is a genuine multi-operation
+    /// edit, so counting only the content edits still yields `operation_count = 3`, which is
+    /// `> 2` and falls through to `Bulk`. The old counter reached the same verdict by accident,
+    /// having counted all seven operations; this pins the genuine three-edit case on purpose.
+    #[test]
+    fn analyze_change_type_counts_multiple_insertions_as_bulk() {
+        const TEXT: &str = "alpha\nbravo\ncharlie\ndelta\n";
+        assert_eq!(Rope::from(TEXT).len_chars(), 26, "document length in characters");
+
+        let changes = change_set(
+            TEXT,
+            [
+                (2, 2, Some(Tendril::from("a"))),
+                (8, 8, Some(Tendril::from("b"))),
+                (14, 14, Some(Tendril::from("c"))),
+            ]
+            .into_iter(),
+        );
+
+        let expected: &[Operation] = &[
+            Operation::Retain(2),
+            Operation::Insert(Tendril::from("a")),
+            Operation::Retain(6),
+            Operation::Insert(Tendril::from("b")),
+            Operation::Retain(6),
+            Operation::Insert(Tendril::from("c")),
+            Operation::Retain(12),
+        ];
+        assert_eq!(changes.changes(), expected);
+
+        assert!(matches!(analyze_change_type(&changes), ChangeType::Bulk));
+    }
+
+    /// An empty operation list reaches the early return before any counting happens. A change
+    /// event still fired, so there is nothing to attribute it to: `Bulk`.
+    #[test]
+    fn analyze_change_type_counts_empty_change_set_as_bulk() {
+        let rope = Rope::from("alpha\nbravo\n");
+        let transaction = Transaction::new(&rope);
+        assert!(
+            transaction.changes().changes().is_empty(),
+            "a fresh transaction has no operations"
+        );
+
+        assert!(matches!(analyze_change_type(transaction.changes()), ChangeType::Bulk));
     }
 }
