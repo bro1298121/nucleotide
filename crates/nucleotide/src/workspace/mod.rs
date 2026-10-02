@@ -2027,6 +2027,22 @@ fn should_refine_completion_for_focused_document(
     has_completion && focused_doc_id == Some(doc_id)
 }
 
+/// Decide whether an extracted completion prefix means the completion menu is no longer
+/// meaningful and should be dismissed.
+///
+/// `is_trigger_completion` is the discriminator, and it must not be discarded. An empty (or
+/// whitespace-only) prefix means two very different things depending on it:
+///
+/// - `false`: the cursor is on a fresh line, either at column 0 or sitting in auto-indent
+///   whitespace. The menu is stale, and applying the empty prefix as a filter would match
+///   every item and leave the popup open showing the whole list (this is what pressing Enter
+///   used to do).
+/// - `true`: the cursor sits immediately after a trigger character such as `.` or `::`, where
+///   an empty prefix is the documented, intended behaviour for member completion.
+fn should_dismiss_completion_menu(prefix: &str, is_trigger_completion: bool) -> bool {
+    prefix.trim().is_empty() && !is_trigger_completion
+}
+
 fn tab_activation_target_after_close<T: Copy + Eq>(
     documents: &[TabActivationDocument<T>],
     closing_doc_id: T,
@@ -12130,7 +12146,24 @@ impl Workspace {
     /// This method attempts to auto-detect the current completion prefix
     pub fn update_completion_filter_auto(&mut self, cx: &mut Context<Self>) -> bool {
         // Get current text under cursor to determine new prefix
-        if let Some(current_prefix) = self.get_current_completion_prefix(cx) {
+        if let Some((current_prefix, is_trigger_completion)) =
+            self.get_current_completion_prefix(cx)
+        {
+            // Derivation: a completion menu is only meaningful while the user is typing a
+            // word, or immediately after a trigger character such as `.` or `::`. After Enter
+            // the cursor sits on a fresh line, optionally with auto-indent whitespace, so the
+            // prefix is empty or whitespace-only and `is_trigger_completion` is false. Feeding
+            // that to `update_completion_filter` would match every item and leave the menu
+            // open showing the whole list, so the menu is dismissed instead. The trigger case
+            // must keep the menu: `extract_prefix` also returns an empty prefix there, and
+            // that is the documented, intended behaviour (see `get_current_completion_prefix`,
+            // "Even empty prefix is valid for trigger completions").
+            if should_dismiss_completion_menu(&current_prefix, is_trigger_completion) {
+                // `hide_completions` clears `active_completion_session`, so the retrigger
+                // below would inspect a session that no longer exists.
+                self.hide_completions(cx);
+                return false;
+            }
             let updated = self.update_completion_filter(current_prefix.clone(), cx);
             self.retrigger_incomplete_completion_if_needed(&current_prefix, cx);
             updated
@@ -12197,7 +12230,15 @@ impl Workspace {
     }
 
     /// Get the current word prefix under the cursor for completion filtering
-    fn get_current_completion_prefix(&mut self, cx: &mut Context<Self>) -> Option<String> {
+    ///
+    /// Returns the prefix together with `is_trigger_completion`. The flag is part of the
+    /// contract because an empty prefix is ambiguous: it means either "the cursor moved to a
+    /// fresh line" (dismiss the menu) or "the user just typed a trigger character" (keep the
+    /// menu). Callers must not drop it; see `should_dismiss_completion_menu`.
+    fn get_current_completion_prefix(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, bool)> {
         let core = self.core.clone();
         core.update(cx, |core, _cx| {
             let editor = &core.editor;
@@ -12275,8 +12316,11 @@ impl Workspace {
                 "Enhanced completion prefix extraction completed"
             );
 
-            // Even empty prefix is valid for trigger completions (e.g., method completion after a dot)
-            Some(prefix)
+            // Even empty prefix is valid for trigger completions (e.g., method completion
+            // after a dot), which is exactly why `is_trigger_completion` must be returned
+            // alongside it: an empty prefix alone cannot distinguish that from the cursor
+            // sitting on a fresh line.
+            Some((prefix, is_trigger_completion))
         })
     }
 
@@ -18250,6 +18294,40 @@ mod tests {
         assert!(!should_refine_completion_for_focused_document(
             true, None, doc_id
         ));
+    }
+
+    /// Expected: dismiss (`true`).
+    ///
+    /// After Enter the cursor sits on a fresh line, either at column 0 or inside an auto-indent
+    /// run, and `extract_prefix` reports an empty prefix with `is_trigger_completion == false`
+    /// for both (see `prefix_extraction`'s `test_fresh_line_at_column_zero_*` and
+    /// `test_fresh_line_with_auto_indent_*`). Passing that empty prefix to
+    /// `update_completion_filter` matches every item, which is what left the popup open showing
+    /// the whole list instead of dismissing it.
+    ///
+    /// The whitespace-only inputs are the auto-indent shape of the same state. `extract_prefix`
+    /// currently collapses an indent run to an empty prefix, so `trim()` is not strictly
+    /// required today, but it keeps the rule correct if that ever changes.
+    #[test]
+    fn should_dismiss_completion_menu_dismisses_blank_prefix_outside_trigger_context() {
+        assert!(should_dismiss_completion_menu("", false));
+        assert!(should_dismiss_completion_menu("    ", false));
+        assert!(should_dismiss_completion_menu("\t", false));
+    }
+
+    /// Expected: keep the menu (`false`).
+    ///
+    /// `("", true)` is the pair that must never be collapsed into a plain empty-prefix check.
+    /// `extract_prefix` returns an empty prefix immediately after a trigger character such as
+    /// `.` or `::`, where showing every member is the intended behaviour, and only
+    /// `is_trigger_completion` separates that from the fresh-line case above. `("st", false)`
+    /// is ordinary typing, which keeps refining the filter; `("st", true)` is a trigger
+    /// completion the user has started narrowing down.
+    #[test]
+    fn should_dismiss_completion_menu_keeps_trigger_and_typed_prefixes() {
+        assert!(!should_dismiss_completion_menu("", true));
+        assert!(!should_dismiss_completion_menu("st", false));
+        assert!(!should_dismiss_completion_menu("st", true));
     }
 
     #[test]

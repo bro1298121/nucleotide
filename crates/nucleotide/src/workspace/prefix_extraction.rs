@@ -253,4 +253,96 @@ mod tests {
         assert_eq!(prefix, "b");
         assert!(!is_trigger);
     }
+
+    // The four tests below pin the `(prefix, is_trigger_completion)` contract that
+    // `workspace::should_dismiss_completion_menu` depends on to tell "the cursor moved to a
+    // fresh line" (dismiss the completion menu) apart from "the user just typed a trigger
+    // character" (keep it). An empty prefix alone cannot distinguish the two, so these
+    // expectations are derived from `extract_prefix`'s control flow rather than from whatever
+    // it happens to return today.
+
+    /// Fresh line with no auto-indent, cursor at column 0: expected `("", false)` -> dismiss.
+    ///
+    /// `extract_prefix` early-returns `("", false)` for `cursor_col == 0`
+    /// (`prefix_extraction.rs:85-87`) before it inspects the line at all, so `"\n"` and `""`
+    /// both yield an empty prefix with no trigger context. That is exactly the cursor state
+    /// after Enter with no indentation, and it must dismiss the menu instead of filtering with
+    /// `""` (which matches every item and leaves the popup open).
+    #[test]
+    fn test_fresh_line_at_column_zero_is_empty_and_not_a_trigger() {
+        let mut extractor = PrefixExtractor::new();
+        extractor.configure_for_language("rust");
+
+        let (prefix, is_trigger) = extractor.extract_prefix("\n", 0);
+        assert_eq!(prefix, "");
+        assert!(!is_trigger);
+
+        let (prefix, is_trigger) = extractor.extract_prefix("", 0);
+        assert_eq!(prefix, "");
+        assert!(!is_trigger);
+    }
+
+    /// Fresh line with a 4-space auto-indent, cursor at column 4: expected `("", false)` ->
+    /// dismiss.
+    ///
+    /// The text before the cursor is the indent run `"    "`. `is_trigger_context` walks
+    /// backwards and hits `' '`, which is a separator rather than a trigger character, so it
+    /// stops immediately and reports no trigger. `extract_identifier_prefix` also breaks on its
+    /// very first step, because the character directly before the cursor is whitespace and
+    /// whitespace is not an identifier character; `start_pos` therefore stays at
+    /// `chars.len()` and the extracted prefix is empty rather than the raw whitespace run.
+    ///
+    /// Either way the dismissal rule holds, because it tests `prefix.trim().is_empty()`, and the
+    /// cursor sits mid-line inside the indent run so this case cannot be caught by looking for
+    /// a newline or by comparing line numbers.
+    #[test]
+    fn test_fresh_line_with_auto_indent_is_empty_and_not_a_trigger() {
+        let mut extractor = PrefixExtractor::new();
+        extractor.configure_for_language("rust");
+
+        let (prefix, is_trigger) = extractor.extract_prefix("    \n", 4);
+        assert_eq!(prefix, "");
+        assert!(!is_trigger);
+
+        // A tab-indented fresh line behaves identically.
+        let (prefix, is_trigger) = extractor.extract_prefix("\t", 1);
+        assert_eq!(prefix, "");
+        assert!(!is_trigger);
+    }
+
+    /// Immediately after `obj.`: expected `("", true)` -> keep the menu.
+    ///
+    /// `"javascript"` is configured here because it is the language whose
+    /// `configure_for_language` explicitly inserts `'.'` into `trigger_chars`; `.` is also a
+    /// base trigger character, so the flag does not depend on that call. `is_trigger_context`
+    /// walks back from the cursor and finds `'.'` before any separator, so
+    /// `extract_trigger_prefix` takes over and returns everything after the trigger character,
+    /// which is nothing. This empty prefix is the documented, intended member-completion
+    /// behaviour and must not be treated as a fresh line.
+    #[test]
+    fn test_trigger_character_yields_empty_but_flagged_prefix() {
+        let mut extractor = PrefixExtractor::new();
+        extractor.configure_for_language("javascript");
+
+        let (prefix, is_trigger) = extractor.extract_prefix("obj.", 4);
+        assert_eq!(prefix, "");
+        assert!(is_trigger);
+    }
+
+    /// Mid-word while typing `st`: expected `("st", false)` -> keep the menu.
+    ///
+    /// `is_trigger_context` walks back over the identifier characters and then stops at the
+    /// `' '` separator in `"let st"`, so there is no trigger. `extract_identifier_prefix`
+    /// walks back over `'s'` and `'t'` to the separator at index 3 and returns
+    /// `chars[3..]`, i.e. the word being typed. A non-empty prefix keeps the menu open and
+    /// refines the filter as usual.
+    #[test]
+    fn test_word_being_typed_is_kept_as_a_non_trigger_prefix() {
+        let mut extractor = PrefixExtractor::new();
+        extractor.configure_for_language("rust");
+
+        let (prefix, is_trigger) = extractor.extract_prefix("let st", 7);
+        assert_eq!(prefix, "st");
+        assert!(!is_trigger);
+    }
 }
