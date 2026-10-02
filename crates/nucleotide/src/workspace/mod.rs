@@ -1113,6 +1113,23 @@ pub struct Workspace {
     cached_char_width: Option<f32>,
     cached_line_height: Option<f32>,
     active_completion_session: Option<ActiveCompletionSession>,
+    /// `(DocumentId, document version)` of the most recently accepted completion edit.
+    ///
+    /// Accepting rewrites the document through `Transaction`, which re-enters
+    /// `handle_document_changed`. Without a marker the automatic trigger would reopen the popup
+    /// for the very edit the user just made by accepting. The document id is part of the key so
+    /// a coincidental version match on a different document cannot suppress a legitimate popup.
+    ///
+    /// The marker is never cleared explicitly. It self-expires: the accept's own edit leaves the
+    /// document at exactly the recorded version, so only the document change produced by that
+    /// edit matches. See `should_suppress_auto_completion_after_accept`.
+    completion_accept_origin: Option<(helix_view::DocumentId, u64)>,
+    /// Monotonic counter bumped once per document change that may schedule an automatic
+    /// completion request. `poll_pending_helix_events` drains up to 64 events per turn and
+    /// `coalesce_helix_events` only dedups `DiagnosticsChanged`, so a single burst of typing
+    /// can call `handle_document_changed` several times. The counter collapses that burst into
+    /// one debounced request: each spawn captures the value it saw and bails if superseded.
+    completion_auto_trigger_generation: u64,
     completion_memory: CompletionMemory,
     last_native_window_metadata: Option<NativeWindowMetadata>,
     pending_remote_open: Option<PendingRemoteOpen>,
@@ -2041,6 +2058,99 @@ fn should_refine_completion_for_focused_document(
 ///   an empty prefix is the documented, intended behaviour for member completion.
 fn should_dismiss_completion_menu(prefix: &str, is_trigger_completion: bool) -> bool {
     prefix.trim().is_empty() && !is_trigger_completion
+}
+
+/// Debounce window for the automatic completion trigger.
+///
+/// `handle_document_changed` can fire several times for a single burst of typing (up to 64 events
+/// are drained per turn and only `DiagnosticsChanged` is coalesced), so the auto-trigger waits for
+/// the burst to settle before asking the server. It is deliberately longer than the fixed 30 ms
+/// settle delay used for `Manual`: a fast typist against a slow server would otherwise get
+/// several in-flight requests per word, and the last one to arrive wins.
+const AUTO_COMPLETION_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// Widen a Helix document version into the `u64` token used by the accept-suppression marker.
+///
+/// `Document::version()` is an `i32`. Both the write side (`accept_completion_item`) and the read
+/// side (`auto_completion_gate`) go through this function, so the mapping is identical on both
+/// sides even in the unreachable case of a negative version.
+fn completion_version_token(version: i32) -> u64 {
+    u64::try_from(version).unwrap_or_default()
+}
+
+/// Document-identity core of [`should_suppress_auto_completion_after_accept`].
+///
+/// Split out from the predicate purely so the identity rule is testable: `helix_view::DocumentId`
+/// has no public constructor, so a test in this crate cannot build two distinct ids to compare.
+/// The production predicate is a thin wrapper that supplies the real `DocumentId`.
+fn completion_change_matches_accept_origin<T: Copy + PartialEq>(
+    origin: Option<(T, u64)>,
+    doc_id: T,
+    version: u64,
+) -> bool {
+    origin == Some((doc_id, version))
+}
+
+/// Decide whether the automatic completion trigger must stay silent for a document change.
+///
+/// Accepting a completion item rewrites the document through `Transaction`, which re-enters
+/// `handle_document_changed` and therefore reaches the auto-trigger. The user did not type that
+/// edit, so opening the popup there is pure noise: the menu would cover the text the accept just
+/// inserted.
+///
+/// The marker is compared against `(doc_id, version)` and never cleared, so it expires on its own.
+/// The accept's own edit leaves the document at exactly the recorded version, so that is the only
+/// change it can ever suppress. A deliberately added check-and-clear flag would be wrong: an
+/// unrelated queued change (paste, format-on-save, an LSP code action) could consume the flag
+/// before the accept's own change was delivered, and the popup would then pop on the accepted
+/// text. Here, a later change advances the version, stops matching, and is judged on its own
+/// merits.
+fn should_suppress_auto_completion_after_accept(
+    origin: Option<(helix_view::DocumentId, u64)>,
+    doc_id: helix_view::DocumentId,
+    version: u64,
+) -> bool {
+    completion_change_matches_accept_origin(origin, doc_id, version)
+}
+
+/// Decide whether an in-flight completion response still describes what the user is looking at.
+///
+/// This is a prefix identity check, not a request generation counter, and that is deliberate.
+/// There is no de-duplication anywhere in the completion path (`finish_completion_request` applies
+/// results unconditionally, `show_completion_items_with_prefix` overwrites
+/// `active_completion_session`, `Overlay::replace_completion` drops the shown view), so
+/// last-to-arrive wins. Comparing the prefix catches two races a counter cannot:
+///
+/// - the cursor moved without any document change, so no counter was bumped, but the prefix the
+///   response was computed for is no longer the prefix under the cursor;
+/// - focus moved to another document, where a single global counter bumped in
+///   `handle_document_changed` would wrongly discard a response that is still valid for the
+///   document the user is now in.
+///
+/// The `Manual` exemption is required, not an optimisation. Ctrl+X is an explicit request and
+/// must keep working on a fresh line and in leading whitespace, which is exactly the context the
+/// second clause below rejects. Only the automatic, character and incomplete triggers - the ones
+/// this workspace manufactures on the user's behalf - have to honour the dismiss rule.
+///
+/// `current_is_dismiss_context` is `should_dismiss_completion_menu(filter_prefix,
+/// is_trigger_completion)` evaluated by the caller, because the dismiss rule is defined over the
+/// `PrefixExtractor` prefix while `response_prefix` lives in the request extractor's coordinate
+/// system. See `completion_request_prefix`.
+fn should_apply_completion_response(
+    response_prefix: &str,
+    current_prefix: &str,
+    current_is_dismiss_context: bool,
+    trigger: &LspCompletionTrigger,
+) -> bool {
+    if response_prefix != current_prefix {
+        return false;
+    }
+
+    if matches!(trigger, LspCompletionTrigger::Manual) {
+        return true;
+    }
+
+    !current_is_dismiss_context
 }
 
 fn tab_activation_target_after_close<T: Copy + Eq>(
@@ -5677,6 +5787,8 @@ impl Workspace {
             cached_char_width: None,
             cached_line_height: None,
             active_completion_session: None,
+            completion_accept_origin: None,
+            completion_auto_trigger_generation: 0,
             completion_memory: CompletionMemory::default(),
             last_native_window_metadata: None,
             pending_remote_open: None,
@@ -8262,6 +8374,7 @@ impl Workspace {
     fn handle_document_changed(
         &mut self,
         doc_id: helix_view::DocumentId,
+        change_summary: nucleotide_events::document::ChangeType,
         line_change: &nucleotide_events::document::DocumentLineChange,
         cx: &mut Context<Self>,
     ) {
@@ -8286,6 +8399,18 @@ impl Workspace {
                 .try_get(core.editor.tree.focus)
                 .map(|view| view.doc)
         };
+        // Auto-trigger completion as the user types.
+        //
+        // This must run *before* the `update_completion_filter_auto` block below. Statement order
+        // is a second, independent guard for the dismiss case, on top of the prefix predicate
+        // inside the gate: on the keystroke that dismisses the menu (space, Enter),
+        // `update_completion_filter_auto` calls `hide_completions`, which clears
+        // `has_completion()`. If the auto-trigger were scheduled after that, the gate's
+        // `has_completion()` condition would be satisfied and it would fire a request for a
+        // context the user just asked to leave. Placed here, the gate sees the menu still open and
+        // rejects on structure rather than on the prefix having been recomputed.
+        self.maybe_trigger_auto_completion(doc_id, change_summary, cx);
+
         if should_refine_completion_for_focused_document(
             self.overlay.read(cx).has_completion(),
             focused_doc_id,
@@ -11995,10 +12120,11 @@ impl Workspace {
         match event {
             DocumentEvent::ContentChanged {
                 doc_id,
+                change_summary,
                 line_change,
                 ..
             } => {
-                self.handle_document_changed(*doc_id, line_change, cx);
+                self.handle_document_changed(*doc_id, *change_summary, line_change, cx);
             }
             DocumentEvent::Opened { doc_id, .. } => {
                 self.handle_document_opened(*doc_id, cx);
@@ -12126,6 +12252,205 @@ impl Workspace {
                 self.hide_completions(cx);
             }
         }
+    }
+
+    /// Read the focused view, the document it shows, and the editor mode in a single `core`
+    /// borrow, so a scheduling decision and a firing decision read the same shape of data.
+    fn completion_focus_context(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> (ViewId, Option<helix_view::DocumentId>, helix_view::document::Mode) {
+        let core = self.core.read(cx);
+        let view_id = core.editor.tree.focus;
+        let doc_id = core.editor.tree.try_get(view_id).map(|view| view.doc);
+        (view_id, doc_id, core.editor.mode())
+    }
+
+    /// Schedule a debounced automatic completion request for a document change.
+    ///
+    /// Called from `handle_document_changed` for every non-bulk change. The full gate runs when
+    /// the timer fires, not here: inside the debounce window the cursor can move, the prefix can
+    /// change again, and the menu can be opened or dismissed by the `update_completion_filter_auto`
+    /// call that follows this one. Only the two cheap structural facts - this is the focused
+    /// document, and the user is typing rather than navigating - are checked up front, so edits in
+    /// a background buffer do not spawn a timer per keystroke.
+    fn maybe_trigger_auto_completion(
+        &mut self,
+        doc_id: helix_view::DocumentId,
+        change_summary: nucleotide_events::document::ChangeType,
+        cx: &mut Context<Self>,
+    ) {
+        // `handle_document_changed` cannot see what actually changed - its only change argument is
+        // `DocumentLineChange { old_lines, new_lines }`. `ChangeType::Bulk` is the bridge's own
+        // classification of the underlying `ChangeSet`: paste, undo, format-on-save and
+        // LSP-applied code actions all routinely land there, and all of them routinely leave a
+        // non-empty prefix at the cursor. Auto-triggering there would pop the menu after a paste.
+        // Ctrl+X is unaffected because it never passes through here.
+        if matches!(change_summary, nucleotide_events::document::ChangeType::Bulk) {
+            return;
+        }
+
+        let (_view_id, focused_doc_id, mode) = self.completion_focus_context(cx);
+        if focused_doc_id != Some(doc_id) {
+            return;
+        }
+        // Completion only makes sense while the user is typing. `handle_document_changed` also
+        // fires for every mode change that touches a buffer, and popping the menu because the user
+        // left insert mode would be a surprise.
+        if mode != helix_view::document::Mode::Insert {
+            return;
+        }
+
+        self.completion_auto_trigger_generation =
+            self.completion_auto_trigger_generation.wrapping_add(1).max(1);
+        let generation = self.completion_auto_trigger_generation;
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(AUTO_COMPLETION_DEBOUNCE)
+                .await;
+
+            if let Some(this) = this.upgrade() {
+                this.update(cx, move |workspace, cx| {
+                    // A newer change in the same burst already claimed this slot.
+                    if workspace.completion_auto_trigger_generation != generation {
+                        return;
+                    }
+
+                    let Some((prefix, trigger_char)) = workspace.auto_completion_gate(doc_id, cx)
+                    else {
+                        return;
+                    };
+
+                    // Re-read the cursor at fire time: the debounce window may have moved it.
+                    let (view_id, _, _) = workspace.completion_focus_context(cx);
+                    let Some(cursor) = workspace.completion_cursor(doc_id, view_id, cx) else {
+                        return;
+                    };
+
+                    nucleotide_logging::debug!(
+                        prefix = %prefix,
+                        doc_id = ?doc_id,
+                        view_id = ?view_id,
+                        cursor = cursor,
+                        trigger_char = ?trigger_char,
+                        "Emitting automatic completion trigger"
+                    );
+                    workspace.emit_auto_completion_trigger(
+                        cursor,
+                        doc_id,
+                        view_id,
+                        trigger_char,
+                        cx,
+                    );
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Decide whether an automatic completion request should be made right now, and describe it.
+    ///
+    /// Returns the prefix the request would be for plus the character immediately before the
+    /// cursor, which is what the LSP needs for `triggerKind`/`triggerCharacter` on the wire (see
+    /// `application::mod`, which derives both from `LspCompletionTrigger`).
+    ///
+    /// Step 1 is the load-bearing condition of this feature and must not be "optimised" away.
+    /// Requiring the menu to be *closed* does three things at once:
+    ///
+    /// - it structurally prevents this path from racing
+    ///   `retrigger_incomplete_completion_if_needed`, which only runs while the menu is open. With
+    ///   no request de-duplication anywhere in the completion path, two in-flight requests would
+    ///   both reach `show_completion_items_with_prefix` and the later partial response would
+    ///   clobber the earlier full one;
+    /// - it bounds the request rate to one per closed-to-open cycle instead of one per keystroke;
+    /// - it keeps this change small, because with the menu open the existing
+    ///   `update_completion_filter_auto` path already does the right thing.
+    ///
+    /// A future reader who removes this condition reintroduces the double-request race.
+    fn auto_completion_gate(
+        &mut self,
+        doc_id: helix_view::DocumentId,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, Option<char>)> {
+        if self.overlay.read(cx).has_completion() {
+            return None;
+        }
+
+        let (view_id, focused_doc_id, mode) = self.completion_focus_context(cx);
+        if focused_doc_id != Some(doc_id) {
+            return None;
+        }
+        if mode != helix_view::document::Mode::Insert {
+            return None;
+        }
+
+        let Some((prefix, is_trigger_completion)) = self.get_current_completion_prefix(cx) else {
+            return None;
+        };
+
+        // Reuse the rule the manual path already uses. This gives the correct cases for free: no
+        // popup after a space, none on a fresh indented line, one on the first letter of a word,
+        // and one after `.` where the empty prefix means "list the members".
+        if should_dismiss_completion_menu(&prefix, is_trigger_completion) {
+            return None;
+        }
+
+        let document_version = self
+            .core
+            .read(cx)
+            .editor
+            .document(doc_id)
+            .map(|doc| completion_version_token(doc.version()));
+        let Some(document_version) = document_version else {
+            return None;
+        };
+        if should_suppress_auto_completion_after_accept(
+            self.completion_accept_origin,
+            doc_id,
+            document_version,
+        ) {
+            return None;
+        }
+
+        let trigger_char = self
+            .completion_cursor(doc_id, view_id, cx)
+            .and_then(|cursor| self.completion_character_before_cursor(cursor, doc_id, cx));
+
+        Some((prefix, trigger_char))
+    }
+
+    /// Emit the automatic completion trigger through the existing event path.
+    ///
+    /// `Workspace::handle_event` is the only observer of `Update::CompletionEvent`, and it is
+    /// subscribed to `core` from `Workspace::with_views`, so the emit target matters: `Core` is
+    /// the entity that subscription is attached to.
+    fn emit_auto_completion_trigger(
+        &self,
+        cursor: usize,
+        doc_id: helix_view::DocumentId,
+        view_id: ViewId,
+        trigger_char: Option<char>,
+        cx: &mut Context<Self>,
+    ) {
+        self.core.update(cx, move |_core, cx| {
+            // Without a trigger character this is `triggerKind: Invoked`, with one it is
+            // `triggerKind: TriggerCharacter` plus `triggerCharacter` on the wire. Both are
+            // derived downstream from the variant chosen here.
+            let event = match trigger_char {
+                Some(ch) => helix_view::handlers::completion::CompletionEvent::TriggerChar {
+                    cursor,
+                    doc: doc_id,
+                    view: view_id,
+                },
+                None => helix_view::handlers::completion::CompletionEvent::AutoTrigger {
+                    cursor,
+                    doc: doc_id,
+                    view: view_id,
+                },
+            };
+            cx.emit(crate::Update::CompletionEvent(event));
+        });
     }
 
     /// Update completion filter if completion is active and prefix has changed
@@ -12518,7 +12843,13 @@ impl Workspace {
 
             if let Some(this) = this.upgrade() {
                 this.update(cx, move |workspace, cx| {
-                    workspace.finish_completion_request(completion_result, doc_id, view_id, cx);
+                    workspace.finish_completion_request(
+                        completion_result,
+                        doc_id,
+                        view_id,
+                        trigger,
+                        cx,
+                    );
                 });
             }
         })
@@ -12535,6 +12866,7 @@ impl Workspace {
         )>,
         doc_id: helix_view::DocumentId,
         view_id: helix_view::ViewId,
+        trigger: LspCompletionTrigger,
         cx: &mut Context<Self>,
     ) {
         match completion_result {
@@ -12547,9 +12879,68 @@ impl Workspace {
                     "Received completion items from Nucleotide LSP path"
                 );
 
+                // Nothing in this path de-duplicates requests, so without this guard a response
+                // that arrives after the user has moved on replaces the menu with a list filtered
+                // for a prefix that is no longer under the cursor. See
+                // `should_apply_completion_response` for why this is a prefix identity check
+                // rather than a request generation counter.
+                let (_, focused_doc_id, _) = self.completion_focus_context(cx);
+                if focused_doc_id != Some(doc_id) {
+                    nucleotide_logging::debug!(
+                        doc_id = ?doc_id,
+                        focused_doc_id = ?focused_doc_id,
+                        "Dropping completion response for unfocused document"
+                    );
+                    return;
+                }
+
+                // Two prefixes, deliberately. `filter_prefix` is what
+                // `should_dismiss_completion_menu` is defined over, so it has to come from the
+                // extractor that rule was written against. `current_prefix` is what the response
+                // has to be compared against, and that has to come from the extractor the request
+                // was built with - see `completion_request_prefix` for why the two are not
+                // interchangeable.
+                let Some((filter_prefix, current_is_trigger)) =
+                    self.get_current_completion_prefix(cx)
+                else {
+                    return;
+                };
+                let Some(current_prefix) = self.completion_request_prefix(doc_id, view_id, cx)
+                else {
+                    return;
+                };
+
+                if !should_apply_completion_response(
+                    &prefix,
+                    &current_prefix,
+                    should_dismiss_completion_menu(&filter_prefix, current_is_trigger),
+                    &trigger,
+                ) {
+                    nucleotide_logging::debug!(
+                        response_prefix = %prefix,
+                        current_prefix = %current_prefix,
+                        filter_prefix = %filter_prefix,
+                        current_is_trigger = current_is_trigger,
+                        trigger = ?trigger,
+                        "Dropping stale completion response"
+                    );
+                    return;
+                }
+
                 if completion_items.is_empty() {
                     nucleotide_logging::warn!("No completion items returned from LSP");
-                    self.hide_completions(cx);
+                    // An empty automatic response must not close a menu that is already open.
+                    // With auto-trigger, `retrigger_incomplete_completion_if_needed` re-requests
+                    // on every keystroke and a server may legitimately answer empty for a partial
+                    // word; closing here produced a visible flicker: menu open, keystroke, menu
+                    // closes, next keystroke reopens it. `Manual` keeps the current behaviour -
+                    // Ctrl+X with no results closes the menu, because the user asked for a fresh
+                    // list and an open stale one would be misleading.
+                    let keep_open = !matches!(trigger, LspCompletionTrigger::Manual)
+                        && self.overlay.read(cx).has_completion();
+                    if !keep_open {
+                        self.hide_completions(cx);
+                    }
                 } else {
                     self.show_completion_items_with_prefix(
                         completion_items,
@@ -12605,6 +12996,50 @@ impl Workspace {
         let text = doc.text();
         let cursor = cursor.min(text.len_chars());
         text.chars_at(cursor).reversed().next()
+    }
+
+    /// Recompute, at the current cursor, the prefix that the in-flight request was built from.
+    ///
+    /// `PendingCompletionRequest.prefix` is produced by `Application::extract_completion_prefix`,
+    /// which walks backwards over `char_is_word` characters. This helper reproduces that walk so
+    /// the response identity check in `should_apply_completion_response` compares like with like.
+    ///
+    /// It is deliberately *not* `get_current_completion_prefix`. That is a different extractor
+    /// (`PrefixExtractor`) with a different character set - ASCII alphanumerics plus `_`, and then
+    /// `-`, `$`, `@` and per-language trigger characters - so the two disagree on text users type
+    /// routinely, for a cursor that never moved at all:
+    ///
+    /// - `--my-var` in CSS: `char_is_word('-')` is false, so the request asks for `var`, while `-`
+    ///   is an identifier character for the filter, so the filter prefix is `--my-var`;
+    /// - `$var` in JavaScript and `@decorator`: the request asks for `var` / `decorator`, the
+    ///   filter prefix is `$var` / `@decorator`;
+    /// - any non-ASCII identifier such as `héllo` or `変数`: `char_is_word` uses
+    ///   `is_alphanumeric`, while `identifier_chars` is built from ASCII ranges only, so the
+    ///   request asks for the whole word and the filter prefix is empty.
+    ///
+    /// Comparing across the two would reject a perfectly valid response, and the completion menu
+    /// would then never open in those files - for manual triggers as well as automatic ones.
+    fn completion_request_prefix(
+        &self,
+        doc_id: helix_view::DocumentId,
+        view_id: helix_view::ViewId,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let core = self.core.read(cx);
+        let doc = core.editor.document(doc_id)?;
+        let text = doc.text();
+        let cursor = doc
+            .selection(view_id)
+            .primary()
+            .cursor(text.slice(..))
+            .min(text.len_chars());
+        let word_chars = text
+            .chars_at(cursor)
+            .reversed()
+            .take_while(|ch| helix_core::chars::char_is_word(*ch))
+            .count();
+
+        Some(text.slice(cursor.saturating_sub(word_chars)..cursor).to_string())
     }
 
     fn manual_completion_needs_lsp_settle_delay(
@@ -12993,7 +13428,28 @@ impl Workspace {
             }
         };
 
-        if accepted && let Some(key) = completion_memory_key {
+        if !accepted {
+            return;
+        }
+
+        // Record the post-edit document version so the automatic trigger stays silent for the
+        // document change this accept is about to produce. See
+        // `should_suppress_auto_completion_after_accept`.
+        //
+        // This is the single funnel for both accept paths: the synchronous one from
+        // `handle_completion_via_helix` and the resolve path from
+        // `resolve_completion_before_accept`, so neither can bypass the marker. The version is read
+        // after the edit because the accept handlers mutate the document synchronously through
+        // `Transaction`; the `ContentChanged` event for that edit is delivered later, on a
+        // subsequent turn of the event loop.
+        self.completion_accept_origin = self
+            .core
+            .read(cx)
+            .editor
+            .document(target.doc_id)
+            .map(|doc| (target.doc_id, completion_version_token(doc.version())));
+
+        if let Some(key) = completion_memory_key {
             self.completion_memory.memorize(key);
         }
     }
@@ -18328,6 +18784,214 @@ mod tests {
         assert!(!should_dismiss_completion_menu("", true));
         assert!(!should_dismiss_completion_menu("st", false));
         assert!(!should_dismiss_completion_menu("st", true));
+    }
+
+    /// Expected: suppress (`true`) for the accept's own change, not for anything else.
+    ///
+    /// `accept_completion_item` rewrites the document through `Transaction`, and that edit leaves
+    /// the document at exactly the version recorded in the marker. That single document change is
+    /// the only one the marker may silence - the user did not type it, and popping the menu over
+    /// the text an accept just inserted is noise.
+    ///
+    /// A different version is the self-expiry case, and it is the behaviour the next keystroke
+    /// relies on: after accepting, the user keeps typing, the version advances, and the popup is
+    /// free to open again. A `None` marker means nothing has been accepted in this document yet,
+    /// so the very first typed character must not be suppressed.
+    #[test]
+    fn should_suppress_auto_completion_after_accept_only_matches_its_own_change() {
+        let doc_id = DocumentId::default();
+
+        assert!(should_suppress_auto_completion_after_accept(Some((doc_id, 7)), doc_id, 7));
+        assert!(!should_suppress_auto_completion_after_accept(Some((doc_id, 7)), doc_id, 8));
+        assert!(!should_suppress_auto_completion_after_accept(None, doc_id, 7));
+    }
+
+    /// Expected: not suppressed (`false`) when only the document differs.
+    ///
+    /// The marker is keyed on `(DocumentId, version)` rather than on the version alone precisely
+    /// so that accepting in one buffer cannot silence the popup in another. Two buffers edited in
+    /// the same session routinely share a version number, so a bare version would suppress
+    /// legitimate completions in the buffer the user is actually typing in.
+    ///
+    /// `DocumentId` has no public constructor - `helix_view` gates `DocumentId::new` behind
+    /// `#[cfg(test)]` inside its own crate - so this half of the rule is exercised through the
+    /// generic core that `should_suppress_auto_completion_after_accept` delegates to, using a
+    /// stand-in identifier type. `PartialEq` on the caller's side is the behaviour under test.
+    #[test]
+    fn completion_change_matches_accept_origin_requires_the_same_document() {
+        assert!(!completion_change_matches_accept_origin(Some((2_u32, 7)), 1_u32, 7));
+        assert!(completion_change_matches_accept_origin(Some((1_u32, 7)), 1_u32, 7));
+    }
+
+    /// Expected: apply (`true`).
+    ///
+    /// The response was computed for exactly the prefix now under the cursor, and the cursor is
+    /// not in a dismiss context, so the menu is still describing reality. This is the common case
+    /// for every trigger: the auto path, the incomplete re-request and Ctrl+X all land here.
+    ///
+    /// Note both prefixes are in the same coordinate system here - the one the request was built
+    /// with. Comparing a request prefix against the `PrefixExtractor` output instead would fail
+    /// this test's siblings for real text; see `completion_request_prefix`.
+    #[test]
+    fn should_apply_completion_response_accepts_unchanged_prefix() {
+        for trigger in [
+            LspCompletionTrigger::Manual,
+            LspCompletionTrigger::Automatic,
+            LspCompletionTrigger::Character('.'),
+            LspCompletionTrigger::Incomplete,
+        ] {
+            assert!(
+                should_apply_completion_response("fo", "fo", false, &trigger),
+                "{trigger:?} should apply an unchanged typed prefix"
+            );
+        }
+    }
+
+    /// Expected: drop (`false`) when the prefix moved on.
+    ///
+    /// The response was filtered for `fo` but the cursor now reads `foo`, so applying it would
+    /// replace the menu with a list that no longer matches the text. Nothing de-duplicates requests
+    /// in this path, so without the identity check a slow response clobbers a newer one. The
+    /// cursor can reach this state without any document change at all (an arrow key, or a mouse
+    /// click), which is why this is a prefix comparison and not a change counter.
+    #[test]
+    fn should_apply_completion_response_drops_changed_prefix() {
+        assert!(!should_apply_completion_response(
+            "fo",
+            "foo",
+            false,
+            &LspCompletionTrigger::Automatic
+        ));
+    }
+
+    /// Expected: apply (`true`) even though the current context would be dismissed.
+    ///
+    /// The third argument is `true`, so the dismiss rule would reject this response on its own
+    /// terms: an empty prefix, cursor on a fresh line. Ctrl+X is an explicit request and Helix
+    /// lets the user press it there, where the automatic path must stay silent. Without the
+    /// `Manual` exemption, manual completion would stop working outside a word - a regression with
+    /// no upside, since the user named the list they wanted.
+    ///
+    /// The whitespace variants matter for the same reason: auto-indent leaves the cursor inside an
+    /// indent run, and Ctrl+X there is a legitimate request.
+    #[test]
+    fn should_apply_completion_response_manual_ignores_the_dismiss_rule() {
+        assert!(should_apply_completion_response("", "", true, &LspCompletionTrigger::Manual));
+        assert!(should_apply_completion_response(
+            "   ",
+            "   ",
+            true,
+            &LspCompletionTrigger::Manual
+        ));
+    }
+
+    /// Expected: drop (`false`) when an automatic trigger's context has become dismissable.
+    ///
+    /// The inputs are chosen so the prefix comparison cannot be what rejects this: the response
+    /// prefix and the current prefix are identical, so the first clause passes and only the
+    /// dismiss context can reject. This is the case the rule exists for, and prefix *text* alone
+    /// cannot express it.
+    ///
+    /// The scenario: the user types `foo.`, the auto-trigger fires with an empty prefix because
+    /// the cursor sits right after a trigger character, and the server takes a while. Before the
+    /// response lands the user deletes the `.` and ends up on a fresh line. The prefix string is
+    /// unchanged - it was `""` when the request went out and it is `""` now - but its meaning is
+    /// completely different: "list the members of `foo`" versus "the cursor is on a blank line".
+    /// Only `is_trigger_completion` carries that difference, and applying the response here would
+    /// pop the whole completion list on an empty line, which is exactly what `d144d45` introduced
+    /// `should_dismiss_completion_menu` to prevent.
+    #[test]
+    fn should_apply_completion_response_drops_non_manual_on_dismissed_context() {
+        for trigger in [
+            LspCompletionTrigger::Automatic,
+            LspCompletionTrigger::Character('.'),
+            LspCompletionTrigger::Incomplete,
+        ] {
+            assert!(
+                !should_apply_completion_response("", "", true, &trigger),
+                "{trigger:?} should not apply an empty prefix on a fresh line"
+            );
+            assert!(
+                !should_apply_completion_response("    ", "    ", true, &trigger),
+                "{trigger:?} should not apply a whitespace prefix in indentation"
+            );
+        }
+    }
+
+    /// Expected: apply (`true`) for an empty prefix that is *not* a dismiss context.
+    ///
+    /// Immediately after `.` the extracted prefix is legitimately empty and the intended behaviour
+    /// is to list every member, so `should_dismiss_completion_menu` returns `false` for it. The
+    /// two tests above and this one are the reason `is_trigger_completion` is threaded all the way
+    /// through instead of being collapsed into "the prefix is empty": collapsing them would make
+    /// member completion impossible, because the request could be sent but its response would
+    /// always be discarded and the menu would never appear.
+    #[test]
+    fn should_apply_completion_response_keeps_non_manual_empty_prefix_in_trigger_context() {
+        assert!(should_apply_completion_response("", "", false, &LspCompletionTrigger::Automatic));
+        assert!(should_apply_completion_response("", "", false, &LspCompletionTrigger::Incomplete));
+    }
+
+    /// Mirror of `Application::extract_completion_prefix`'s backwards walk, on a plain `&str`.
+    ///
+    /// `extract_completion_prefix` is private to `application`, so the test module cannot call it.
+    /// Reproducing the walk keeps the divergence below honest instead of asserting a remembered
+    /// result. `take_while` on a reversed iterator counts exactly the `char_is_word` characters
+    /// immediately before the cursor, which is what the real code slices back over.
+    fn request_style_prefix(text: &str) -> String {
+        let word_chars = text
+            .chars()
+            .rev()
+            .take_while(|ch| helix_core::chars::char_is_word(*ch))
+            .count();
+        let total = text.chars().count();
+        text.chars().skip(total - word_chars).collect()
+    }
+
+    /// Expected: the two extractors disagree, so the response guard must not compare across them.
+    ///
+    /// This is the invariant behind `completion_request_prefix`. The prefix that comes back on the
+    /// wire is built by walking back over `char_is_word` (`is_alphanumeric` or `_`); the prefix the
+    /// menu filters with is built by `PrefixExtractor` over a hand-maintained ASCII-plus-symbols
+    /// set. They are not the same function, and the divergence shows up on text users type
+    /// constantly, with the cursor never having moved:
+    ///
+    /// - `--my-var`, the normal way to write a CSS custom property: `char_is_word('-')` is false so
+    ///   the request asks for `var`, while `-` is an identifier character for the filter so the
+    ///   filter prefix is `--my-var`;
+    /// - `変数`: `is_alphanumeric` accepts it, so the request asks for `変数`, while
+    ///   `identifier_chars` is built from `'a'..='z'`, `'A'..='Z'` and `'0'..='9'` only, so the
+    ///   filter prefix is empty.
+    ///
+    /// Comparing a response prefix against the `PrefixExtractor` output would therefore reject a
+    /// perfectly valid response and the completion menu would never open in those files - for
+    /// Ctrl+X as well as for the automatic trigger. `completion_request_prefix` exists so the guard
+    /// compares in the coordinate system the request was made in, and these two assertions are
+    /// what would fail if someone "simplified" it back to `get_current_completion_prefix`.
+    #[test]
+    fn response_guard_compares_in_the_extractor_coordinate_system_that_matters() {
+        for (typed, language, expected_request_prefix, expected_filter_prefix) in [
+            ("--my-var", "css", "var", "--my-var"),
+            ("変数", "rust", "変数", ""),
+        ] {
+            let mut extractor = PrefixExtractor::new();
+            extractor.configure_for_language(language);
+            let (filter_prefix, is_trigger) =
+                extractor.extract_prefix(typed, typed.chars().count());
+
+            assert_eq!(request_style_prefix(typed), expected_request_prefix, "{typed}");
+            assert_eq!(filter_prefix, expected_filter_prefix, "{typed}");
+            assert!(!is_trigger, "{typed} is not a trigger context");
+
+            // The response arrived for `expected_request_prefix` and the cursor has not moved, so
+            // the guard must let it through on both coordinate systems' terms.
+            assert!(should_apply_completion_response(
+                expected_request_prefix,
+                &request_style_prefix(typed),
+                false,
+                &LspCompletionTrigger::Manual
+            ));
+        }
     }
 
     #[test]
