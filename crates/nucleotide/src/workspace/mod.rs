@@ -2064,10 +2064,20 @@ fn should_dismiss_completion_menu(prefix: &str, is_trigger_completion: bool) -> 
 ///
 /// `handle_document_changed` can fire several times for a single burst of typing (up to 64 events
 /// are drained per turn and only `DiagnosticsChanged` is coalesced), so the auto-trigger waits for
-/// the burst to settle before asking the server. It is deliberately longer than the fixed 30 ms
-/// settle delay used for `Manual`: a fast typist against a slow server would otherwise get
-/// several in-flight requests per word, and the last one to arrive wins.
-const AUTO_COMPLETION_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(60);
+/// the burst to settle before asking the server. This is a coalescing window, not a settle delay:
+/// it is unrelated to the fixed 30 ms delay that `Manual` triggers use to let the LSP catch up.
+///
+/// It bounds how many requests can be issued while the menu is still closed, since
+/// `auto_completion_gate` only fires when `!has_completion()`. Once the popup appears, later
+/// keystrokes are handled by `update_completion_filter_auto` instead and issue no new requests.
+///
+/// Lowering it trades request volume for perceived latency. Between firing the trigger and the
+/// popup appearing there is a window — the server round trip — during which the menu is still
+/// closed, so a fast typist against a slow server can issue more than one request per word. Stale
+/// responses are dropped by `should_apply_completion_response`, so this costs server work and not
+/// correctness. If large files ever feel like they are stuttering while typing, suppressing a
+/// trigger while one is already in flight is the fix, not raising this number back.
+const AUTO_COMPLETION_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Widen a Helix document version into the `u64` token used by the accept-suppression marker.
 ///
