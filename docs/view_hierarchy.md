@@ -25,8 +25,12 @@ Window
     │   │
     │   └── Main Content (vertical flex)
     │       ├── Document Area
-    │       │   └── DocumentView(s) (one per split)
-    │       │       └── DocumentElement (text rendering)
+    │       │   └── EditorPaneGrid
+    │       │       ├── Editor pane (one per Helix ViewId)
+    │       │       │   ├── TabBar (pane-local tabs and scrolling)
+    │       │       │   └── DocumentView or image viewer
+    │       │       │       └── DocumentElement (text rendering)
+    │       │       └── Split dividers and resize handles
     │       │
     │       ├── NotificationView (stacked notifications)
     │       │   └── Individual Notification Items
@@ -50,6 +54,43 @@ Window
 - Controls layout (file tree visibility, splits)
 - Focus management and restoration
 - Theme application
+
+#### Pane-local tabs
+
+`crates/nucleotide/src/workspace/pane_tabs.rs` stores ordered tab membership,
+image selection and tab-strip scroll state for each Helix `ViewId`. Helix still
+owns the split tree, active document in each view and shared document buffers.
+The workspace reconciles tab membership after both GUI actions and Helix commands.
+
+- A new split starts with the document displayed in that split. Other tabs stay
+  in their original pane.
+- Selecting a tab or using a tab-bar control targets that bar's pane.
+- Drag a tab onto another tab to insert it before that tab, or onto empty bar
+  space to append it. A theme-coloured insertion line marks the destination,
+  including the end of each strip in separate pinned-tab rows. The same gestures
+  reorder tabs within a pane.
+- Drag a tab over another pane's editor body to preview a new split. The nearest
+  edge, measured relative to the pane's width and height, selects its left,
+  right, top or bottom half. A flat theme-colour rectangle at 30% opacity marks
+  the destination while the existing layout stays unchanged.
+- Release over the editor body to divide only that destination into equal
+  halves and move the tab into the highlighted half. Tab-bar drops still
+  reorder or merge tabs. You can also split the source pane when it contains
+  more than one tab, including when no split exists yet. The other tabs stay
+  in the original pane; dragging its only tab over its own body does nothing.
+  Leaving the editor or pressing Escape clears the preview without changing
+  the layout.
+- Transfers remove the source tab and activate it in the destination. If the
+  destination already has that document, it keeps one tab rather than a duplicate.
+- Moving the last tab out closes the empty split without closing its buffer.
+- Closing a tab shared with another pane removes only the local copy. Closing
+  its last copy retains the existing unsaved-change confirmation.
+- Closing a split's only document tab closes that split after any unsaved-change
+  confirmation, rather than showing a file from another pane's history. The final
+  editor pane remains open.
+- Closing a split through Helix returns its otherwise unassigned tabs to the
+  focused pane. Tab context-menu ranges apply to that pane, not the workspace.
+- Image viewers render inside their pane and do not replace the split grid.
 
 #### **DocumentView** (`src/document.rs`)
 - Individual editor view for each split

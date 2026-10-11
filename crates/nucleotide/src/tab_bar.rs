@@ -19,13 +19,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::{TabCloseButtonVisibility, TabClosePosition, TabDiagnosticsVisibility};
-use crate::tab::{Tab, TabId, TabPosition, tab_container_height};
+use crate::tab::{DraggedTab, Tab, TabId, TabPosition, tab_container_height};
 
 /// Type alias for tab event handlers
 type TabEventHandler = Arc<dyn Fn(TabId, &mut Window, &mut App) + 'static>;
 type TabContextMenuHandler = Arc<dyn Fn(TabId, &MouseDownEvent, &mut Window, &mut App) + 'static>;
 type EmptyTabBarClickHandler = Arc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 type TabBarScrollWheelHandler = Arc<dyn Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static>;
+type TabDropHandler = Arc<dyn Fn(&DraggedTab, Option<TabId>, &mut Window, &mut App)>;
 
 const MAX_TAB_TITLE_LEN: usize = 24;
 
@@ -161,6 +162,7 @@ struct TabStripOptions {
     scroll_handle: Option<ScrollHandle>,
     on_empty_double_click: Option<EmptyTabBarClickHandler>,
     on_scroll_wheel: Option<TabBarScrollWheelHandler>,
+    on_drop: Option<TabDropHandler>,
     forced_pin_state: Option<bool>,
     tokens: nucleotide_ui::tokens::DesignTokens,
     border_color: gpui::Hsla,
@@ -213,6 +215,7 @@ pub struct TabBar {
     end_children: Vec<AnyElement>,
     /// Documents whose contents are still being loaded
     loading_documents: HashSet<TabId>,
+    pane_drag_drop: Option<(helix_view::ViewId, TabDropHandler)>,
 }
 
 impl TabBar {
@@ -263,7 +266,17 @@ impl TabBar {
             start_children: Vec::new(),
             end_children: Vec::new(),
             loading_documents: HashSet::new(),
+            pane_drag_drop: None,
         }
+    }
+
+    pub(crate) fn with_pane_drag_drop(
+        mut self,
+        pane: helix_view::ViewId,
+        on_drop: impl Fn(&DraggedTab, Option<TabId>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.pane_drag_drop = Some((pane, Arc::new(on_drop)));
+        self
     }
 
     pub fn loading_documents(mut self, documents: impl IntoIterator<Item = TabId>) -> Self {
@@ -497,12 +510,27 @@ impl RenderOnce for TabBar {
             pinned_count,
         );
 
-        if self.should_render_separate_pinned_row(&documents) {
+        let pane_drag_drop = self.pane_drag_drop.clone();
+        let bar = if self.should_render_separate_pinned_row(&documents) {
             self.render_two_row_tab_bar(pinned_tabs, unpinned_tabs, tokens, &tab_bar_tokens)
         } else {
             self.render_single_row_tab_bar(pinned_tabs, unpinned_tabs, tokens, &tab_bar_tokens)
                 .into_any_element()
-        }
+        };
+        div()
+            .id("pane-tab-drop-target")
+            .w_full()
+            .flex_none()
+            .when_some(pane_drag_drop, |bar, (_, on_drop)| {
+                bar.drag_over::<DraggedTab>(|style, _, _, cx| {
+                    style.bg(cx.theme().tokens.chrome.surface_hover)
+                })
+                .on_drop(move |dragged: &DraggedTab, window, cx| {
+                    on_drop(dragged, None, window, cx);
+                    cx.stop_propagation();
+                })
+            })
+            .child(bar)
     }
 }
 
@@ -596,6 +624,12 @@ impl TabBar {
                     });
                 }
 
+                if let Some((pane, on_drop)) = self.pane_drag_drop.clone() {
+                    tab = tab.with_pane_drag_drop(pane, move |dragged, window, cx| {
+                        on_drop(dragged, Some(doc_id), window, cx);
+                    });
+                }
+
                 tab
             })
             .collect()
@@ -609,11 +643,7 @@ impl TabBar {
         tab_bar_tokens: &nucleotide_ui::tokens::TabBarTokens,
     ) -> gpui::AnyElement {
         let tabbar_bg = tab_bar_tokens.container_background;
-        let border_color = tab_bar_tokens.tab_border;
-        let first_tab_is_active = pinned_tabs
-            .first()
-            .or_else(|| unpinned_tabs.first())
-            .is_some_and(|tab| tab.is_active);
+        let border_color = tab_bar_tokens.tab_separator;
         let active_doc_id = self.active_doc_id;
         let has_active_unpinned_tab = self
             .documents
@@ -638,6 +668,7 @@ impl TabBar {
             scroll_handle,
             on_empty_double_click,
             on_scroll_wheel,
+            on_drop: self.pane_drag_drop.map(|(_, on_drop)| on_drop),
             forced_pin_state: None,
             tokens: *tokens,
             border_color,
@@ -661,8 +692,8 @@ impl TabBar {
                         .gap(tab_bar_control_gap(tokens))
                         .px(tab_bar_control_padding_x())
                         .border_b_1()
+                        .border_r_1()
                         .border_color(border_color)
-                        .when(!first_tab_is_active, |controls| controls.border_r_1())
                         .children(start_children),
                 )
             })
@@ -728,7 +759,6 @@ impl TabBar {
         end_children: Vec<AnyElement>,
         tokens: &nucleotide_ui::tokens::DesignTokens,
         border_color: gpui::Hsla,
-        first_tab_is_active: bool,
     ) -> gpui::AnyElement {
         div()
             .id(id)
@@ -746,8 +776,8 @@ impl TabBar {
                         .gap(tab_bar_control_gap(tokens))
                         .px(tab_bar_control_padding_x())
                         .border_b_1()
+                        .border_r_1()
                         .border_color(border_color)
-                        .when(!first_tab_is_active, |controls| controls.border_r_1())
                         .children(start_children),
                 )
             })
@@ -795,14 +825,14 @@ impl TabBar {
         tab_bar_tokens: &nucleotide_ui::tokens::TabBarTokens,
     ) -> gpui::AnyElement {
         let tabbar_bg = tab_bar_tokens.container_background;
-        let border_color = tab_bar_tokens.tab_border;
+        let border_color = tab_bar_tokens.tab_separator;
         let scroll_handle = self.scroll_handle;
         let on_empty_double_click = self.on_empty_double_click;
         let on_scroll_wheel = self.on_scroll_wheel;
         let start_children = self.start_children;
         let end_children = self.end_children;
         let row_height = tab_container_height(*tokens);
-        let first_pinned_tab_is_active = pinned_tabs.first().is_some_and(|tab| tab.is_active);
+        let on_drop = self.pane_drag_drop.map(|(_, on_drop)| on_drop);
 
         let pinned_strip = Self::render_tab_strip(TabStripOptions {
             id: "pinned-tabs",
@@ -810,6 +840,7 @@ impl TabBar {
             scroll_handle: None,
             on_empty_double_click: on_empty_double_click.clone(),
             on_scroll_wheel: None,
+            on_drop: on_drop.clone(),
             forced_pin_state: Some(true),
             tokens: *tokens,
             border_color,
@@ -820,6 +851,7 @@ impl TabBar {
             scroll_handle,
             on_empty_double_click,
             on_scroll_wheel,
+            on_drop,
             forced_pin_state: Some(false),
             tokens: *tokens,
             border_color,
@@ -841,7 +873,6 @@ impl TabBar {
                 end_children,
                 tokens,
                 border_color,
-                first_pinned_tab_is_active,
             ))
             .child(Self::render_tab_bar_row(
                 "unpinned-tabs-row",
@@ -850,7 +881,6 @@ impl TabBar {
                 Vec::new(),
                 tokens,
                 border_color,
-                false,
             ))
             .into_any_element()
     }
@@ -877,6 +907,7 @@ impl TabBar {
             .children(options.tabs)
             .child(Self::render_end_drop_target(
                 options.on_empty_double_click,
+                options.on_drop,
                 options.forced_pin_state,
                 options.tokens,
                 options.border_color,
@@ -886,6 +917,7 @@ impl TabBar {
 
     fn render_end_drop_target(
         on_empty_double_click: Option<EmptyTabBarClickHandler>,
+        on_drop: Option<TabDropHandler>,
         forced_pin_state: Option<bool>,
         tokens: nucleotide_ui::tokens::DesignTokens,
         border_color: gpui::Hsla,
@@ -906,6 +938,18 @@ impl TabBar {
             );
 
         target
+            .when_some(on_drop, |target, on_drop| {
+                target
+                    .drag_over::<DraggedTab>(|style, _, _, cx| {
+                        style
+                            .border_l_2()
+                            .border_color(cx.theme().tokens.chrome.border_focus)
+                    })
+                    .on_drop(move |dragged: &DraggedTab, window, cx| {
+                        on_drop(dragged, None, window, cx);
+                        cx.stop_propagation();
+                    })
+            })
             .when_some(on_empty_double_click, |target, handler| {
                 target.on_click(move |event, window, cx| {
                     if event.click_count() >= 2 {

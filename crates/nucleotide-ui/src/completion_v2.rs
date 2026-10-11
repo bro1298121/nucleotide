@@ -2090,8 +2090,7 @@ impl Render for CompletionView {
             "Completion view render completed"
         );
         container
-            .absolute()
-            // Remove hardcoded positioning - parent will handle this
+            // Remain in flow so the parent can measure the popup before anchoring it.
             .child(
                 div()
                     .id("completion-popup-layout")
@@ -2302,14 +2301,6 @@ impl Render for CompletionView {
                                                         let is_selected =
                                                             index == self.selected_index;
 
-                                                        // Add explicit ID for scroll-to-element functionality
-                                                        let completion_element =
-                                                            CompletionItemElement::new(
-                                                                item.clone(),
-                                                                string_match.clone(),
-                                                                is_selected,
-                                                            );
-
                                                         // Wrap in div with ID for scroll targeting
                                                         Some(
                                                             div()
@@ -2319,17 +2310,34 @@ impl Render for CompletionView {
                                                                 ))
                                                                 .w_full()
                                                                 .child(
-                                                                    completion_element
-                                                                        .compact()
-                                                                        .into_element_with_theme(
-                                                                            theme,
-                                                                        ),
+                                                                    CompletionItemElement::new(
+                                                                        item.clone(),
+                                                                        string_match.clone(),
+                                                                        is_selected,
+                                                                    )
+                                                                    .compact()
+                                                                    .into_element_with_theme(theme),
                                                                 ),
                                                         )
                                                     })
                                                     .collect::<Vec<_>>()
                                             }),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .border_t_1()
+                                    .border_color(tokens.chrome.popup_border)
+                                    .mt(tokens.sizes.space_1)
+                                    .px(tokens.sizes.space_2)
+                                    .py(tokens.sizes.space_2)
+                                    .text_size(tokens.sizes.text_sm)
+                                    .text_color(tokens.chrome.text_chrome_secondary)
+                                    .child(format!(
+                                        "{} suggestion{}",
+                                        filtered_entries.len(),
+                                        if filtered_entries.len() == 1 { "" } else { "s" }
+                                    )),
                             ),
                     )
                     .when_some(selected_documentation, |layout, documentation| {
@@ -3037,6 +3045,43 @@ mod tests {
                 view.select_prev(_cx);
                 assert_eq!(view.selected_index, 0, "Should move back to first item");
             });
+        }
+
+        #[gpui::test]
+        fn completion_popup_is_measurable_and_snaps_inside_window(cx: &mut TestAppContext) {
+            use gpui::{
+                Anchor, AppContext as _, InteractiveElement as _, IntoElement as _,
+                ParentElement as _, anchored, point,
+            };
+            cx.update(|cx| cx.set_global(crate::Theme::from_tokens(crate::DesignTokens::dark())));
+            let completion = cx.new(|cx| {
+                let mut view = CompletionView::new(cx);
+                view.set_items_with_filter(vec![CompletionItem::new("alphaGeometry")], None, cx);
+                view
+            });
+            let window = cx.add_empty_window();
+            let viewport = window.update(|window, _| window.viewport_size());
+            window.draw(point(px(0.0), px(0.0)), viewport, |_, _| {
+                anchored()
+                    .anchor(Anchor::TopLeft)
+                    .position(point(viewport.width - px(30.0), px(40.0)))
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(
+                        div()
+                            .debug_selector(|| "completion-measured".into())
+                            .child(completion.clone()),
+                    )
+                    .into_element()
+            });
+            let bounds = window.debug_bounds("completion-measured").unwrap();
+            assert!(bounds.size.width >= px(220.0));
+            assert!(bounds.size.height > px(0.0));
+            // Anchored rounds the origin to whole pixels, while text widths may be fractional.
+            assert!(
+                bounds.right() <= viewport.width - px(7.0),
+                "popup={bounds:?}, viewport={viewport:?}"
+            );
+            assert_eq!(bounds.top(), px(40.0));
         }
 
         #[gpui::test]

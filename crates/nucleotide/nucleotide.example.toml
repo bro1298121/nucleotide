@@ -31,15 +31,24 @@ auto_download = false
 mode = "system"
 
 # Theme used when light appearance is active. Default: "nucleotide-sandcastle".
+# Try "nucleotide-paper" for Warm Paper's quieter ivory palette.
 light_theme = "nucleotide-sandcastle"
 
 # Theme used when dark appearance is active. Default: "nucleotide-teal".
+# "nucleotide-teal" is Refined Teal; "nucleotide-graphite" is Graphite Studio.
+# Switch immediately with :theme <name> in the editor command prompt.
 dark_theme = "nucleotide-teal"
 
 [window]
 # Enable blur/vibrancy for dark themes where the platform supports it.
 # Default: false.
 blur_dark_themes = false
+
+# Chrome background opacity, from 0.0 to 1.0. Default: 1.0 (opaque).
+# Try 0.92 for subtle translucency in titlebar, file tree, tabs and status bar.
+# Text, code, terminal content and floating pickers/completion stay opaque.
+# Desktop transparency needs compositor support; blur is platform-dependent.
+chrome_opacity = 1.0
 
 # Update the native window appearance when the theme changes. Default: true.
 appearance_follows_theme = true
@@ -195,6 +204,10 @@ show_tab_bar_buttons = true
 show_pinned_tabs_in_separate_row = false
 
 [tabs]
+# Tabs use flat, contiguous surfaces with subtle separators and a bottom accent
+# on the active tab. Unsaved dots and diagnostic markers sit after the label;
+# the configured close or pin control remains separate from these indicators.
+
 # Show git status decorations on tabs. Default: false.
 git_status = false
 

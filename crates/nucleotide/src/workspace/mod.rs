@@ -1,6 +1,7 @@
 // ABOUTME: Workspace module decomposition for cleaner architecture
 // ABOUTME: Separates view management from workspace coordination logic
 
+mod pane_tabs;
 pub mod prefix_extraction;
 mod split_resize;
 pub mod view_manager;
@@ -51,8 +52,8 @@ use nucleotide_ui::scrollbar::{Scrollbar, ScrollbarState};
 use nucleotide_ui::{
     AboutWindow, Button, ButtonSize, ButtonVariant, ConfirmDialog, ConfirmDialogEvent,
     ConfirmDialogView, ContextMenuController, EditorPaneGrid, IndeterminateProgressIndicator,
-    MarkdownStyle, ModalLayer, PopupMenu, PopupMenuSurface, StateView, StatusBar, Tooltipped,
-    completion_menu_action_for_key, markdown_extended,
+    MarkdownStyle, ModalLayer, PopupMenu, PopupMenuSurface, StateView, StatusBar, Toolbar,
+    Tooltipped, completion_menu_action_for_key, markdown_extended,
 };
 
 use crate::input_coordinator::{InputContext, InputCoordinator};
@@ -76,7 +77,7 @@ use crate::remote_open::{
     RemoteOpenRequest, RemoteOpenTarget, RemoteOpenTargetKind, parse_remote_open_input,
     parse_remote_open_request,
 };
-use crate::tab::TabId;
+use crate::tab::{DraggedTab, TabId};
 use crate::types::{
     EditorStatus, GlobalSearchLocation, HoverDocEntry, RegexSelectionAction, Severity,
 };
@@ -991,7 +992,6 @@ pub struct Workspace {
     notifications: Entity<NotificationView>,
     last_notified_editor_status: Option<EditorStatus>,
     focus_handle: FocusHandle,
-    needs_focus_restore: bool,
     statusbar_lsp_focus: FocusHandle,
     statusbar_file_tree_focus: FocusHandle,
     statusbar_terminal_focus: FocusHandle,
@@ -1012,9 +1012,8 @@ pub struct Workspace {
     needs_appearance_update: bool,
     needs_window_appearance_update: bool,
     pending_appearance: Option<gpui::WindowAppearance>,
-    tab_bar_scroll_handle: ScrollHandle,
-    last_scrolled_tab_doc_id: Option<TabId>,
-    suppress_tab_bar_auto_scroll: bool,
+    pane_tabs: pane_tabs::PaneTabState,
+    pane_drop_target: Option<(ViewId, pane_tabs::PaneDropEdge)>,
     image_tabs: Vec<ImageTab>,
     active_image_tab_id: Option<u64>,
     next_image_tab_index: u64,
@@ -1034,7 +1033,6 @@ pub struct Workspace {
     tab_bar_split_menu: ContextMenuController,
     tab_bar_split_popup_menu: Option<Entity<PopupMenu>>,
     tab_bar_split_popup_menu_subscription: Option<Subscription>,
-    tab_bar_split_button_bounds: Option<Bounds<Pixels>>,
     split_pane_resize: Option<SplitPaneResizeState>,
     // Tab bar new item menu state
     tab_bar_new_menu: ContextMenuController,
@@ -1094,8 +1092,6 @@ pub struct Workspace {
     embedded_terminal_panel: Option<gpui::Entity<nucleotide_terminal_panel::TerminalPanel>>,
     // Cwd used to spawn the active terminal session.
     terminal_cwd: Option<PathBuf>,
-    // Request to focus terminal on next render (when toggled on via button)
-    terminal_focus_pending: bool,
     // Cache last applied editor size to avoid redundant resizes each frame
     last_editor_size: Option<(u16, u16)>,
     last_terminal_bounds: Option<(TerminalId, TerminalBounds)>,
@@ -1162,10 +1158,38 @@ struct ActiveCompletionSession {
     doc_id: DocumentId,
     view_id: ViewId,
     document_version: i32,
+    document_text: Rope,
+    prefix_range: std::ops::Range<usize>,
     is_incomplete: bool,
     incomplete_server_ids: Vec<u64>,
     retained_items: Vec<nucleotide_events::completion::CompletionItem>,
     requested_prefix: String,
+}
+
+impl ActiveCompletionSession {
+    /// Only edits to the active word prefix may reuse these candidates and ranges.
+    fn prefix_change(&self, text: &Rope, cursor: usize) -> Option<helix_core::Transaction> {
+        let start = self.prefix_range.start;
+        if cursor < start || cursor > text.len_chars() || start > text.len_chars() {
+            return None;
+        }
+        let prefix = text.slice(start..cursor);
+        if !prefix.chars().all(helix_core::chars::char_is_word)
+            || text.slice(..start) != self.document_text.slice(..start)
+            || text.slice(cursor..) != self.document_text.slice(self.prefix_range.end..)
+        {
+            return None;
+        }
+        Some(helix_core::Transaction::change(
+            &self.document_text,
+            [(
+                start,
+                self.prefix_range.end,
+                Some(prefix.to_string().into()),
+            )]
+            .into_iter(),
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1173,6 +1197,7 @@ struct CompletionAcceptTarget {
     doc_id: DocumentId,
     view_id: ViewId,
     document_version: i32,
+    source_version: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2972,7 +2997,7 @@ impl Workspace {
         let id = self.spawn_terminal_session_with_input(cwd, extra_env, initial_input, cx);
         self.set_embedded_terminal_panel(id, cx);
         self.terminal_panel_visible = true;
-        self.terminal_focus_pending = true;
+        self.defer_focus_terminal(cx);
         cx.notify();
         id
     }
@@ -2991,16 +3016,14 @@ impl Workspace {
         let id = self.spawn_terminal_command_session(cwd, program, args, extra_env, cx);
         self.set_embedded_terminal_panel(id, cx);
         self.terminal_panel_visible = true;
-        self.terminal_focus_pending = true;
+        self.defer_focus_terminal(cx);
         cx.notify();
         id
     }
 
     fn hide_terminal_panel(&mut self, cx: &mut Context<Self>) {
         self.terminal_panel_visible = false;
-        self.terminal_focus_pending = false;
         self.last_terminal_bounds = None;
-        self.needs_focus_restore = true;
         if let Some(focus) = self.terminal_focus_handle(cx)
             && let Some(coordinator) = cx.try_global::<nucleotide_ui::FocusCoordinator>().cloned()
         {
@@ -3053,7 +3076,6 @@ impl Workspace {
             if let Some(activity_id) = self.active_run_activity.take() {
                 self.finish_background_activity(activity_id, cx);
             }
-            self.terminal_focus_pending = false;
             let status_message = match (status, code) {
                 (RunStatus::Finished, Some(0) | None) => "Runnable finished".to_string(),
                 (RunStatus::Failed, Some(exit_code)) => {
@@ -3211,8 +3233,7 @@ impl Workspace {
 
         self.terminal_panel_visible = true;
         self.register_terminal_focus(cx);
-        // Ask render to focus the terminal on the next frame
-        self.terminal_focus_pending = true;
+        self.defer_focus_terminal(cx);
         cx.notify();
     }
 
@@ -3783,9 +3804,7 @@ impl Workspace {
         &self,
         metadata: &StatusBarDocumentMetadata,
         status_bar_tokens: &nucleotide_ui::tokens::StatusBarTokens,
-        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let notification_tokens = cx.theme().tokens.notification_tokens();
         div()
             .h_full()
             .px_2()
@@ -3802,7 +3821,7 @@ impl Workspace {
                         svg()
                             .path("icons/triangle-alert.svg")
                             .size(px(12.0))
-                            .text_color(notification_tokens.warning_text),
+                            .text_color(status_bar_tokens.warning),
                     )
                     .child(metadata.warnings.to_string()),
             )
@@ -3815,7 +3834,7 @@ impl Workspace {
                         svg()
                             .path("icons/circle-x.svg")
                             .size(px(12.0))
-                            .text_color(notification_tokens.error_text),
+                            .text_color(status_bar_tokens.error),
                     )
                     .child(metadata.errors.to_string()),
             )
@@ -3858,7 +3877,6 @@ impl Workspace {
         model: &StatusBarModel,
         geometry: StatusBarGeometry,
         status_bar_tokens: &nucleotide_ui::tokens::StatusBarTokens,
-        border_radius: Pixels,
     ) -> gpui::AnyElement {
         let (mode_color, mode_text) = match model.mode {
             helix_view::document::Mode::Normal => (
@@ -3883,13 +3901,11 @@ impl Workspace {
             .justify_center()
             .child(
                 div()
-                    .min_w(px(60.0))
-                    .h(px(22.0))
+                    .size_full()
                     .px_2()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(border_radius)
                     .bg(mode_color)
                     .text_color(mode_text)
                     .font_weight(FontWeight::MEDIUM)
@@ -4049,7 +4065,6 @@ impl Workspace {
         model: &StatusBarModel,
         geometry: StatusBarGeometry,
         status_bar_tokens: &nucleotide_ui::tokens::StatusBarTokens,
-        button_border_radius: Pixels,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let mut context = div().flex_none().h_full().flex().items_center();
@@ -4091,12 +4106,9 @@ impl Workspace {
         ));
 
         if model.density == StatusBarDensity::Wide {
-            if let Some(vcs_ref) = model.vcs_ref.as_ref() {
-                context = context.child(self.statusbar_vcs_item(vcs_ref, status_bar_tokens));
-            }
             if let Some(metadata) = model.document_metadata.as_ref() {
                 context =
-                    context.child(self.statusbar_diagnostics_item(metadata, status_bar_tokens, cx));
+                    context.child(self.statusbar_diagnostics_item(metadata, status_bar_tokens));
             }
         }
 
@@ -4107,12 +4119,12 @@ impl Workspace {
             .flex_row()
             .items_center()
             .h_full()
-            .child(self.statusbar_mode_item(
-                model,
-                geometry,
-                status_bar_tokens,
-                button_border_radius,
-            ))
+            .child(self.statusbar_mode_item(model, geometry, status_bar_tokens))
+            .when(model.density == StatusBarDensity::Wide, |content| {
+                content.when_some(model.vcs_ref.as_ref(), |content, vcs_ref| {
+                    content.child(self.statusbar_vcs_item(vcs_ref, status_bar_tokens))
+                })
+            })
             .child(
                 div()
                     .flex_1()
@@ -4429,6 +4441,189 @@ impl Workspace {
         self.tab_bar_document_generation = self.tab_bar_document_generation.wrapping_add(1);
     }
 
+    fn sync_pane_tabs(&mut self, cx: &Context<Self>) {
+        let editor = &self.core.read(cx).editor;
+        let views = editor
+            .tree
+            .views()
+            .map(|(view, _)| (view.id, view.doc))
+            .collect::<Vec<_>>();
+        let mut available = self
+            .document_order
+            .iter()
+            .copied()
+            .filter(|id| editor.documents.contains_key(id))
+            .map(TabId::Document)
+            .collect::<Vec<_>>();
+        available.extend(
+            editor
+                .documents
+                .keys()
+                .copied()
+                .map(TabId::Document)
+                .filter(|id| {
+                    !self
+                        .document_order
+                        .iter()
+                        .any(|doc| TabId::Document(*doc) == *id)
+                }),
+        );
+        available.extend(self.image_tabs.iter().map(|tab| TabId::Image(tab.id)));
+        self.pane_tabs.sync(
+            &views,
+            editor.tree.focus,
+            &available,
+            &mut self.active_image_tab_id,
+        );
+    }
+
+    fn focus_tab_pane(&mut self, pane: ViewId, cx: &mut Context<Self>) {
+        let handle = self.handle.clone();
+        self.core.update(cx, |core, _| {
+            let _guard = handle.enter();
+            if core.editor.tree.contains(pane) {
+                core.editor.focus(pane);
+            }
+        });
+        self.sync_pane_tabs(cx);
+        self.update_document_views(cx);
+    }
+
+    fn split_pane_tab(
+        &mut self,
+        dragged: &DraggedTab,
+        target: ViewId,
+        edge: pane_tabs::PaneDropEdge,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_pane_tabs(cx);
+        if !self.pane_tabs.panes.contains_key(&target)
+            || !self.pane_tabs.panes.get(&dragged.pane).is_some_and(|pane| {
+                pane.tabs.contains(&dragged.tab) && (dragged.pane != target || pane.tabs.len() > 1)
+            })
+        {
+            return;
+        }
+        let handle = self.handle.clone();
+        let destination = self.core.update(cx, |core, _| {
+            let _guard = handle.enter();
+            let document = match dragged.tab {
+                TabId::Document(doc) => doc,
+                TabId::Image(_) => core.editor.tree.get(target).doc,
+            };
+            core.editor.focus(target);
+            core.editor.switch(document, edge.split_action());
+            core.editor.tree.focus
+        });
+        self.move_pane_tab(dragged.pane, destination, dragged.tab, None, cx);
+        // An image's Helix view needs a backing document, not an extra visible tab.
+        if matches!(dragged.tab, TabId::Image(_)) {
+            self.pane_tabs.panes.get_mut(&destination).unwrap().tabs = vec![dragged.tab];
+        }
+    }
+
+    fn move_pane_tab(
+        &mut self,
+        source: ViewId,
+        target: ViewId,
+        tab: TabId,
+        before: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_pane_tabs(cx);
+        let source_active = self.pane_tabs.panes.get(&source).map(|pane| pane.active());
+        if !self.pane_tabs.move_tab(source, target, tab, before) {
+            return;
+        }
+        // Dragging a preview is an explicit decision to keep it open.
+        if let TabId::Document(doc) = tab {
+            self.unregister_preview_document(doc, cx);
+        }
+        let replacement = self.pane_tabs.panes[&source].tabs.first().copied();
+        let source_empty = self.pane_tabs.panes[&source].tabs.is_empty();
+        let handle = self.handle.clone();
+        self.core.update(cx, |core, cx| {
+            let _guard = handle.enter();
+            // Display the buffer in its destination before replacing the source:
+            // Helix otherwise discards an undisplayed, empty scratch buffer.
+            core.editor.focus(target);
+            if let TabId::Document(doc) = tab {
+                core.editor.switch(doc, helix_view::editor::Action::Replace);
+            }
+            if source != target {
+                if source_empty {
+                    core.editor.close(source);
+                } else if source_active == Some(tab) {
+                    core.editor.focus(source);
+                    if let Some(TabId::Document(doc)) = replacement {
+                        core.editor.switch(doc, helix_view::editor::Action::Replace);
+                    }
+                }
+            }
+            core.editor.focus(target);
+            cx.emit(crate::Update::Redraw);
+        });
+        if source != target && source_active == Some(tab) {
+            self.pane_tabs.panes.get_mut(&source).unwrap().active_image = match replacement {
+                Some(TabId::Image(id)) => Some(id),
+                _ => None,
+            };
+        }
+        self.pane_tabs.panes.get_mut(&target).unwrap().active_image = match tab {
+            TabId::Image(id) => Some(id),
+            _ => None,
+        };
+        self.active_image_tab_id = self.pane_tabs.panes[&target].active_image;
+        self.allow_tab_bar_auto_scroll();
+        self.update_document_views(cx);
+        cx.notify();
+    }
+
+    /// Closing a copy in one split must not unload a buffer used by another.
+    fn detach_shared_pane_tab(
+        &mut self,
+        pane_id: ViewId,
+        tab: TabId,
+        activation: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self
+            .pane_tabs
+            .panes
+            .iter()
+            .any(|(id, pane)| *id != pane_id && pane.tabs.contains(&tab))
+        {
+            return false;
+        }
+        let pane = self.pane_tabs.panes.get_mut(&pane_id).unwrap();
+        let was_active = pane.active() == tab;
+        pane.tabs.retain(|id| *id != tab);
+        let replacement = activation
+            .filter(|id| pane.tabs.contains(id))
+            .or_else(|| pane.tabs.first().copied());
+        if was_active {
+            pane.active_image = match replacement {
+                Some(TabId::Image(id)) => Some(id),
+                _ => None,
+            };
+            self.active_image_tab_id = pane.active_image;
+        }
+        let handle = self.handle.clone();
+        self.core.update(cx, |core, cx| {
+            let _guard = handle.enter();
+            if replacement.is_none() {
+                core.editor.close(pane_id);
+            } else if was_active && let Some(TabId::Document(doc)) = replacement {
+                core.editor.focus(pane_id);
+                core.editor.switch(doc, helix_view::editor::Action::Replace);
+            }
+            cx.emit(crate::Update::Redraw);
+        });
+        self.update_document_views(cx);
+        cx.notify();
+        true
+    }
+
     fn invalidate_tab_bar_document_if_presentation_changed(
         &mut self,
         doc_id: DocumentId,
@@ -4520,6 +4715,7 @@ impl Workspace {
 
         self.invalidate_tab_bar_documents();
         self.allow_tab_bar_auto_scroll();
+        self.sync_pane_tabs(cx);
 
         if let Some(file_tree) = &self.file_tree {
             file_tree.update(cx, |tree, cx| {
@@ -4528,7 +4724,7 @@ impl Workspace {
         }
 
         if should_focus {
-            self.needs_focus_restore = false;
+            self.defer_focus_editor(cx);
         }
 
         cx.notify();
@@ -4540,6 +4736,7 @@ impl Workspace {
             self.active_image_tab_id = Some(image_id);
             self.invalidate_tab_bar_documents();
             self.allow_tab_bar_auto_scroll();
+            self.sync_pane_tabs(cx);
             cx.notify();
         }
     }
@@ -4554,6 +4751,10 @@ impl Workspace {
     fn visible_tab_document_ids(&self, cx: &mut Context<Self>) -> Vec<TabId> {
         let core = self.core.read(cx);
         let editor = &core.editor;
+
+        if let Some(pane) = self.pane_tabs.panes.get(&editor.tree.focus) {
+            return zed_style_tab_order(&pane.tabs, &self.pinned_documents);
+        }
 
         let mut visible_doc_ids = self
             .document_order
@@ -4713,6 +4914,10 @@ impl Workspace {
     fn close_tab_ids(&mut self, tab_ids: impl IntoIterator<Item = TabId>, cx: &mut Context<Self>) {
         let mut document_ids = Vec::new();
         for tab_id in tab_ids {
+            let pane = self.core.read(cx).editor.tree.focus;
+            if self.detach_shared_pane_tab(pane, tab_id, None, cx) {
+                continue;
+            }
             match tab_id {
                 TabId::Document(doc_id) => document_ids.push(doc_id),
                 TabId::Image(image_id) => self.close_image_tab(image_id, None, cx),
@@ -4745,6 +4950,10 @@ impl Workspace {
         activation_target: Option<TabId>,
         cx: &mut Context<Self>,
     ) {
+        let pane = self.core.read(cx).editor.tree.focus;
+        if self.detach_shared_pane_tab(pane, TabId::Image(image_id), activation_target, cx) {
+            return;
+        }
         let Some(index) = self.image_tabs.iter().position(|tab| tab.id == image_id) else {
             return;
         };
@@ -4773,12 +4982,50 @@ impl Workspace {
         force: bool,
         cx: &mut Context<Self>,
     ) {
+        let pane = self.core.read(cx).editor.tree.focus;
+        if self.detach_shared_pane_tab(pane, TabId::Document(doc_id), activation_target, cx) {
+            return;
+        }
+        let close_pane = self
+            .pane_tabs
+            .panes
+            .get(&pane)
+            .is_some_and(|pane| pane.tabs == [TabId::Document(doc_id)])
+            && self.core.read(cx).editor.tree.views().count() > 1;
         let handle = self.handle.clone();
         let (closed, close_status, modified_name) = self.core.update(cx, |core, cx| {
             let _guard = handle.enter();
 
-            match core.editor.close_document(doc_id, force) {
+            // Switch within the same pane before unloading its active buffer.
+            // Helix otherwise may close the view and focus a different split.
+            let can_close = core
+                .editor
+                .documents
+                .get(&doc_id)
+                .is_some_and(|doc| force || !doc.is_modified());
+            let mut removed_empty_scratch = false;
+            if can_close
+                && core.editor.tree.get(core.editor.tree.focus).doc == doc_id
+                && let Some(TabId::Document(target)) = activation_target
+                && target != doc_id
+                && core.editor.documents.contains_key(&target)
+            {
+                core.editor
+                    .switch(target, helix_view::editor::Action::Replace);
+                removed_empty_scratch = !core.editor.documents.contains_key(&doc_id);
+            }
+            let result = if removed_empty_scratch {
+                Ok(())
+            } else {
+                core.editor.close_document(doc_id, force)
+            };
+            match result {
                 Ok(()) => {
+                    // Inherited Helix history must not keep an empty split alive.
+                    // Wait for success so unsaved buffers retain their pane.
+                    if close_pane && core.editor.tree.contains(pane) {
+                        core.editor.close(pane);
+                    }
                     if let Some(TabId::Document(target_doc_id)) = activation_target
                         && core.editor.documents.contains_key(&target_doc_id)
                     {
@@ -4895,7 +5142,13 @@ impl Workspace {
     }
 
     fn allow_tab_bar_auto_scroll(&mut self) {
-        self.suppress_tab_bar_auto_scroll = false;
+        if let Some(pane) = self
+            .pane_tabs
+            .focused
+            .and_then(|id| self.pane_tabs.panes.get_mut(&id))
+        {
+            pane.suppress_auto_scroll = false;
+        }
     }
 
     fn active_document_and_view(&self, cx: &mut Context<Self>) -> Option<(DocumentId, ViewId)> {
@@ -5413,7 +5666,7 @@ impl Workspace {
             self.execute_raw_command(command, cx);
         }
         if self.view_manager.focused_view_id().is_some() {
-            self.needs_focus_restore = true;
+            self.defer_focus_editor(cx);
         }
         cx.notify();
     }
@@ -5518,21 +5771,25 @@ impl Workspace {
         info: Entity<InfoBoxView>,
         input_coordinator: Arc<InputCoordinator>,
         update_controller: Entity<UpdateController>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        let modal_layer = cx.new(|_| ModalLayer::new());
+        cx.observe_in(&modal_layer, window, |workspace, _layer, window, cx| {
+            workspace.sync_confirmation_modal(window, cx);
+        })
+        .detach();
         // Register editor focus with the global coordinator for centralized focus handling
         if let Some(coord) = cx.try_global::<nucleotide_ui::FocusCoordinator>().cloned() {
             coord.set_editor_focus(focus_handle.clone());
         }
 
-        // Subscribe to overlay dismiss events to restore focus
+        // Only removal of the focused surface restores focus (see on_focus_lost below).
+        // Completion dismissals also emit this event, but never own keyboard focus.
         cx.subscribe(
             &overlay,
             |workspace, _overlay, _event: &DismissEvent, cx| {
-                // Mark that we need to restore focus in the next render
-                workspace.needs_focus_restore = true;
-
                 // Check if completion was dismissed and manage context
                 let has_completion = workspace.overlay.read(cx).has_completion();
                 workspace.manage_completion_context(has_completion);
@@ -5566,9 +5823,22 @@ impl Workspace {
         .detach();
 
         // Subscribe to core (Application) events to receive Update events
-        cx.subscribe(&core, |workspace, _core, event: &crate::Update, cx| {
-            debug!("Workspace: Received Update event from core: {:?}", event);
-            workspace.handle_event(event, cx);
+        cx.subscribe_in(
+            &core,
+            window,
+            |workspace, _core, event: &crate::Update, _window, cx| {
+                debug!("Workspace: Received Update event from core: {:?}", event);
+                workspace.handle_event(event, cx);
+            },
+        )
+        .detach();
+
+        cx.on_focus_lost(window, |workspace, window, cx| {
+            if !workspace.overlay.read(cx).has_focusable_overlay()
+                && !workspace.modal_layer.read(cx).has_active_modal()
+            {
+                workspace.focus_editor(window, cx);
+            }
         })
         .detach();
 
@@ -5682,14 +5952,13 @@ impl Workspace {
             view_manager: ViewManager::new(),
             handle,
             overlay,
-            modal_layer: cx.new(|_| ModalLayer::new()),
+            modal_layer,
             info,
             info_hidden: true,
             key_hints,
             notifications,
             last_notified_editor_status: None,
             focus_handle,
-            needs_focus_restore: false,
             statusbar_lsp_focus: cx.focus_handle(),
             statusbar_file_tree_focus: cx.focus_handle(),
             statusbar_terminal_focus: cx.focus_handle(),
@@ -5710,9 +5979,8 @@ impl Workspace {
             needs_appearance_update: false,
             needs_window_appearance_update: false,
             pending_appearance: None,
-            tab_bar_scroll_handle: ScrollHandle::new(),
-            last_scrolled_tab_doc_id: None,
-            suppress_tab_bar_auto_scroll: false,
+            pane_tabs: pane_tabs::PaneTabState::default(),
+            pane_drop_target: None,
             image_tabs: Vec::new(),
             active_image_tab_id: None,
             next_image_tab_index: 1,
@@ -5729,7 +5997,6 @@ impl Workspace {
             tab_bar_split_menu: ContextMenuController::new(),
             tab_bar_split_popup_menu: None,
             tab_bar_split_popup_menu_subscription: None,
-            tab_bar_split_button_bounds: None,
             split_pane_resize: None,
             tab_bar_new_menu: ContextMenuController::new(),
             tab_bar_new_popup_menu: None,
@@ -5784,7 +6051,6 @@ impl Workspace {
             basic_terminal_height: 220.0,
             embedded_terminal_panel: None,
             terminal_cwd: None,
-            terminal_focus_pending: false,
             // Performance cache for editor sizing
             last_editor_size: None,
             last_terminal_bounds: None,
@@ -5809,18 +6075,13 @@ impl Workspace {
         // Compute initial theme-derived colors once
         workspace.recompute_theme_colors(cx);
 
-        // Set initial focus restore state
-        workspace.needs_focus_restore = true;
-
         // Note: Completion handling is now done directly via event-driven approach
 
         // Initialize document views
         workspace.update_document_views(cx);
 
-        // Auto-focus the first document view on startup
-        if workspace.view_manager.focused_view_id().is_some() {
-            workspace.needs_focus_restore = true;
-        }
+        // Establish the initial keyboard owner after workspace construction.
+        workspace.defer_focus_editor(cx);
 
         // Setup LSP state subscription for project status updates
         workspace.setup_lsp_state_subscription(cx);
@@ -5883,6 +6144,7 @@ impl Workspace {
             .any(|document| document.is_modified());
         if has_modified_buffers {
             self.update_restart_confirm_open = true;
+            self.defer_confirmation_modal(cx);
             cx.notify();
         } else {
             self.prepare_and_arm_update_restart(cx);
@@ -5967,6 +6229,7 @@ impl Workspace {
     ) {
         self.close_confirm = Some(UnsavedCloseConfirmation { action, names });
         self.close_confirm_open = true;
+        self.defer_confirmation_modal(cx);
         cx.notify();
     }
 
@@ -6000,6 +6263,7 @@ impl Workspace {
         match delete_confirmation_required(delete_mode) {
             true => {
                 self.delete_confirm_open = true;
+                self.defer_confirmation_modal(cx);
                 cx.notify();
             }
             false => self.perform_delete_confirm(cx),
@@ -6104,11 +6368,23 @@ impl Workspace {
         }
     }
 
+    fn defer_confirmation_modal(&self, cx: &mut Context<Self>) {
+        let workspace = cx.weak_entity();
+        cx.defer(move |cx| {
+            cx.with_window(workspace.entity_id(), |window, cx| {
+                let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.sync_confirmation_modal(window, cx);
+                });
+            });
+        });
+    }
+
     fn render_documentation_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let tokens = &cx.theme().tokens;
         let gui_config = &self.core.read(cx).config.gui;
         let file_tree_tokens = file_tree_tokens_for_gui_config(tokens, gui_config);
-        let markdown_style = MarkdownStyle::from_tokens(tokens).compact();
+        let mut markdown_style = MarkdownStyle::from_tokens(tokens);
+        markdown_style.body_font_size = tokens.sizes.text_base;
 
         let mut body = div()
             .id("documentation-sidebar-body")
@@ -6118,8 +6394,8 @@ impl Workspace {
             .min_h(px(0.0))
             .overflow_y_scroll()
             .track_scroll(&self.doc_sidebar_scroll_handle)
-            .px(tokens.sizes.space_3)
-            .py(tokens.sizes.space_3)
+            .px(tokens.sizes.space_4)
+            .py(tokens.sizes.space_4)
             .gap(tokens.sizes.space_4);
 
         if self.doc_sidebar_loading {
@@ -6201,17 +6477,13 @@ impl Workspace {
             .text_color(file_tree_tokens.item_text)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
-                div()
-                    .h(tokens.sizes.space_8)
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px(tokens.sizes.space_3)
-                    .border_b_1()
+                Toolbar::new("documentation-sidebar-header")
+                    .height(crate::tab::tab_container_height(*tokens))
                     .border_color(file_tree_tokens.separator)
                     .child(
                         div()
                             .flex()
+                            .flex_1()
                             .items_center()
                             .gap(tokens.sizes.space_2)
                             .text_sm()
@@ -6220,35 +6492,23 @@ impl Workspace {
                             .child(
                                 svg()
                                     .path("icons/book-text.svg")
-                                    .size(px(14.0))
+                                    .size(tokens.sizes.space_4)
                                     .text_color(file_tree_tokens.item_text)
                                     .flex_shrink_0(),
                             )
                             .child("Documentation"),
                     )
                     .child(
-                        div()
-                            .id("documentation-sidebar-close")
-                            .size(tokens.sizes.space_6)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(tokens.sizes.radius_sm)
-                            .cursor_pointer()
-                            .hover(move |button| button.bg(file_tree_tokens.item_background_hover))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|workspace, _event, _window, cx| {
-                                    workspace.close_documentation_sidebar(cx);
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .child(
-                                svg()
-                                    .path("icons/close.svg")
-                                    .size(px(12.0))
-                                    .text_color(file_tree_tokens.item_text_secondary),
-                            ),
+                        Button::icon_only("documentation-sidebar-close", "icons/close.svg")
+                            .variant(ButtonVariant::Ghost)
+                            .size(ButtonSize::ExtraSmall)
+                            .tooltip("Close Documentation")
+                            .aria_label("Close documentation sidebar")
+                            .activate_on_mouse_down()
+                            .on_click(cx.listener(|workspace, _event, _window, cx| {
+                                workspace.close_documentation_sidebar(cx);
+                                cx.stop_propagation();
+                            })),
                     ),
             )
             .child(body_container)
@@ -6689,7 +6949,7 @@ impl Workspace {
         let finished_resize = self.split_pane_resize.take().is_some();
 
         if finished_resize && self.view_manager.focused_view_id().is_some() {
-            self.needs_focus_restore = true;
+            self.focus_editor(window, cx);
         }
 
         if finished_resize || stopped_drag {
@@ -6783,7 +7043,7 @@ impl Workspace {
         });
 
         if self.view_manager.focused_view_id().is_some() {
-            self.needs_focus_restore = true;
+            self.defer_focus_editor(cx);
         }
         cx.notify();
     }
@@ -7066,27 +7326,24 @@ impl Workspace {
             return false;
         };
 
+        // Capture-phase completion actions bypass the document's key handler.
+        // Restore and reset native preedit before accepting or navigating the menu.
+        if let Some(view) = self.view_manager.get_focused_document_view() {
+            view.update(cx, |view, cx| view.cancel_native_composition(cx));
+        }
         self.overlay.update(cx, |overlay, cx| {
             overlay.handle_completion_menu_action(action, cx)
         })
     }
 
-    fn handle_completion_commit_character(
+    pub(crate) fn handle_completion_commit_character(
         &mut self,
-        ev: &KeyDownEvent,
+        commit_character: char,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.overlay.read(cx).has_completion() {
             return false;
         }
-
-        let Some(commit_character) = completion_commit_character_from_key(
-            ev.keystroke.key.as_str(),
-            ev.keystroke.key_char.as_deref(),
-            ev.keystroke.modifiers.control,
-        ) else {
-            return false;
-        };
 
         let accept_index = self.overlay.update(cx, |overlay, cx| {
             overlay.completion_commit_accept_index(commit_character, cx)
@@ -7149,8 +7406,25 @@ impl Workspace {
             return;
         }
 
-        let accepted_completion_on_commit_character =
-            self.handle_completion_commit_character(ev, cx);
+        // Native text checks commit characters when text is actually committed,
+        // not on the raw keys used to build an IME preedit.
+        let native_text = ev.keystroke.key_char.is_some()
+            && ev
+                .keystroke
+                .modifiers
+                .is_subset_of(&gpui::Modifiers::shift())
+            && self
+                .core
+                .read(cx)
+                .editor_input
+                .uses_native_text(&self.core.read(cx).editor, key);
+        let accepted_completion_on_commit_character = !native_text
+            && completion_commit_character_from_key(
+                ev.keystroke.key.as_str(),
+                ev.keystroke.key_char.as_deref(),
+                ev.keystroke.modifiers.control,
+            )
+            .is_some_and(|ch| self.handle_completion_commit_character(ch, cx));
 
         // Update input context based on current focus state
         self.update_input_context(window, cx);
@@ -7176,6 +7450,18 @@ impl Workspace {
             InputResult::SendToHelix(helix_key) => {
                 if !self.view_manager.is_document_view_focused(cx, window) {
                     self.handle_unfocused_semantic_shortcut(ev, cx);
+                    return;
+                }
+                // Leave unbound insert text propagating to GPUI's platform input
+                // handler. The document and workspace must not also insert its raw key.
+                let core = self.core.read(cx);
+                if ev.keystroke.key_char.is_some()
+                    && ev
+                        .keystroke
+                        .modifiers
+                        .is_subset_of(&gpui::Modifiers::shift())
+                    && core.editor_input.uses_native_text(&core.editor, helix_key)
+                {
                     return;
                 }
                 nucleotide_logging::trace!(
@@ -7767,7 +8053,9 @@ impl Workspace {
                 })
                 .unwrap_or(false);
 
-        self.cached_bg_color = if uses_windows_material_backdrop {
+        self.cached_bg_color = if uses_windows_material_backdrop
+            || self.core.read(cx).config.gui.window.chrome_opacity < 1.0
+        {
             gpui::hsla(0.0, 0.0, 0.0, 0.0)
         } else {
             tokens.editor.background
@@ -8244,6 +8532,19 @@ impl Workspace {
     }
 
     fn handle_redraw(&mut self, cx: &mut Context<Self>) {
+        // Keyboard split/navigation commands mutate Helix's active view. Follow
+        // that transition only if the old editor surface still owns GPUI focus.
+        let editor = &self.core.read(cx).editor;
+        if self.view_manager.focused_view_id() != Some(editor.tree.focus)
+            || editor.tree.views().count() != self.view_manager.view_count()
+            || editor
+                .tree
+                .views()
+                .any(|(view, _)| !self.view_manager.has_view(&view.id))
+        {
+            self.update_document_views(cx);
+        }
+
         // Shaped lines are keyed by text and paint style, so ordinary redraws
         // can reuse them. Font and theme changes invalidate the cache at their
         // dedicated update sites.
@@ -8577,7 +8878,7 @@ impl Workspace {
         info!("View focused: {:?}", view_id);
         self.active_image_tab_id = None;
         self.invalidate_tab_bar_documents();
-        self.view_manager.handle_view_focused(view_id, cx);
+        self.update_document_views(cx);
 
         let focused_filename = self.current_filename(cx);
         self.update_titlebar_filename(focused_filename.as_deref(), true, cx);
@@ -9837,8 +10138,11 @@ impl Workspace {
         cx.update_global(|theme_manager: &mut crate::ThemeManager, _cx| {
             theme_manager.set_ui_chrome_style(ui_chrome_style);
             theme_manager.set_ui_font_size(gpui::px(ui_font.size));
+            theme_manager.set_chrome_opacity(config.gui.window.chrome_opacity);
         });
         Self::sync_ui_theme_from_theme_manager(cx);
+        self.colors_dirty = true;
+        self.schedule_window_appearance_update(cx);
 
         info!(
             ui_font_family = %ui_font.family,
@@ -10138,7 +10442,7 @@ impl Workspace {
             });
         }
         if should_focus && self.view_manager.focused_view_id().is_some() {
-            self.needs_focus_restore = true;
+            self.defer_focus_editor(cx);
         }
         cx.notify();
 
@@ -10315,7 +10619,7 @@ impl Workspace {
             });
         }
         if should_focus && self.view_manager.focused_view_id().is_some() {
-            self.needs_focus_restore = true;
+            self.defer_focus_editor(cx);
         }
         cx.notify();
     }
@@ -10498,7 +10802,7 @@ impl Workspace {
 
         // Only focus the editor if requested (not when opening from file tree)
         if should_focus && self.view_manager.focused_view_id().is_some() {
-            self.needs_focus_restore = true;
+            self.defer_focus_editor(cx);
         }
 
         // Force a redraw
@@ -10691,7 +10995,6 @@ impl Workspace {
                 // pending keymap payload.
                 self.info_hidden = true;
                 self.update_key_hints(cx);
-                self.needs_focus_restore = true;
                 cx.notify();
             }
             crate::Update::ShouldQuit => {
@@ -10754,21 +11057,25 @@ impl Workspace {
     }
 
     /// Render the tab bar showing all open documents
-    fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_bar(
+        &mut self,
+        pane_id: ViewId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         use crate::tab_bar::{DocumentInfo, TabBar};
         use helix_view::editor::BufferLine;
 
         let tab_bar_button_size = cx.theme().tokens.sizes.button_height_sm;
         let active_document_focused = self
             .view_manager
-            .focused_view_id()
-            .and_then(|view_id| self.view_manager.get_document_view(&view_id))
+            .get_document_view(&pane_id)
             .is_some_and(|doc_view| doc_view.focus_handle(cx).contains_focused(window, cx));
         let tab_bar_menu_focused = self.any_tab_bar_menu_open();
         let workspace_focused = self.focus_handle.contains_focused(window, cx);
-        let terminal_pane_focused =
-            self.terminal_is_focused(window, cx) || self.terminal_focus_pending;
-        let editor_pane_focused = workspace_focused || active_document_focused;
+        let terminal_pane_focused = self.terminal_is_focused(window, cx);
+        let editor_pane_focused = self.pane_tabs.focused == Some(pane_id)
+            && (workspace_focused || active_document_focused);
         let show_focused_tab_bar_buttons =
             editor_pane_focused || terminal_pane_focused || tab_bar_menu_focused;
 
@@ -10782,7 +11089,7 @@ impl Workspace {
             bufferline_config,
             editor.documents.len() + self.image_tabs.len()
         );
-        let tab_count = editor.documents.len() + self.image_tabs.len();
+        let tab_count = self.pane_tabs.panes[&pane_id].tabs.len();
 
         let should_show_tabs = core.config.gui.tab_bar.show
             && match bufferline_config {
@@ -10809,12 +11116,7 @@ impl Workspace {
         debug!("Tab bar visible, rendering tabs");
 
         // Get the currently active tab ID
-        let active_doc_id = self.active_image_tab_id.map(TabId::Image).or_else(|| {
-            self.view_manager
-                .focused_view_id()
-                .and_then(|focused_view_id| editor.tree.try_get(focused_view_id))
-                .map(|view| TabId::Document(view.doc))
-        });
+        let active_doc_id = Some(self.pane_tabs.panes[&pane_id].active());
 
         // Get project directory for relative paths first
         let project_directory = core.project_directory.clone();
@@ -10994,20 +11296,31 @@ impl Workspace {
             documents
         };
 
+        let pane = self.pane_tabs.panes.get_mut(&pane_id).unwrap();
+        let mut documents = pane
+            .tabs
+            .iter()
+            .filter_map(|id| documents.iter().find(|doc| doc.id == *id).cloned())
+            .enumerate()
+            .map(|(order, mut doc)| {
+                doc.order = order;
+                doc
+            })
+            .collect::<Vec<_>>();
+        documents.sort_by_key(|doc| (!doc.is_pinned, doc.order));
+        let documents: Arc<[DocumentInfo]> = documents.into();
+        let scroll_handle = pane.scroll.clone();
         let visible_doc_ids = documents.iter().map(|doc| doc.id).collect::<Vec<_>>();
-        if should_scroll_active_tab(
-            self.suppress_tab_bar_auto_scroll,
-            self.last_scrolled_tab_doc_id,
-            active_doc_id,
-        ) && let Some(active_doc_id) = active_doc_id
+        if should_scroll_active_tab(pane.suppress_auto_scroll, pane.last_scrolled, active_doc_id)
+            && let Some(active_doc_id) = active_doc_id
             && let Some(active_index) = active_unpinned_tab_scroll_index(
                 &visible_doc_ids,
                 &self.pinned_documents,
                 active_doc_id,
             )
         {
-            self.tab_bar_scroll_handle.scroll_to_item(active_index);
-            self.last_scrolled_tab_doc_id = Some(active_doc_id);
+            scroll_handle.scroll_to_item(active_index);
+            pane.last_scrolled = Some(active_doc_id);
         }
 
         let has_documents = !documents.is_empty();
@@ -11039,6 +11352,7 @@ impl Workspace {
                 let handle = self.handle.clone();
                 move |doc_id, _window, cx| {
                     workspace.update(cx, |workspace, cx| {
+                        workspace.focus_tab_pane(pane_id, cx);
                         match doc_id {
                             TabId::Image(image_id) => {
                                 workspace.switch_to_image_tab(image_id, cx);
@@ -11073,6 +11387,7 @@ impl Workspace {
                 let activation_documents = activation_documents.clone();
                 move |doc_id, _window, cx| {
                     workspace.update(cx, |workspace, cx| {
+                        workspace.focus_tab_pane(pane_id, cx);
                         workspace.close_tab_context_menu();
                         let activation_target = tab_activation_target_after_close(
                             &activation_documents,
@@ -11080,6 +11395,10 @@ impl Workspace {
                             active_doc_id,
                             activate_on_close,
                         );
+                        if workspace.detach_shared_pane_tab(pane_id, doc_id, activation_target, cx)
+                        {
+                            return;
+                        }
                         match doc_id {
                             TabId::Image(image_id) => {
                                 workspace.close_image_tab(image_id, activation_target, cx);
@@ -11105,12 +11424,23 @@ impl Workspace {
         .show_diagnostics(show_diagnostics)
         .loading_documents(self.loading_documents.keys().copied().map(TabId::Document))
         .deemphasized(!editor_pane_focused)
-        .track_scroll(&self.tab_bar_scroll_handle)
+        .track_scroll(&scroll_handle)
+        .with_pane_drag_drop(pane_id, {
+            let workspace = cx.entity().clone();
+            move |dragged, before, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.move_pane_tab(dragged.pane, pane_id, dragged.tab, before, cx);
+                    workspace.focus_editor(window, cx);
+                });
+            }
+        })
         .with_scroll_wheel_handler({
             let workspace = cx.entity().clone();
             move |_event, _window, cx| {
                 workspace.update(cx, |workspace, _cx| {
-                    workspace.suppress_tab_bar_auto_scroll = true;
+                    if let Some(pane) = workspace.pane_tabs.panes.get_mut(&pane_id) {
+                        pane.suppress_auto_scroll = true;
+                    }
                 });
             }
         })
@@ -11118,7 +11448,7 @@ impl Workspace {
             tab_bar
                 .start_child(
                     Button::icon_only("tab-nav-back", "icons/arrow-left.svg")
-                        .variant(ButtonVariant::Secondary)
+                        .variant(ButtonVariant::Ghost)
                         .size(ButtonSize::Small)
                         .tooltip("Go Back")
                         .activate_on_mouse_down()
@@ -11127,6 +11457,7 @@ impl Workspace {
                             let workspace = cx.entity().clone();
                             move |_event, _window, cx| {
                                 workspace.update(cx, |workspace, cx| {
+                                    workspace.focus_tab_pane(pane_id, cx);
                                     workspace.send_helix_key("ctrl-o", cx);
                                 });
                                 cx.stop_propagation();
@@ -11135,7 +11466,7 @@ impl Workspace {
                 )
                 .start_child(
                     Button::icon_only("tab-nav-forward", "icons/arrow-right.svg")
-                        .variant(ButtonVariant::Secondary)
+                        .variant(ButtonVariant::Ghost)
                         .size(ButtonSize::Small)
                         .tooltip("Go Forward")
                         .activate_on_mouse_down()
@@ -11144,6 +11475,7 @@ impl Workspace {
                             let workspace = cx.entity().clone();
                             move |_event, _window, cx| {
                                 workspace.update(cx, |workspace, cx| {
+                                    workspace.focus_tab_pane(pane_id, cx);
                                     workspace.send_helix_key("ctrl-i", cx);
                                 });
                                 cx.stop_propagation();
@@ -11155,7 +11487,7 @@ impl Workspace {
             tab_bar
                 .end_child(
                     Button::icon_only("tab-new-file", "icons/plus.svg")
-                        .variant(ButtonVariant::Secondary)
+                        .variant(ButtonVariant::Ghost)
                         .size(ButtonSize::Small)
                         .tooltip("New File")
                         .activate_on_mouse_down()
@@ -11163,6 +11495,7 @@ impl Workspace {
                             let workspace = cx.entity().clone();
                             move |_event, _window, cx| {
                                 workspace.update(cx, |workspace, cx| {
+                                    workspace.focus_tab_pane(pane_id, cx);
                                     workspace.close_tab_bar_menus();
                                     workspace.tab_bar_action_new_file(cx);
                                 });
@@ -11181,13 +11514,16 @@ impl Workspace {
                                     return;
                                 };
                                 workspace.update(cx, |workspace, _cx| {
-                                    workspace.tab_bar_split_button_bounds = Some(bounds);
+                                    if let Some(pane) = workspace.pane_tabs.panes.get_mut(&pane_id)
+                                    {
+                                        pane.split_button_bounds = Some(bounds);
+                                    }
                                 });
                             }
                         })
                         .child(
                             Button::icon_only("tab-split-menu", "icons/columns-2.svg")
-                                .variant(ButtonVariant::Secondary)
+                                .variant(ButtonVariant::Ghost)
                                 .size(ButtonSize::Small)
                                 .tooltip("Split Pane")
                                 .activate_on_mouse_down()
@@ -11196,6 +11532,7 @@ impl Workspace {
                                     let workspace = cx.entity().clone();
                                     move |event, window, cx| {
                                         workspace.update(cx, |workspace, cx| {
+                                            workspace.focus_tab_pane(pane_id, cx);
                                             if workspace.tab_bar_split_menu.is_open() {
                                                 workspace.close_tab_bar_menus();
                                                 cx.notify();
@@ -11204,7 +11541,10 @@ impl Workspace {
 
                                             let fallback_position = event.position();
                                             let menu_position = workspace
-                                                .tab_bar_split_button_bounds
+                                                .pane_tabs
+                                                .panes
+                                                .get(&pane_id)
+                                                .and_then(|pane| pane.split_button_bounds)
                                                 .map(|bounds| bounds.bottom_right())
                                                 .unwrap_or(fallback_position);
                                             workspace.close_tab_context_menu();
@@ -11246,6 +11586,7 @@ impl Workspace {
             let workspace = cx.entity().clone();
             move |_event, _window, cx| {
                 workspace.update(cx, |workspace, cx| {
+                    workspace.focus_tab_pane(pane_id, cx);
                     workspace.close_tab_bar_menus();
                     workspace.tab_bar_action_new_file(cx);
                 });
@@ -11255,6 +11596,7 @@ impl Workspace {
             let workspace = cx.entity().clone();
             move |doc_id, _window, cx| {
                 workspace.update(cx, |workspace, cx| {
+                    workspace.focus_tab_pane(pane_id, cx);
                     workspace.close_tab_bar_menus();
                     workspace.tab_action_double_click(doc_id, cx);
                 });
@@ -11264,6 +11606,7 @@ impl Workspace {
             let workspace = cx.entity().clone();
             move |doc_id, event, window, cx| {
                 workspace.update(cx, |workspace, cx| {
+                    workspace.focus_tab_pane(pane_id, cx);
                     workspace.close_tab_bar_split_menu();
                     workspace.close_tab_bar_new_menu();
                     workspace
@@ -11501,9 +11844,10 @@ impl Workspace {
             )
         };
         let viewport_width = f32::from(window.viewport_size().width);
+        let native_sidebar_enabled = macos_system_sidebar_enabled(&self.core.read(cx).config.gui);
         let geometry = StatusBarGeometry::new(
             viewport_width,
-            self.show_file_tree,
+            self.show_file_tree && native_sidebar_enabled,
             self.file_tree_width,
             &sizes,
         );
@@ -11511,7 +11855,6 @@ impl Workspace {
         let chrome_metrics =
             nucleotide_ui::DensityMetrics::for_density(nucleotide_ui::ControlDensity::Comfortable);
         let divider_color = status_bar_tokens.border;
-        let native_sidebar_enabled = macos_system_sidebar_enabled(&self.core.read(cx).config.gui);
         let extend_sidebar_into_status_bar = should_extend_translucent_sidebar_into_status_bar(
             self.show_file_tree,
             self.file_tree_width,
@@ -11530,13 +11873,7 @@ impl Workspace {
             .when(extend_sidebar_into_status_bar, |content| {
                 content.border_t_1().border_color(divider_color)
             })
-            .child(self.statusbar_main_content(
-                &model,
-                geometry,
-                &status_bar_tokens,
-                sizes.radius_md,
-                cx,
-            ));
+            .child(self.statusbar_main_content(&model, geometry, &status_bar_tokens, cx));
 
         let workspace_entity = cx.entity().clone();
         let file_tree_button = Button::icon_only("file-tree-toggle", "icons/folder-tree.svg")
@@ -12480,6 +12817,14 @@ impl Workspace {
     /// Update completion filter by detecting current prefix at cursor
     /// This method attempts to auto-detect the current completion prefix
     pub fn update_completion_filter_auto(&mut self, cx: &mut Context<Self>) -> bool {
+        // Preedit is temporary document text, not a committed completion prefix.
+        if self
+            .view_manager
+            .get_focused_document_view()
+            .is_some_and(|view| view.read(cx).has_native_composition())
+        {
+            return false;
+        }
         // Get current text under cursor to determine new prefix
         if let Some((current_prefix, is_trigger_completion)) =
             self.get_current_completion_prefix(cx)
@@ -13091,13 +13436,18 @@ impl Workspace {
         let language = self.completion_language_for_doc(doc_id, cx);
         let retained_items =
             retained_completion_items_for_completed_providers(&items, &incomplete_server_ids);
-        let document_version = self
-            .core
-            .read(cx)
-            .editor
-            .document(doc_id)
-            .map(|doc| doc.version())
-            .unwrap_or_default();
+        let (document_version, document_text, cursor) = {
+            let core = self.core.read(cx);
+            let Some(doc) = core.editor.document(doc_id) else {
+                return;
+            };
+            let cursor = doc
+                .selection(view_id)
+                .primary()
+                .cursor(doc.text().slice(..));
+            (doc.version(), doc.text().clone(), cursor)
+        };
+        let prefix_start = completion_word_start(document_text.slice(..), cursor);
         let mut ui_items: Vec<nucleotide_ui::completion_v2::CompletionItem> = items
             .into_iter()
             .map(ui_completion_item_from_event)
@@ -13122,6 +13472,8 @@ impl Workspace {
             doc_id,
             view_id,
             document_version,
+            document_text,
+            prefix_range: prefix_start..cursor,
             is_incomplete,
             incomplete_server_ids,
             retained_items,
@@ -13168,21 +13520,43 @@ impl Workspace {
 
     /// Focus the main editor area
     pub fn focus_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        nucleotide_logging::debug!("Focusing editor area");
-
-        // Find the currently active document view and focus it
-        if let Some(view_id) = self.view_manager.focused_view_id()
-            && let Some(doc_view) = self.view_manager.get_document_view(&view_id)
+        if self.active_image_tab_id.is_none()
+            && self.view_manager.get_focused_document_view().is_some()
         {
-            let doc_focus = doc_view.focus_handle(cx);
-            window.focus(&doc_focus, cx);
-            nucleotide_logging::debug!(view_id = ?view_id, "Focused active document view");
-            return;
+            self.view_manager.focus_editor_area(cx, window);
+        } else {
+            window.focus(&self.focus_handle, cx);
         }
+    }
 
-        // If no specific document, focus the main workspace
-        window.focus(&self.focus_handle, cx);
-        nucleotide_logging::debug!("Focused main workspace");
+    // Core events and async file opens do not carry a Window. Run their explicit
+    // focus transition after the current effect cycle, not from rendering.
+    fn defer_focus_editor(&self, cx: &mut Context<Self>) {
+        let workspace = cx.weak_entity();
+        cx.defer(move |cx| {
+            cx.with_window(workspace.entity_id(), |window, cx| {
+                let _ = workspace.update(cx, |workspace, cx| {
+                    if !workspace.overlay.read(cx).has_focusable_overlay()
+                        && !workspace.modal_layer.read(cx).has_active_modal()
+                    {
+                        workspace.focus_editor(window, cx);
+                    }
+                });
+            });
+        });
+    }
+
+    fn defer_focus_terminal(&self, cx: &mut Context<Self>) {
+        let workspace = cx.weak_entity();
+        cx.defer(move |cx| {
+            cx.with_window(workspace.entity_id(), |window, cx| {
+                let _ = workspace.update(cx, |workspace, cx| {
+                    if workspace.terminal_panel_visible {
+                        workspace.focus_terminal_panel(window, cx);
+                    }
+                });
+            });
+        });
     }
 
     /// Focus the file tree if it exists and is visible
@@ -13269,12 +13643,18 @@ impl Workspace {
         let session = self.active_completion_session.as_ref()?;
         let core = self.core.read(cx);
         let view_doc = core.editor.tree.try_get(session.view_id)?.doc;
-        if view_doc != session.doc_id {
+        if view_doc != session.doc_id || core.editor.tree.focus != session.view_id {
             return None;
         }
 
         let doc = core.editor.document(session.doc_id)?;
-        if doc.version() != session.document_version {
+        let cursor = doc
+            .selection(session.view_id)
+            .primary()
+            .cursor(doc.text().slice(..));
+        if (doc.version() != session.document_version || cursor != session.prefix_range.end)
+            && session.prefix_change(doc.text(), cursor).is_none()
+        {
             return None;
         }
 
@@ -13282,7 +13662,8 @@ impl Workspace {
             CompletionAcceptTarget {
                 doc_id: session.doc_id,
                 view_id: session.view_id,
-                document_version: session.document_version,
+                document_version: doc.version(),
+                source_version: session.document_version,
             },
             session.requested_prefix.clone(),
         ))
@@ -13419,11 +13800,70 @@ impl Workspace {
 
     fn accept_completion_item(
         &mut self,
-        completion_item: nucleotide_ui::CompletionItem,
+        mut completion_item: nucleotide_ui::CompletionItem,
         completion_memory_key: Option<CompletionMemoryKey>,
         target: CompletionAcceptTarget,
         cx: &mut Context<Self>,
     ) {
+        if target.document_version != target.source_version
+            && let Some(edit) = completion_item.edit.as_mut()
+        {
+            let Some(session) = self.active_completion_session.as_ref().filter(|session| {
+                session.doc_id == target.doc_id
+                    && session.view_id == target.view_id
+                    && session.document_version == target.source_version
+            }) else {
+                return;
+            };
+            let core = self.core.read(cx);
+            let Some(doc) = core.editor.document(target.doc_id) else {
+                return;
+            };
+            // Also retain the exact version check across asynchronous item resolve.
+            if doc.version() != target.document_version {
+                return;
+            }
+            let cursor = doc
+                .selection(target.view_id)
+                .primary()
+                .cursor(doc.text().slice(..));
+            let Some(change) = session.prefix_change(doc.text(), cursor) else {
+                return;
+            };
+            let encoding = helix_offset_encoding_from_completion(edit.offset_encoding);
+            for text_edit in edit
+                .text_edit
+                .iter_mut()
+                .chain(edit.additional_text_edits.iter_mut())
+            {
+                let Some(range) = helix_lsp::util::lsp_range_to_range(
+                    &session.document_text,
+                    lsp_range_from_completion(text_edit.range),
+                    encoding,
+                ) else {
+                    return;
+                };
+                let range = helix_core::Range::new(
+                    change
+                        .changes()
+                        .map_pos(range.from(), helix_core::Assoc::Before),
+                    change
+                        .changes()
+                        .map_pos(range.to(), helix_core::Assoc::After),
+                );
+                let range = helix_lsp::util::range_to_lsp_range(doc.text(), range, encoding);
+                text_edit.range = nucleotide_ui::CompletionRange {
+                    start: nucleotide_ui::CompletionPosition {
+                        line: range.start.line,
+                        character: range.start.character,
+                    },
+                    end: nucleotide_ui::CompletionPosition {
+                        line: range.end.line,
+                        character: range.end.character,
+                    },
+                };
+            }
+        }
         let accepted = if let Some(edit) = completion_item.edit.clone() {
             self.handle_lsp_edit_completion(completion_item, edit, target, cx)
         } else {
@@ -13945,8 +14385,34 @@ impl Workspace {
     }
 
     fn update_document_views(&mut self, cx: &mut Context<Self>) {
+        let previous_view_id = self.view_manager.focused_view_id();
+        let previous_focus = self
+            .view_manager
+            .get_focused_document_view()
+            .map(|view| view.focus_handle(cx));
         let mut view_ids = HashSet::new();
         self.make_views(&mut view_ids, cx);
+
+        if let Some(view) = self.view_manager.get_focused_document_view()
+            && let Some(coordinator) = cx.try_global::<nucleotide_ui::FocusCoordinator>()
+        {
+            coordinator.set_editor_focus(view.focus_handle(cx));
+        }
+
+        if previous_view_id != self.view_manager.focused_view_id()
+            && let Some(previous_focus) = previous_focus
+        {
+            let workspace = cx.weak_entity();
+            cx.defer(move |cx| {
+                cx.with_window(workspace.entity_id(), |window, cx| {
+                    if previous_focus.is_focused(window) {
+                        let _ = workspace.update(cx, |workspace, cx| {
+                            workspace.focus_editor(window, cx);
+                        });
+                    }
+                });
+            });
+        }
     }
 
     /// Update only a specific document view - more efficient for targeted updates
@@ -13996,38 +14462,142 @@ impl Workspace {
     }
 
     fn render_document_view_layout(
-        &self,
+        &mut self,
         layout: DocumentViewLayout,
         total_area: HelixRect,
         editor_width: f32,
         editor_height: f32,
         show_focus_indicator: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let view_entity = self
             .view_manager
             .get_document_view(&layout.view_id)?
             .clone();
-        let theme = cx.theme();
+        let tokens = cx.theme().tokens;
         let (left, top, width, height) =
             helix_rect_to_scaled_pixel_bounds(layout.area, total_area, editor_width, editor_height);
+        let pane_id = layout.view_id;
+        if !cx.has_active_drag() {
+            self.pane_drop_target = None;
+        }
+        let preview = self
+            .pane_drop_target
+            .filter(|(target, _)| *target == pane_id)
+            .map(|(_, edge)| {
+                let bounds = edge.preview_bounds(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: gpui::size(width, height),
+                });
+                div()
+                    .absolute()
+                    .left(bounds.left())
+                    .top(bounds.top())
+                    .w(bounds.size.width)
+                    .h(bounds.size.height)
+                    .bg(nucleotide_ui::tokens::with_alpha(
+                        tokens.chrome.border_focus,
+                        0.3,
+                    ))
+                    .when(cfg!(test), |preview| {
+                        preview.debug_selector(|| "pane-drop-preview".to_string())
+                    })
+            });
+        let tab_bar = self
+            .render_tab_bar(layout.view_id, window, cx)
+            .into_any_element();
+        let image = self.pane_tabs.panes[&layout.view_id]
+            .active_image
+            .and_then(|id| self.image_tabs.iter().find(|tab| tab.id == id).cloned());
+        let content = if let Some(image) = image {
+            self.render_image_viewer(image, cx)
+        } else {
+            view_entity.into_any_element()
+        };
 
         Some(
             div()
+                .id(SharedString::from(format!(
+                    "editor-pane-{:?}",
+                    layout.view_id
+                )))
+                .when(cfg!(test), |pane| {
+                    pane.debug_selector(move || format!("editor-pane-{pane_id:?}"))
+                })
                 .absolute()
+                .flex()
+                .flex_col()
                 .left(left)
                 .top(top)
                 .w(width)
                 .h(height)
                 .overflow_hidden()
                 .when(self.debug_colors_enabled, |d| {
-                    d.border_1()
-                        .border_color(theme.tokens.chrome.border_default)
+                    d.border_1().border_color(tokens.chrome.border_default)
                 })
-                .child(view_entity)
+                .child(tab_bar)
+                .child(
+                    div()
+                        .id(SharedString::from(format!("pane-drop-body-{pane_id:?}")))
+                        .when(cfg!(test), |body| {
+                            body.debug_selector(move || format!("pane-drop-body-{pane_id:?}"))
+                        })
+                        .relative()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_hidden()
+                        .on_drag_move::<DraggedTab>(cx.listener(
+                            move |workspace, event: &gpui::DragMoveEvent<DraggedTab>, _, cx| {
+                                // Use the full pane for preview geometry, but leave its
+                                // tab bar available for the existing reorder/merge drops.
+                                let pane_bounds = Bounds {
+                                    origin: point(
+                                        event.bounds.left(),
+                                        event.bounds.bottom() - height,
+                                    ),
+                                    size: gpui::size(width, height),
+                                };
+                                let target = ((event.drag(cx).pane != pane_id
+                                    || workspace.pane_tabs.panes[&pane_id].tabs.len() > 1)
+                                    && event.bounds.contains(&event.event.position))
+                                .then(|| {
+                                    pane_tabs::PaneDropEdge::nearest(
+                                        event.event.position,
+                                        pane_bounds,
+                                    )
+                                })
+                                .flatten()
+                                .map(|edge| (pane_id, edge));
+                                if target.is_some()
+                                    || workspace
+                                        .pane_drop_target
+                                        .is_some_and(|(id, _)| id == pane_id)
+                                {
+                                    if workspace.pane_drop_target != target {
+                                        workspace.pane_drop_target = target;
+                                        cx.notify();
+                                    }
+                                }
+                            },
+                        ))
+                        .on_drop(
+                            cx.listener(move |workspace, dragged: &DraggedTab, window, cx| {
+                                if let Some((target, edge)) = workspace.pane_drop_target.take()
+                                    && target == pane_id
+                                {
+                                    workspace.split_pane_tab(dragged, target, edge, cx);
+                                    workspace.focus_editor(window, cx);
+                                }
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(content),
+                )
+                .children(preview)
                 .when(show_focus_indicator && layout.is_focused, |d| {
                     d.child(div().absolute().top_0().left_0().bottom_0().w(px(2.0)).bg(
-                        nucleotide_ui::tokens::with_alpha(theme.tokens.editor.focus_ring, 0.8),
+                        nucleotide_ui::tokens::with_alpha(tokens.editor.focus_ring, 0.8),
                     ))
                 })
                 .into_any_element(),
@@ -14079,12 +14649,16 @@ impl Workspace {
                 cx.stop_propagation();
             }),
             cx.listener(|workspace, _event: &MouseUpEvent, window, cx| {
-                workspace.finish_split_pane_resize(window, cx);
-                cx.stop_propagation();
+                if workspace.split_pane_resize.is_some() {
+                    workspace.finish_split_pane_resize(window, cx);
+                    cx.stop_propagation();
+                }
             }),
             cx.listener(|workspace, _event: &MouseUpEvent, window, cx| {
-                workspace.finish_split_pane_resize(window, cx);
-                cx.stop_propagation();
+                if workspace.split_pane_resize.is_some() {
+                    workspace.finish_split_pane_resize(window, cx);
+                    cx.stop_propagation();
+                }
             }),
         );
 
@@ -14183,7 +14757,7 @@ impl Workspace {
     fn send_helix_key(&mut self, key: &str, cx: &mut Context<Self>) {
         // Ensure an editor view has focus
         if self.view_manager.focused_view_id().is_some() {
-            self.needs_focus_restore = true;
+            self.defer_focus_editor(cx);
         }
 
         // Parse the key string and send it to Helix
@@ -14209,9 +14783,6 @@ impl Workspace {
     ) {
         if !self.view_manager.is_document_view_focused(cx, window) {
             return;
-        }
-        if self.view_manager.focused_view_id().is_some() {
-            self.needs_focus_restore = true;
         }
         self.input
             .update(cx, |_, cx| cx.emit(InputEvent::semantic(action)));
@@ -14249,8 +14820,10 @@ impl Workspace {
         view_ids: &mut HashSet<ViewId>,
         cx: &mut Context<Self>,
     ) -> Option<String> {
+        self.sync_pane_tabs(cx);
         let mut focused_file_name = None;
         let mut focused_doc_path = None;
+        self.view_manager.set_focused_view_id(None);
 
         {
             let editor = &self.core.read(cx).editor;
@@ -14348,6 +14921,15 @@ impl Workspace {
                         is_focused,
                     )
                 });
+                let document = view.downgrade();
+                let workspace_id = cx.entity_id();
+                cx.defer(move |cx| {
+                    cx.with_window(workspace_id, |window, cx| {
+                        let _ = document.update(cx, |view, cx| {
+                            view.observe_focus(window, cx);
+                        });
+                    });
+                });
                 self.view_manager.insert_document_view(view_id, view);
             }
         }
@@ -14375,24 +14957,22 @@ impl Workspace {
     fn visible_tab_bar_height(&self, cx: &Context<Self>) -> Pixels {
         let core = self.core.read(cx);
         let editor = &core.editor;
-        let has_pinned_tabs = editor
-            .documents
-            .keys()
-            .copied()
-            .map(TabId::Document)
-            .chain(self.image_tabs.iter().map(|tab| TabId::Image(tab.id)))
-            .any(|tab_id| self.pinned_documents.contains(&tab_id));
-        let has_unpinned_tabs = editor
-            .documents
-            .keys()
-            .copied()
-            .map(TabId::Document)
-            .chain(self.image_tabs.iter().map(|tab| TabId::Image(tab.id)))
-            .any(|tab_id| !self.pinned_documents.contains(&tab_id));
+        let tabs = self
+            .pane_tabs
+            .panes
+            .get(&editor.tree.focus)
+            .map(|pane| pane.tabs.as_slice())
+            .unwrap_or_default();
+        let has_pinned_tabs = tabs
+            .iter()
+            .any(|tab_id| self.pinned_documents.contains(tab_id));
+        let has_unpinned_tabs = tabs
+            .iter()
+            .any(|tab_id| !self.pinned_documents.contains(tab_id));
         tab_bar_height_for_editor(
             core.config.gui.tab_bar.show,
             &editor.config().bufferline,
-            editor.documents.len() + self.image_tabs.len(),
+            tabs.len(),
             crate::tab::tab_container_height(cx.theme().tokens),
             core.config.gui.tab_bar.show_pinned_tabs_in_separate_row,
             has_pinned_tabs,
@@ -14559,7 +15139,7 @@ impl Workspace {
         let bounds = TerminalBounds::from_pixels(
             cell_width_px,
             cell_height_px,
-            available_width_px,
+            available_width_px - 2.0 * f32::from(cx.theme().tokens.sizes.space_3),
             terminal_content_height_px,
         );
         let panel_pixel_height = nucleotide_terminal_panel::snapped_terminal_panel_height(
@@ -14651,51 +15231,7 @@ impl Render for Workspace {
         }
 
         self.sync_file_tree_width_for_viewport(f32::from(window.viewport_size().width));
-        self.sync_confirmation_modal(window, cx);
-
-        // Failsafe: If the overlay is gone and no known element has focus, force-refocus.
-        // We see cases in logs where overlay_empty=true and both workspace and doc view
-        // report not focused, leaving the app with no key receiver. This block ensures
-        // that after overlay teardown, we always regain a valid focus target without a click.
-        if self.overlay.read(cx).is_empty() && !self.modal_layer.read(cx).has_active_modal() {
-            let ws_focused = self.focus_handle.contains_focused(window, cx);
-            let overlay_focused = self.overlay.focus_handle(cx).contains_focused(window, cx);
-
-            let (doc_focus_handle, doc_focused) = if let Some(id) =
-                self.view_manager.focused_view_id()
-                && let Some(doc_view) = self.view_manager.get_document_view(&id)
-            {
-                let fh = doc_view.focus_handle(cx);
-                (Some(fh.clone()), fh.contains_focused(window, cx))
-            } else {
-                (None, false)
-            };
-
-            let file_tree_focused = self
-                .file_tree
-                .as_ref()
-                .map(|ft| ft.focus_handle(cx).contains_focused(window, cx))
-                .unwrap_or(false);
-
-            let terminal_focused = self
-                .terminal_focus_handle(cx)
-                .is_some_and(|focus| focus.contains_focused(window, cx));
-
-            if !ws_focused
-                && !overlay_focused
-                && !doc_focused
-                && !file_tree_focused
-                && !terminal_focused
-            {
-                if let Some(fh) = doc_focus_handle {
-                    window.focus(&fh, cx);
-                } else if let Some(file_tree) = &self.file_tree {
-                    window.focus(&file_tree.focus_handle(cx), cx);
-                } else {
-                    window.focus(&self.focus_handle, cx);
-                }
-            }
-        }
+        self.sync_pane_tabs(cx);
 
         // Update global workspace layout information for completion positioning
         self.update_workspace_layout_info(window, cx);
@@ -14752,17 +15288,6 @@ impl Render for Workspace {
             }
         }
 
-        // Handle focus restoration if needed
-        if self.needs_focus_restore {
-            if self.view_manager.get_focused_document_view().is_some() {
-                self.view_manager.focus_editor_area(cx, window);
-            } else if let Some(file_tree) = &self.file_tree {
-                window.focus(&file_tree.focus_handle(cx), cx);
-            } else {
-                window.focus(&self.focus_handle, cx);
-            }
-            self.needs_focus_restore = false;
-        }
         let (focused_file_name, native_metadata) = self.focused_native_window_metadata(cx);
 
         self.update_titlebar_filename(focused_file_name.as_deref(), false, cx);
@@ -14846,7 +15371,8 @@ impl Render for Workspace {
         } else {
             available_h
         };
-        let editor_content_h_px = (editor_h - f32::from(tab_bar_height)).max(1.0);
+        // Each pane reserves its own chrome inside its split bounds.
+        let editor_content_h_px = editor_h.max(1.0);
 
         let rows = (editor_content_h_px / line_h_value).floor().max(1.0) as u16;
         let cols = (editor_content_w_px / char_w_value).floor().max(1.0) as u16;
@@ -14875,20 +15401,7 @@ impl Render for Workspace {
             cx.theme().tokens.chrome.border_strong,
         );
 
-        let active_image_tab = self
-            .active_image_tab_id
-            .and_then(|doc_id| self.image_tabs.iter().find(|tab| tab.id == doc_id).cloned());
-        if let Some(image_tab) = active_image_tab {
-            docs_root = docs_root.child(
-                div()
-                    .id("image-viewer-container")
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .child(self.render_image_viewer(image_tab, cx)),
-            );
-        } else {
+        {
             let editor_pane_layout = EditorPaneLayout::new(self.document_view_layouts(cx));
 
             if editor_pane_layout.is_empty() {
@@ -14922,6 +15435,7 @@ impl Render for Workspace {
                             editor_content_w_px,
                             editor_content_h_px,
                             editor_pane_layout.show_focus_indicator(),
+                            window,
                             cx,
                         ) {
                             docs_root = docs_root.child(doc_element);
@@ -14976,19 +15490,6 @@ impl Render for Workspace {
             .w_full()
             .h_full()
             // Background color inherited
-            // No gap needed between tab bar and content
-            .child({
-                // Tab bar at the top of editor area, consistently wrapped in a Div
-                let debug = self.debug_colors_enabled;
-                let debug_border = cx.theme().tokens.chrome.border_default;
-                let tab = self.render_tab_bar(window, cx);
-                div()
-                    .when(debug, |d| {
-                        // Tab bar wrapper (blue)
-                        d.border_1().border_color(debug_border)
-                    })
-                    .child(tab)
-            })
             .child(
                 // Editor content container
                 div()
@@ -14996,7 +15497,7 @@ impl Render for Workspace {
                     .flex()
                     .flex_col()
                     .w_full()
-                    .flex_1() // Take remaining height after tab bar
+                    .flex_1()
                     .relative()
                     // Debug: container styling; label appended later to ensure on top
                     .when(self.debug_colors_enabled, |d| {
@@ -15094,7 +15595,13 @@ impl Render for Workspace {
         // regardless of focus state or overlay presence for global shortcuts to work
         workspace_div = workspace_div
             .track_focus(&self.focus_handle)
-            .capture_key_down(cx.listener(|view, ev, _window, cx| {
+            .capture_key_down(cx.listener(|view, ev: &KeyDownEvent, window, cx| {
+                if ev.keystroke.key == "escape" && cx.stop_active_drag(window) {
+                    view.pane_drop_target = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 if view.handle_regular_completion_menu_key(ev, cx) {
                     cx.stop_propagation();
                 }
@@ -15151,10 +15658,6 @@ impl Render for Workspace {
                 if workspace.close_tab_bar_menus() {
                     cx.notify();
                 }
-
-                // Ensure workspace regains focus when clicked, so global shortcuts work
-                workspace.needs_focus_restore = true;
-                cx.notify();
             }),
         );
 
@@ -15979,12 +16482,6 @@ impl Render for Workspace {
                 container.into_any_element()
             }
         };
-
-        // If terminal was toggled on via button, focus it now (after elements are built)
-        if self.terminal_panel_visible && self.terminal_focus_pending {
-            self.focus_terminal_panel(window, cx);
-            self.terminal_focus_pending = false;
-        }
 
         // Build final workspace with unified bottom status bar
         workspace_div
@@ -19012,6 +19509,8 @@ mod tests {
             doc_id,
             view_id,
             document_version: 0,
+            document_text: Rope::from_str("pri"),
+            prefix_range: 0..3,
             is_incomplete: true,
             incomplete_server_ids: vec![1],
             retained_items: Vec::new(),
@@ -19034,6 +19533,8 @@ mod tests {
             doc_id,
             view_id,
             document_version: 0,
+            document_text: Rope::from_str("pri"),
+            prefix_range: 0..3,
             is_incomplete: false,
             incomplete_server_ids: vec![1],
             retained_items: Vec::new(),

@@ -19,14 +19,17 @@ use nucleotide_ui::{
 };
 use nucleotide_workspace::{WorkspaceBackendHandle, WorkspaceIdentity};
 
+mod native_input;
+
 use crate::{Core, Input, InputEvent};
 use nucleotide_editor::{
     DiagnosticSeverityIconColors, EDITOR_MINIMUM_VIEWPORT_COLUMNS, EditorCursorReveal,
     EditorLayout, EditorPointerSelectionPhase, EditorSurfacePointerEvent, EditorViewLayoutSnapshot,
-    EditorViewState, NativeEditorFramePalette, NativeEditorFrameRenderParams,
-    NativeEditorFrameThemeStyles, NativeEditorView, ViewportScrollUpdate,
-    diagnostic_scrollbar_markers, diagnostic_severity_by_line, log_pointer_selection_outcome,
-    render_native_editor_frame, run_gutter_extra_columns,
+    EditorViewState, NativeEditorFramePaintParams, NativeEditorFramePalette,
+    NativeEditorFramePrepareParams, NativeEditorFrameThemeStyles, NativeEditorPreparedFrame,
+    NativeEditorView, ViewportScrollUpdate, diagnostic_scrollbar_markers,
+    diagnostic_severity_by_line, log_pointer_selection_outcome, paint_native_editor_frame,
+    prepare_native_editor_frame, run_gutter_extra_columns,
 };
 
 fn handle_editor_pointer_selection(
@@ -106,6 +109,7 @@ pub struct DocumentView {
     view_id: ViewId,
     style: TextStyle,
     focus: FocusHandle,
+    // Active Helix split for painting; keyboard ownership is queried from `focus`.
     is_focused: bool,
     editor_state: EditorViewState,
     markdown_modes: BTreeMap<DocumentId, MarkdownDisplayMode>,
@@ -114,6 +118,7 @@ pub struct DocumentView {
     markdown_snapshot_cache: Option<MarkdownSnapshotCache>,
     runnable_tasks_cache: Option<RunnableTasksCache>,
     runnable_tasks_pending: Option<RunnableTasksPending>,
+    native_input: native_input::NativeInput,
 }
 
 impl DocumentView {
@@ -145,7 +150,32 @@ impl DocumentView {
             markdown_snapshot_cache: None,
             runnable_tasks_cache: None,
             runnable_tasks_pending: None,
+            native_input: native_input::NativeInput::default(),
         }
+    }
+
+    /// GPUI owns keyboard focus; entering a surface activates that Helix split.
+    pub fn observe_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.on_focus(&self.focus, window, |view, _window, cx| {
+            if view.core.read(cx).editor.tree.focus != view.view_id {
+                focus_editor_view(&view.core, view.view_id, cx);
+            }
+            cx.notify();
+        })
+        .detach();
+        cx.on_blur(&self.focus, window, |view, _window, cx| {
+            view.cancel_native_composition(cx);
+            view.editor_state.clear_pointer_selection();
+            cx.notify();
+        })
+        .detach();
+        cx.observe_window_activation(window, |view, window, cx| {
+            if !window.is_window_active() {
+                view.cancel_native_composition(cx);
+                view.editor_state.clear_pointer_selection();
+            }
+        })
+        .detach();
     }
 
     pub fn set_focused(&mut self, is_focused: bool) -> bool {
@@ -532,7 +562,8 @@ async fn remote_runnable_tasks_by_line_from_backend(
 impl EventEmitter<DismissEvent> for DocumentView {}
 
 impl Render for DocumentView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reset_native_input_if_needed(window, cx);
         let runnable_tasks_by_line = self.runnable_tasks_by_line(cx);
         let layout_snapshot = self.editor_state.layout_snapshot();
         let desired_gutter_extra_columns = if runnable_tasks_by_line.is_empty() {
@@ -627,8 +658,13 @@ impl Render for DocumentView {
             let core = self.core.clone();
             let view_id = self.view_id;
             let style = self.style.clone();
+            let paint_style = style.clone();
             let focus = self.focus.clone();
             let paint_focus = focus.clone();
+            let input_view = cx.entity();
+            let input_bounds = self.native_input.bounds.clone();
+            let prepare_input_bounds = input_bounds.clone();
+            let marked_ranges = self.native_input.marked_ranges();
             let is_focused = self.is_focused;
             let input = self.input.clone();
             let scrollbar_thumb_color = cx.ui_theme().tokens.editor.focus_ring;
@@ -661,18 +697,63 @@ impl Render for DocumentView {
                 self.editor_state.clone(),
                 style.clone(),
                 move |editor_state, bounds, after_layout, window, cx| {
-                    paint_document_content(DocumentPaintParams {
+                    prepare_input_bounds.set(Some(bounds));
+                    let prepared = prepare_document_content(DocumentPrepareParams {
                         core: &core,
                         view_id,
                         style: &style,
-                        focus: &paint_focus,
                         is_focused,
                         editor_state,
                         bounds,
                         layout: after_layout,
+                        cx,
+                    });
+                    let overlay = prepared.as_ref().and_then(|frame| {
+                        frame.cursor_overlay_plan(window.text_system(), after_layout, &style)
+                    });
+                    editor_state.apply_cursor_overlay_plan(overlay);
+                    if core.read(cx).editor.tree.focus == view_id {
+                        let layout_info = cx.global_mut::<crate::overlay::WorkspaceLayoutInfo>();
+                        layout_info.cursor_position = overlay.map(|plan| plan.cursor_position);
+                        layout_info.cursor_size = overlay.map(|plan| plan.cursor_size);
+                    }
+                    prepared
+                },
+                move |editor_state, prepared, layout, window, cx| {
+                    let Some(prepared) = prepared else {
+                        editor_state.clear_gutter_run_button_hits();
+                        return None;
+                    };
+                    let theme = cx.global::<crate::ThemeManager>().helix_theme().clone();
+                    let overlay = paint_native_editor_frame(
                         window,
                         cx,
-                    })
+                        NativeEditorFramePaintParams {
+                            editor_state,
+                            frame_state: &prepared.frame_state,
+                            plan: &prepared.paint_plan,
+                            layout,
+                            text_style: &paint_style,
+                            diagnostic_theme: &theme,
+                            element_focused: paint_focus.is_focused(window),
+                        },
+                    );
+                    native_input::paint_marked_ranges(
+                        editor_state,
+                        &marked_ranges,
+                        input_bounds.get(),
+                        &input_view,
+                        window,
+                        cx,
+                    );
+                    if let Some(bounds) = input_bounds.get() {
+                        window.handle_input(
+                            &paint_focus,
+                            gpui::ElementInputHandler::new(bounds, input_view.clone()),
+                            cx,
+                        );
+                    }
+                    overlay
                 },
             )
             .scrollbar_thumb_color(scrollbar_thumb_color)
@@ -680,8 +761,14 @@ impl Render for DocumentView {
             .track_focus(focus.clone());
 
             if let Some(input) = input {
+                let input_view = cx.entity();
                 editor_content = editor_content.on_key_down(move |ev, _window, cx| {
                     let key = crate::utils::translate_key(&ev.keystroke);
+                    let uses_native_text = input_view.read(cx).uses_native_text(ev, cx);
+                    if uses_native_text {
+                        return false;
+                    }
+                    input_view.update(cx, |view, cx| view.cancel_native_composition(cx));
                     input.update(cx, |_, cx| {
                         cx.emit(InputEvent::key_down(key, ev.is_held));
                     });
@@ -690,30 +777,24 @@ impl Render for DocumentView {
             }
 
             editor_content
-                .on_cursor_overlay(|overlay_plan, cx| {
-                    let layout_info = cx.global_mut::<crate::overlay::WorkspaceLayoutInfo>();
-                    if let Some(overlay_plan) = overlay_plan {
-                        layout_info.cursor_position = Some(overlay_plan.cursor_position);
-                        layout_info.cursor_size = Some(overlay_plan.cursor_size);
-                    } else {
-                        layout_info.cursor_position = None;
-                        layout_info.cursor_size = None;
-                    }
-                })
                 .on_pointer_selection({
+                    let input_view = cx.entity();
                     let core = self.core.clone();
                     let view_id = self.view_id;
                     let editor_state = self.editor_state.clone();
                     let runnable_tasks_by_line = runnable_tasks_by_line.clone();
 
                     move |phase, event, cx| {
+                        if phase == EditorPointerSelectionPhase::Begin {
+                            input_view.update(cx, |view, cx| view.cancel_native_composition(cx));
+                        }
                         if phase == EditorPointerSelectionPhase::Begin
                             && let Some(task) = editor_state
                                 .gutter_run_button_line_at(event.position)
                                 .and_then(|line| runnable_tasks_by_line.get(&line).cloned())
                         {
                             run_gutter_task(&core, view_id, task, cx);
-                            return true;
+                            return false;
                         }
 
                         handle_editor_pointer_selection(
@@ -890,6 +971,8 @@ impl DocumentView {
         let editor_font = cx.global::<crate::types::EditorFontConfig>();
         let mut markdown_style = MarkdownStyle::preview_from_tokens(tokens);
         markdown_style.code_font_family = SharedString::from(editor_font.family.clone());
+        // Keep prose readable on wide editor panes without fixing narrow-pane width.
+        let reading_width = markdown_style.body_font_size * 52.0;
         let focus = self.focus.clone();
         let click_focus = focus.clone();
         let core = self.core.clone();
@@ -901,8 +984,6 @@ impl DocumentView {
             )))
             .size_full()
             .min_h(px(0.0))
-            .focusable()
-            .track_focus(&focus)
             .overflow_y_scroll()
             .track_scroll(&self.markdown_scroll_handle)
             .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
@@ -911,7 +992,12 @@ impl DocumentView {
             })
             .px(tokens.sizes.space_8)
             .py(tokens.sizes.space_8)
-            .child(markdown_extended(snapshot.source.clone(), markdown_style));
+            .child(
+                div().w_full().max_w(reading_width).mx_auto().child(
+                    markdown_extended(snapshot.source.clone(), markdown_style)
+                        .selectable(format!("markdown-selection-{}", snapshot.doc_id), focus),
+                ),
+            );
 
         div()
             .id(SharedString::from(format!(
@@ -1065,32 +1151,28 @@ impl Focusable for DocumentView {
     }
 }
 
-struct DocumentPaintParams<'a> {
+struct DocumentPrepareParams<'a> {
     core: &'a Entity<Core>,
     view_id: ViewId,
     style: &'a TextStyle,
-    focus: &'a FocusHandle,
     is_focused: bool,
     editor_state: &'a mut EditorViewState,
     bounds: Bounds<Pixels>,
     layout: &'a mut EditorLayout,
-    window: &'a mut Window,
     cx: &'a mut App,
 }
 
-fn paint_document_content(
-    params: DocumentPaintParams<'_>,
-) -> Option<nucleotide_editor::CursorOverlayPlan> {
-    let DocumentPaintParams {
+fn prepare_document_content(
+    params: DocumentPrepareParams<'_>,
+) -> Option<NativeEditorPreparedFrame> {
+    let DocumentPrepareParams {
         core,
         view_id,
         style,
-        focus,
         is_focused,
         editor_state,
         bounds,
         layout,
-        window,
         cx,
     } = params;
 
@@ -1101,38 +1183,33 @@ fn paint_document_content(
         let tokens = cx.theme().tokens;
         let ui_tokens = cx.ui_theme().tokens;
         let theme_styles = NativeEditorFrameThemeStyles::from_style_fn(|key| cx.theme_style(key));
-        render_native_editor_frame(
-            window,
-            cx,
-            NativeEditorFrameRenderParams {
-                editor: &mut core.editor,
-                view_id,
-                editor_state,
-                theme: &helix_theme,
-                bounds,
-                layout,
-                text_style: style,
-                font_size: style.font_size.to_pixels(px(16.0)),
-                is_focused,
-                focus,
-                soft_wrap_minimum_columns: EDITOR_MINIMUM_VIEWPORT_COLUMNS,
-                theme_styles,
-                palette: NativeEditorFramePalette {
-                    fg_color: tokens.editor.text_primary,
-                    bg_color: tokens.editor.background,
-                    fallback_gutter_color: ui_tokens.editor.line_number,
-                    diagnostic_highlight_base: tokens.chrome.text_on_chrome,
-                    diagnostic_icon_colors: DiagnosticSeverityIconColors {
-                        error: tokens.editor.diagnostic_error,
-                        warning: tokens.editor.diagnostic_warning,
-                        info: tokens.editor.diagnostic_info,
-                        hint: tokens.editor.diagnostic_hint,
-                    },
-                    fallback_ruler_color: ui_tokens.chrome.border_default,
-                    run_button_color: tokens.editor.success,
+        prepare_native_editor_frame(NativeEditorFramePrepareParams {
+            editor: &mut core.editor,
+            view_id,
+            editor_state,
+            theme: &helix_theme,
+            bounds,
+            layout,
+            text_style: style,
+            font_size: style.font_size.to_pixels(px(16.0)),
+            is_focused,
+            soft_wrap_minimum_columns: EDITOR_MINIMUM_VIEWPORT_COLUMNS,
+            theme_styles,
+            palette: NativeEditorFramePalette {
+                fg_color: tokens.editor.text_primary,
+                bg_color: tokens.editor.background,
+                fallback_gutter_color: ui_tokens.editor.line_number,
+                diagnostic_highlight_base: tokens.chrome.text_on_chrome,
+                diagnostic_icon_colors: DiagnosticSeverityIconColors {
+                    error: tokens.editor.diagnostic_error,
+                    warning: tokens.editor.diagnostic_warning,
+                    info: tokens.editor.diagnostic_info,
+                    hint: tokens.editor.diagnostic_hint,
                 },
+                fallback_ruler_color: ui_tokens.chrome.border_default,
+                run_button_color: tokens.editor.success,
             },
-        )
+        })
     })
 }
 

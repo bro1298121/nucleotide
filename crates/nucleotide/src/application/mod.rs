@@ -11024,6 +11024,1038 @@ mod tests {
         })
     }
 
+    #[gpui::test]
+    fn editor_native_composition_preserves_unicode_multicursors_and_undo(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::EntityInputHandler;
+        use helix_core::{Range, Selection};
+        use helix_view::document::Mode;
+        use std::str::FromStr;
+
+        let _runtime = TEST_RUNTIME.enter();
+        let root = tempdir().unwrap();
+        let path = root.path().join("native.txt");
+        fs::write(&path, "a😀b|cdé\n").unwrap();
+        let core = new_test_application(cx);
+        let view_id = core.update(cx, |core, _| {
+            core.editor.open(&path, Action::VerticalSplit).unwrap();
+            core.editor.mode = Mode::Insert;
+            let view_id = core.editor.tree.focus;
+            let doc_id = core.editor.tree.get(view_id).doc;
+            core.editor
+                .documents
+                .get_mut(&doc_id)
+                .unwrap()
+                .set_selection(
+                    view_id,
+                    Selection::new(vec![Range::point(1), Range::point(5)].into(), 1),
+                );
+            view_id
+        });
+        let view = cx.new(|cx| {
+            crate::document::DocumentView::new(
+                core.clone(),
+                None,
+                view_id,
+                gpui::TextStyle::default(),
+                &cx.focus_handle(),
+                true,
+            )
+        });
+        let window = cx.add_empty_window();
+        window.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let mut actual = None;
+                // A surrogate-interior offset must not slice an emoji in half.
+                assert_eq!(
+                    view.text_for_range(2..4, &mut actual, window, cx)
+                        .as_deref(),
+                    Some("😀b")
+                );
+                assert_eq!(actual, Some(1..4));
+                view.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+                view.replace_and_mark_text_in_range(None, "你好😀", Some(2..4), window, cx);
+                assert_eq!(view.marked_text_range(window, cx), Some(10..14));
+                assert_eq!(
+                    view.selected_text_range(false, window, cx).unwrap().range,
+                    12..14
+                );
+                view.replace_and_mark_text_in_range(Some(12..14), "é", Some(0..1), window, cx);
+                assert_eq!(view.marked_text_range(window, cx), Some(9..12));
+                let mut actual = None;
+                assert_eq!(
+                    view.text_for_range(9..12, &mut actual, window, cx)
+                        .as_deref(),
+                    Some("你好é")
+                );
+                // Native cancellation restores the full original selection, not just primary.
+                let marked = view.marked_text_range(window, cx);
+                view.replace_text_in_range(marked, "", window, cx);
+            });
+        });
+        window.update(|_, cx| {
+            core.update(cx, |core, _| {
+                let doc_id = core.editor.tree.get(view_id).doc;
+                let doc = &core.editor.documents[&doc_id];
+                assert_eq!(doc.text().to_string(), "a😀b|cdé\n");
+                assert_eq!(
+                    doc.selection(view_id).ranges(),
+                    &[Range::new(1, 2), Range::new(5, 6)]
+                );
+            })
+        });
+        window.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.replace_and_mark_text_in_range(None, "ni hao", None, window, cx);
+                view.replace_text_in_range(None, "你好", window, cx);
+            });
+        });
+        window.update(|_, cx| {
+            core.update(cx, |core, _| {
+                let doc_id = core.editor.tree.get(view_id).doc;
+                assert_eq!(
+                    core.editor.documents[&doc_id].text().to_string(),
+                    "a你好😀b|c你好dé\n"
+                );
+                core.editor_input.handle_key(
+                    helix_view::input::KeyEvent::from_str("esc").unwrap(),
+                    &mut core.compositor,
+                    &mut core.editor,
+                    &mut core.jobs,
+                );
+                core.editor_input.handle_semantic_action(
+                    super::editor_input::EditorSemanticAction::Undo,
+                    &mut core.compositor,
+                    &mut core.editor,
+                    &mut core.jobs,
+                );
+                assert_eq!(
+                    core.editor.documents[&doc_id].text().to_string(),
+                    "a😀b|cdé\n"
+                );
+                core.editor.mode = Mode::Insert;
+                core.editor
+                    .documents
+                    .get_mut(&doc_id)
+                    .unwrap()
+                    .set_selection(
+                        view_id,
+                        Selection::new(vec![Range::point(1), Range::point(5)].into(), 0),
+                    );
+            })
+        });
+        window.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                // Explicit native replacement uses UTF-16 and must not insert
+                // another copy at an unrelated secondary cursor.
+                view.replace_text_in_range(Some(1..3), "日", window, cx);
+            });
+        });
+        window.update(|_, cx| {
+            core.update(cx, |core, _| {
+                let doc_id = core.editor.tree.get(view_id).doc;
+                assert_eq!(
+                    core.editor.documents[&doc_id].text().to_string(),
+                    "a日b|cdé\n"
+                );
+            })
+        });
+        window.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.replace_and_mark_text_in_range(Some(1..2), "ni", None, window, cx);
+                view.unmark_text(window, cx);
+                assert_eq!(view.marked_text_range(window, cx), None);
+            });
+            core.update(cx, |core, _| {
+                let doc_id = core.editor.tree.get(view_id).doc;
+                assert_eq!(
+                    core.editor.documents[&doc_id].text().to_string(),
+                    "anib|cdé\n"
+                );
+            });
+        });
+        window.update(|window, cx| {
+            core.update(cx, |core, _| {
+                let doc_id = core.editor.tree.get(view_id).doc;
+                core.editor
+                    .documents
+                    .get_mut(&doc_id)
+                    .unwrap()
+                    .set_selection(
+                        view_id,
+                        Selection::new(
+                            vec![Range::point(1), Range::point(2), Range::point(5)].into(),
+                            1,
+                        ),
+                    );
+            });
+            view.update(cx, |view, cx| {
+                // Deletion merges cursors inside the replaced span. The
+                // primary index must come from Helix's mapped selection.
+                view.replace_text_in_range(Some(1..3), "", window, cx);
+            });
+            core.read_with(cx, |core, _| {
+                let doc_id = core.editor.tree.get(view_id).doc;
+                let doc = &core.editor.documents[&doc_id];
+                assert_eq!(doc.text().to_string(), "ab|cdé\n");
+                assert_eq!(doc.selection(view_id).primary_index(), 0);
+                assert_eq!(
+                    doc.selection(view_id).ranges(),
+                    &[Range::new(1, 2), Range::new(3, 4)]
+                );
+            });
+        });
+        window.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.replace_and_mark_text_in_range(None, "ni hao", None, window, cx);
+            });
+            let replacement = root.path().join("replacement.txt");
+            fs::write(&replacement, "other document\n").unwrap();
+            let original_doc = core.update(cx, |core, _| {
+                let original_doc = core.editor.tree.get(view_id).doc;
+                core.editor.open(&replacement, Action::Replace).unwrap();
+                core.editor.mode = Mode::Insert;
+                original_doc
+            });
+            // File-tree preview can replace the document before GPUI delivers
+            // blur. Native cancellation still belongs to the original buffer.
+            view.update(cx, |view, cx| {
+                view.replace_and_mark_text_in_range(None, "", None, window, cx);
+                assert_eq!(view.marked_text_range(window, cx), None);
+            });
+            core.read_with(cx, |core, _| {
+                assert_eq!(
+                    core.editor.documents[&original_doc].text().to_string(),
+                    "ab|cdé\n"
+                );
+                let replacement_doc = core.editor.tree.get(view_id).doc;
+                assert_eq!(
+                    core.editor.documents[&replacement_doc].text().to_string(),
+                    "other document\n"
+                );
+            });
+        });
+    }
+
+    fn new_test_workspace<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        path: &Path,
+    ) -> (
+        Entity<Application>,
+        Entity<crate::workspace::Workspace>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        use crate::workspace::Workspace;
+        use nucleotide_ui::FocusCoordinator;
+
+        let _runtime = TEST_RUNTIME.enter();
+        let core = new_test_application(cx);
+        core.update(cx, |core, _cx| {
+            let _runtime = TEST_RUNTIME.enter();
+            core.project_directory = Some(path.parent().unwrap().to_path_buf());
+            core.editor.open(path, Action::VerticalSplit).unwrap();
+        });
+        cx.update(|cx| {
+            nucleotide_appearance::SystemAppearance::init(cx);
+            nucleotide_ui::init(cx, None);
+            let config = &core.read(cx).config;
+            let editor_font = config.editor_font();
+            let ui_font = config.ui_font();
+            let font = nucleotide_types::Font {
+                family: editor_font.family.clone(),
+                weight: editor_font.weight,
+                style: nucleotide_types::FontStyle::Normal,
+            };
+            cx.set_global(crate::types::FontSettings {
+                fixed_font: font.clone(),
+                var_font: font,
+            });
+            cx.set_global(crate::types::EditorFontConfig {
+                family: editor_font.family,
+                size: editor_font.size,
+                weight: editor_font.weight,
+                line_height: editor_font.line_height,
+            });
+            cx.set_global(crate::types::UiFontConfig {
+                family: ui_font.family,
+                size: ui_font.size,
+                weight: ui_font.weight,
+            });
+            let theme = crate::ThemeManager::new(core.read(cx).editor.theme.clone());
+            cx.set_global(theme.ui_theme().clone());
+            cx.set_global(theme);
+            cx.set_global(FocusCoordinator::default());
+            let vcs = nucleotide_vcs::VcsServiceHandle::new(Default::default(), cx);
+            cx.set_global(vcs);
+        });
+        let input = cx.new(|_| crate::Input);
+        let core_for_input = core.clone();
+        cx.update(|cx| {
+            cx.subscribe(&input, move |_, event: &crate::InputEvent, cx| {
+                core_for_input.update(cx, |core, cx| {
+                    core.handle_input_event(event.clone(), cx, TEST_RUNTIME.handle().clone());
+                });
+            })
+            .detach();
+        });
+        let core_for_workspace = core.clone();
+        let (workspace, cx) = cx.add_window_view(move |window, cx| {
+            let _runtime = TEST_RUNTIME.enter();
+            let overlay = cx.new(|cx| {
+                let view = crate::overlay::OverlayView::new(
+                    &cx.focus_handle(),
+                    &core_for_workspace,
+                    TEST_RUNTIME.handle().clone(),
+                );
+                view.subscribe(&core_for_workspace, cx);
+                view
+            });
+            let notifications = cx.new(|_| crate::notification::NotificationView::new());
+            let info = cx.new(|_| crate::info_box::InfoBoxView::new());
+            let updates = cx.new(|cx| {
+                crate::updates::UpdateController::new(
+                    crate::config::UpdatesConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            Workspace::with_views(
+                core_for_workspace,
+                input,
+                TEST_RUNTIME.handle().clone(),
+                overlay,
+                notifications,
+                info,
+                Arc::new(crate::input_coordinator::InputCoordinator::new()),
+                updates,
+                window,
+                cx,
+            )
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        (core, workspace, cx)
+    }
+
+    #[gpui::test]
+    fn split_tabs_transfer_through_drag_and_drop(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, MouseButton, point, px};
+        let _runtime = TEST_RUNTIME.enter();
+        let root = tempdir().unwrap();
+        let alpha_path = root.path().join("alpha.txt");
+        let beta_path = root.path().join("beta.txt");
+        fs::write(&alpha_path, "alpha\n").unwrap();
+        fs::write(&beta_path, "beta\n").unwrap();
+        let (core, workspace, cx) = new_test_workspace(cx, &alpha_path);
+        let (left, alpha, beta) = core.update(cx, |core, cx| {
+            let mut config = (**core.helix_config_arc.load()).clone();
+            config.editor.bufferline = helix_view::editor::BufferLine::Always;
+            core.helix_config_arc.store(Arc::new(config));
+            let left = core.editor.tree.focus;
+            let alpha = core.editor.tree.get(left).doc;
+            let beta = core.editor.open(&beta_path, Action::Load).unwrap();
+            cx.emit(crate::Update::Redraw);
+            (left, alpha, beta)
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_editor(window, cx)
+        });
+        cx.simulate_keystrokes("ctrl-w v");
+        let right = core.read_with(cx, |core, _| core.editor.tree.focus);
+        assert_ne!(left, right);
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        // Selectors locate public tab hitboxes; clicks and drops exercise the
+        // actual callbacks rather than calling workspace transfer helpers.
+        let alpha_left = Box::leak(format!("pane-tab-{:?}-{}", left, alpha).into_boxed_str());
+        let beta_left = Box::leak(format!("pane-tab-{:?}-{}", left, beta).into_boxed_str());
+        let alpha_right = Box::leak(format!("pane-tab-{:?}-{}", right, alpha).into_boxed_str());
+        let beta_right = Box::leak(format!("pane-tab-{:?}-{}", right, beta).into_boxed_str());
+        let start = cx.debug_bounds(beta_left).unwrap().center();
+        let end = cx.debug_bounds(alpha_right).unwrap().center();
+        cx.simulate_mouse_move(start, None, Modifiers::none());
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        cx.simulate_mouse_move(
+            start + point(px(20.0), px(0.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        core.read_with(cx, |core, _| {
+            assert_eq!(core.editor.tree.views().count(), 2);
+            assert_eq!(core.editor.tree.get(left).doc, alpha);
+            assert_eq!(core.editor.tree.get(right).doc, beta);
+        });
+        assert!(cx.debug_bounds(beta_left).is_none());
+        assert!(cx.debug_bounds(beta_right).is_some());
+        assert!(cx.debug_bounds(alpha_right).is_some());
+
+        // A click in the unfocused pane targets that pane, not the destination.
+        let position = cx.debug_bounds(alpha_left).unwrap().center();
+        cx.simulate_click(position, Modifiers::none());
+        core.read_with(cx, |core, _| assert_eq!(core.editor.tree.focus, left));
+
+        // Moving its last tab onto an existing copy closes only the empty pane.
+        let start = cx.debug_bounds(alpha_left).unwrap().center();
+        let end = cx.debug_bounds(alpha_right).unwrap().center();
+        cx.simulate_mouse_move(start, None, Modifiers::none());
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            start + point(px(20.0), px(0.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        core.read_with(cx, |core, _| {
+            assert_eq!(core.editor.tree.views().count(), 1);
+            assert_eq!(core.editor.tree.get(right).doc, alpha);
+            assert_eq!(core.editor.documents[&beta].text().to_string(), "beta\n");
+        });
+
+        // Closing a shared dirty tab removes only that pane's copy; closing
+        // the last copy must keep its unsaved buffer until confirmed.
+        cx.simulate_keystrokes("i");
+        cx.simulate_input("changed");
+        cx.simulate_keystrokes("escape ctrl-w v");
+        let copy = core.read_with(cx, |core, _| core.editor.tree.focus);
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let alpha_copy = Box::leak(format!("pane-tab-{:?}-{}", copy, alpha).into_boxed_str());
+        let point = cx.debug_bounds(alpha_copy).unwrap().center();
+        cx.simulate_mouse_down(point, MouseButton::Middle, Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Middle, Modifiers::none());
+        cx.run_until_parked();
+        core.read_with(cx, |core, _| {
+            assert_eq!(core.editor.tree.views().count(), 1);
+            assert!(core.editor.documents[&alpha].is_modified());
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let point = cx.debug_bounds(alpha_right).unwrap().center();
+        cx.simulate_mouse_down(point, MouseButton::Middle, Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Middle, Modifiers::none());
+        cx.run_until_parked();
+        core.read_with(cx, |core, _| {
+            assert_eq!(core.editor.tree.get(right).doc, alpha);
+            assert_eq!(
+                core.editor.documents[&alpha].text().to_string(),
+                "changedalpha\n"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn pane_edge_drag_previews_and_splits_only_the_destination(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, MouseButton, point, px};
+        let _runtime = TEST_RUNTIME.enter();
+        let root = tempdir().unwrap();
+        let alpha_path = root.path().join("alpha.txt");
+        let beta_path = root.path().join("beta.txt");
+        fs::write(&alpha_path, "alpha\n").unwrap();
+        fs::write(&beta_path, "beta\n").unwrap();
+
+        for (horizontal, before) in [(true, true), (true, false), (false, true), (false, false)] {
+            let (core, workspace, cx) = new_test_workspace(cx, &alpha_path);
+            let (source, alpha, beta) = core.update(cx, |core, cx| {
+                let mut config = (**core.helix_config_arc.load()).clone();
+                config.editor.bufferline = helix_view::editor::BufferLine::Always;
+                core.helix_config_arc.store(Arc::new(config));
+                let source = core.editor.tree.focus;
+                let alpha = core.editor.tree.get(source).doc;
+                let beta = core.editor.open(&beta_path, Action::Load).unwrap();
+                cx.emit(crate::Update::Redraw);
+                (source, alpha, beta)
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear());
+            let (target, sibling) = core.update(cx, |core, cx| {
+                core.editor.switch(alpha, Action::VerticalSplit);
+                let target = core.editor.tree.focus;
+                core.editor.switch(alpha, Action::VerticalSplit);
+                let sibling = core.editor.tree.focus;
+                cx.emit(crate::Update::Redraw);
+                (target, sibling)
+            });
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.focus_editor(window, cx)
+            });
+            let draw = |cx: &mut gpui::VisualTestContext| {
+                cx.run_until_parked();
+                cx.update(|window, cx| window.draw(cx).clear());
+            };
+            draw(cx);
+            let tab = Box::leak(format!("pane-tab-{source:?}-{beta}").into_boxed_str());
+            let target_selector = Box::leak(format!("editor-pane-{target:?}").into_boxed_str());
+            let source_body = Box::leak(format!("pane-drop-body-{source:?}").into_boxed_str());
+            let target_body = Box::leak(format!("pane-drop-body-{target:?}").into_boxed_str());
+            let start = cx.debug_bounds(tab).unwrap().center();
+            let bounds = cx.debug_bounds(target_selector).unwrap();
+            let body = cx.debug_bounds(target_body).unwrap();
+            let end = if horizontal {
+                point(
+                    if before {
+                        bounds.left() + px(8.0)
+                    } else {
+                        bounds.right() - px(8.0)
+                    },
+                    body.center().y,
+                )
+            } else {
+                point(
+                    bounds.center().x,
+                    if before {
+                        body.top() + px(8.0)
+                    } else {
+                        bounds.bottom() - px(8.0)
+                    },
+                )
+            };
+            let original = core.read_with(cx, |core, _| {
+                [source, target, sibling].map(|id| core.editor.tree.get(id).area)
+            });
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_move(
+                start + point(px(20.0), px(0.0)),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            draw(cx);
+            // This tall, narrow pane distinguishes normalized edge distance
+            // from pixel distance: the latter would incorrectly choose left.
+            cx.simulate_mouse_move(
+                bounds.origin + point(bounds.size.width * 0.2, bounds.size.height * 0.175),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            draw(cx);
+            let normalized_preview = cx.debug_bounds("pane-drop-preview").unwrap();
+            assert!((normalized_preview.size.width - bounds.size.width).abs() < px(1.0));
+            cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+            draw(cx);
+            let preview = cx.debug_bounds("pane-drop-preview").unwrap();
+            assert!(
+                (preview.size.width - bounds.size.width / if horizontal { 2.0 } else { 1.0 }).abs()
+                    < px(1.0)
+            );
+            assert!(
+                (preview.size.height - bounds.size.height / if horizontal { 1.0 } else { 2.0 })
+                    .abs()
+                    < px(1.0)
+            );
+            assert!(
+                (preview.left()
+                    - if horizontal && !before {
+                        bounds.center().x
+                    } else {
+                        bounds.left()
+                    })
+                .abs()
+                    < px(1.0)
+            );
+            assert!(
+                (preview.top()
+                    - if !horizontal && !before {
+                        bounds.center().y
+                    } else {
+                        bounds.top()
+                    })
+                .abs()
+                    < px(1.0)
+            );
+            core.read_with(cx, |core, _| {
+                assert_eq!(core.editor.tree.views().count(), 3);
+                assert_eq!(core.editor.tree.get(target).area, original[1]);
+            });
+
+            // Leaving the target and cancelling cannot change the layout or
+            // leave a stale shaded rectangle behind. The multi-tab source
+            // also offers a split preview without changing the layout.
+            cx.simulate_mouse_move(
+                point(px(5.0), px(5.0)),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            draw(cx);
+            assert!(cx.debug_bounds("pane-drop-preview").is_none());
+            let source_center = cx.debug_bounds(source_body).unwrap().center();
+            cx.simulate_mouse_move(source_center, MouseButton::Left, Modifiers::none());
+            draw(cx);
+            assert!(cx.debug_bounds("pane-drop-preview").is_some());
+            cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+            draw(cx);
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+            assert!(cx.debug_bounds("pane-drop-preview").is_none());
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+            core.read_with(cx, |core, _| {
+                assert_eq!(core.editor.tree.views().count(), 3)
+            });
+
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_move(
+                start + point(px(20.0), px(0.0)),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            draw(cx);
+            cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+            draw(cx);
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+            draw(cx);
+            assert!(cx.debug_bounds("pane-drop-preview").is_none());
+            let destination = core.read_with(cx, |core, _| {
+                let destination = core.editor.tree.focus;
+                assert_eq!(core.editor.tree.views().count(), 4);
+                assert_eq!(core.editor.tree.get(source).area, original[0]);
+                assert_eq!(core.editor.tree.get(sibling).area, original[2]);
+                assert_eq!(core.editor.tree.get(source).doc, alpha);
+                assert_eq!(core.editor.tree.get(target).doc, alpha);
+                assert_eq!(core.editor.tree.get(destination).doc, beta);
+                let moved = core.editor.tree.get(destination).area;
+                let remaining = core.editor.tree.get(target).area;
+                if horizontal {
+                    assert_eq!(moved.height, original[1].height);
+                    assert!(moved.width.abs_diff(remaining.width) <= 1);
+                    assert_eq!(moved.x < remaining.x, before);
+                } else {
+                    assert_eq!(moved.width, original[1].width);
+                    assert!(moved.height.abs_diff(remaining.height) <= 1);
+                    assert_eq!(moved.y < remaining.y, before);
+                }
+                destination
+            });
+            assert!(cx.debug_bounds(tab).is_none());
+            let moved_tab = Box::leak(format!("pane-tab-{destination:?}-{beta}").into_boxed_str());
+            let retained_tab = Box::leak(format!("pane-tab-{source:?}-{alpha}").into_boxed_str());
+            assert!(cx.debug_bounds(moved_tab).is_some());
+            assert!(cx.debug_bounds(retained_tab).is_some());
+        }
+    }
+
+    #[gpui::test]
+    fn pane_tab_drag_creates_first_split(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, MouseButton, point, px};
+        let _runtime = TEST_RUNTIME.enter();
+        let root = tempdir().unwrap();
+        let alpha_path = root.path().join("alpha.txt");
+        let beta_path = root.path().join("beta.txt");
+        let gamma_path = root.path().join("gamma.txt");
+        fs::write(&alpha_path, "alpha\n").unwrap();
+        fs::write(&beta_path, "beta\n").unwrap();
+        fs::write(&gamma_path, "gamma\n").unwrap();
+
+        for (horizontal, before) in [(true, true), (true, false), (false, true), (false, false)] {
+            for active in [false, true] {
+                let (core, workspace, cx) = new_test_workspace(cx, &alpha_path);
+                let (source, alpha, beta, gamma) = core.update(cx, |core, cx| {
+                    let mut config = (**core.helix_config_arc.load()).clone();
+                    config.editor.bufferline = helix_view::editor::BufferLine::Always;
+                    core.helix_config_arc.store(Arc::new(config));
+                    let source = core.editor.tree.focus;
+                    let alpha = core.editor.tree.get(source).doc;
+                    let beta = core.editor.open(&beta_path, Action::Load).unwrap();
+                    let gamma = core.editor.open(&gamma_path, Action::Load).unwrap();
+                    if active {
+                        core.editor.switch(beta, Action::Replace);
+                    }
+                    cx.emit(crate::Update::Redraw);
+                    (source, alpha, beta, gamma)
+                });
+                workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.focus_editor(window, cx)
+                });
+                let draw = |cx: &mut gpui::VisualTestContext| {
+                    cx.run_until_parked();
+                    cx.update(|window, cx| window.draw(cx).clear());
+                };
+                draw(cx);
+                let pane = Box::leak(format!("editor-pane-{source:?}").into_boxed_str());
+                let bounds = cx.debug_bounds(pane).unwrap();
+                let end = if horizontal {
+                    point(
+                        if before {
+                            bounds.left() + px(8.0)
+                        } else {
+                            bounds.right() - px(8.0)
+                        },
+                        bounds.center().y,
+                    )
+                } else {
+                    point(
+                        bounds.center().x,
+                        if before {
+                            bounds.top() + px(80.0)
+                        } else {
+                            bounds.bottom() - px(8.0)
+                        },
+                    )
+                };
+                let lone_tab = Box::leak(format!("pane-tab-{source:?}-{alpha}").into_boxed_str());
+                let tab = Box::leak(format!("pane-tab-{source:?}-{beta}").into_boxed_str());
+                let start = cx.debug_bounds(tab).unwrap().center();
+                cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+                cx.simulate_mouse_move(
+                    start + point(px(20.0), px(0.0)),
+                    MouseButton::Left,
+                    Modifiers::none(),
+                );
+                draw(cx);
+                cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+                draw(cx);
+                let preview = cx.debug_bounds("pane-drop-preview").unwrap();
+                assert!(
+                    (preview.size.width - bounds.size.width / if horizontal { 2.0 } else { 1.0 })
+                        .abs()
+                        < px(1.0)
+                );
+                assert!(
+                    (preview.size.height - bounds.size.height / if horizontal { 1.0 } else { 2.0 })
+                        .abs()
+                        < px(1.0)
+                );
+                core.read_with(cx, |core, _| {
+                    assert_eq!(core.editor.tree.views().count(), 1)
+                });
+                cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+                draw(cx);
+                assert!(cx.debug_bounds("pane-drop-preview").is_none());
+                let destination = core.read_with(cx, |core, _| {
+                    assert_eq!(core.editor.tree.views().count(), 2);
+                    let destination = core.editor.tree.focus;
+                    assert_ne!(destination, source);
+                    assert_eq!(core.editor.tree.get(source).doc, alpha);
+                    assert_eq!(core.editor.tree.get(destination).doc, beta);
+                    let moved = core.editor.tree.get(destination).area;
+                    let remaining = core.editor.tree.get(source).area;
+                    if horizontal {
+                        assert_eq!(moved.height, remaining.height);
+                        assert!(moved.width.abs_diff(remaining.width) <= 1);
+                        assert_eq!(moved.x < remaining.x, before);
+                    } else {
+                        assert_eq!(moved.width, remaining.width);
+                        assert!(moved.height.abs_diff(remaining.height) <= 1);
+                        assert_eq!(moved.y < remaining.y, before);
+                    }
+                    destination
+                });
+                assert!(cx.debug_bounds(lone_tab).is_some());
+                assert!(cx.debug_bounds(tab).is_none());
+                let moved_tab =
+                    Box::leak(format!("pane-tab-{destination:?}-{beta}").into_boxed_str());
+                assert!(cx.debug_bounds(moved_tab).is_some());
+
+                // A lone tab cannot be transferred into a split of its own pane.
+                let destination_pane =
+                    Box::leak(format!("editor-pane-{destination:?}").into_boxed_str());
+                let start = cx.debug_bounds(moved_tab).unwrap().center();
+                let end = cx.debug_bounds(destination_pane).unwrap().center();
+                cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+                cx.simulate_mouse_move(
+                    start + point(px(20.0), px(0.0)),
+                    MouseButton::Left,
+                    Modifiers::none(),
+                );
+                draw(cx);
+                cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+                draw(cx);
+                assert!(cx.debug_bounds("pane-drop-preview").is_none());
+                cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+                draw(cx);
+                core.read_with(cx, |core, _| {
+                    assert_eq!(core.editor.tree.views().count(), 2)
+                });
+
+                // Closing the moved tab must close its split, even if that
+                // view inherited history for documents in the source pane.
+                let position = cx.debug_bounds(moved_tab).unwrap().center();
+                cx.simulate_mouse_down(position, MouseButton::Middle, Modifiers::none());
+                cx.simulate_mouse_up(position, MouseButton::Middle, Modifiers::none());
+                draw(cx);
+                core.read_with(cx, |core, _| {
+                    assert_eq!(core.editor.tree.views().count(), 1);
+                    assert!(!core.editor.tree.contains(destination));
+                    assert_eq!(core.editor.tree.get(source).doc, alpha);
+                    assert!(!core.editor.documents.contains_key(&beta));
+                    assert_eq!(core.editor.documents[&gamma].text().to_string(), "gamma\n");
+                });
+                assert!(cx.debug_bounds(destination_pane).is_none());
+                assert!(cx.debug_bounds(moved_tab).is_none());
+                assert!(cx.debug_bounds(lone_tab).is_some());
+                let gamma_tab = Box::leak(format!("pane-tab-{source:?}-{gamma}").into_boxed_str());
+                assert!(cx.debug_bounds(gamma_tab).is_some());
+
+                // Closing the remaining tabs must leave the final editor pane.
+                for tab in [&*gamma_tab, &*lone_tab] {
+                    let position = cx.debug_bounds(tab).unwrap().center();
+                    cx.simulate_mouse_down(position, MouseButton::Middle, Modifiers::none());
+                    cx.simulate_mouse_up(position, MouseButton::Middle, Modifiers::none());
+                    draw(cx);
+                    core.read_with(cx, |core, _| {
+                        assert_eq!(core.editor.tree.views().count(), 1)
+                    });
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn workspace_focus_follows_splits_and_overlay_dismissal_without_stealing_tree_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::Focusable;
+        use nucleotide_ui::FocusCoordinator;
+        let _runtime = TEST_RUNTIME.enter();
+        let root = tempdir().unwrap();
+        let path = root.path().join("focus.txt");
+        fs::write(&path, "first line\nsecond line\n").unwrap();
+        let (core, workspace, cx) = new_test_workspace(cx, &path);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_file_tree(window, cx)
+        });
+        // A non-focus update and redraw must leave the tree's keyboard receiver intact.
+        core.update(cx, |_, cx| {
+            cx.emit(crate::Update::Info(helix_view::info::Info {
+                title: "hint".into(),
+                text: "hint".into(),
+                width: 4,
+                height: 1,
+            }));
+            cx.emit(crate::Update::Redraw);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(
+                cx.global::<FocusCoordinator>()
+                    .file_tree_focus()
+                    .unwrap()
+                    .is_focused(window)
+            );
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_editor(window, cx)
+        });
+        // A completion may remain behind a prompt but must not block restoration.
+        let completion = cx.new(nucleotide_ui::completion_v2::CompletionView::new);
+        core.update(cx, |_, cx| cx.emit(crate::Update::Completion(completion)));
+        cx.simulate_keystrokes(":");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(
+                cx.global::<FocusCoordinator>()
+                    .prompt_focus()
+                    .unwrap()
+                    .is_focused(window)
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(
+                cx.global::<FocusCoordinator>()
+                    .editor_focus()
+                    .unwrap()
+                    .is_focused(window)
+            );
+        });
+        cx.simulate_keystrokes("ctrl-w v");
+        cx.run_until_parked();
+        let right_view = core.read_with(cx, |core, _| {
+            assert_eq!(core.editor.tree.views().count(), 2);
+            core.editor.tree.focus
+        });
+        let right_focus =
+            cx.update(|_, cx| cx.global::<FocusCoordinator>().editor_focus().unwrap());
+        cx.update(|window, cx| {
+            assert!(
+                cx.global::<FocusCoordinator>()
+                    .editor_focus()
+                    .unwrap()
+                    .is_focused(window)
+            );
+        });
+        cx.simulate_keystrokes("ctrl-w h");
+        cx.run_until_parked();
+        core.read_with(cx, |core, _| assert_ne!(core.editor.tree.focus, right_view));
+        cx.update(|window, cx| {
+            assert!(
+                cx.global::<FocusCoordinator>()
+                    .editor_focus()
+                    .unwrap()
+                    .is_focused(window)
+            );
+            assert!(workspace.focus_handle(cx).contains_focused(window, cx));
+        });
+        // GPUI traversal into a split must activate it even without a pointer event.
+        cx.update(|window, cx| {
+            window.focus(&right_focus, cx);
+            window.draw(cx).clear();
+        });
+        cx.run_until_parked();
+        core.read_with(cx, |core, _| assert_eq!(core.editor.tree.focus, right_view));
+
+        // The terminal must retain focus even before its async model is registered.
+        cx.dispatch_action(crate::actions::workspace::ToggleTerminal);
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(
+                cx.global::<FocusCoordinator>()
+                    .terminal_focus()
+                    .unwrap()
+                    .is_focused(window)
+            );
+        });
+        cx.dispatch_action(crate::actions::workspace::ToggleTerminal);
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(
+                cx.global::<FocusCoordinator>()
+                    .editor_focus()
+                    .unwrap()
+                    .is_focused(window)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn native_completion_accepts_prefix_edits_but_rejects_unrelated_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use helix_core::{Selection, Transaction};
+        use helix_view::document::Mode;
+        use nucleotide_events::completion::{
+            CompletionEdit, CompletionItem, CompletionItemKind, CompletionOffsetEncoding,
+            CompletionPosition, CompletionRange, CompletionTextEdit,
+        };
+
+        let _runtime = TEST_RUNTIME.enter();
+        let root = tempdir().unwrap();
+        let path = root.path().join("completion.txt");
+        let original = "😀:al|TAIL\n";
+        fs::write(&path, original).unwrap();
+        let (core, workspace, cx) = new_test_workspace(cx, &path);
+        for case in ["typed", "backspace", "commit", "unrelated", "cursor"] {
+            let (doc_id, view_id) = core.update(cx, |core, cx| {
+                core.editor.mode = Mode::Insert;
+                let view_id = core.editor.tree.focus;
+                let doc_id = core.editor.tree.get(view_id).doc;
+                let doc = core.editor.documents.get_mut(&doc_id).unwrap();
+                let transaction = Transaction::change(
+                    doc.text(),
+                    [(0, doc.text().len_chars(), Some(original.into()))].into_iter(),
+                )
+                .with_selection(Selection::point(4));
+                doc.apply(&transaction, view_id);
+                cx.notify();
+                (doc_id, view_id)
+            });
+            cx.run_until_parked();
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.focus_editor(window, cx);
+                let item = CompletionItem::new("alpineZ9".into(), CompletionItemKind::Variable)
+                    .with_commit_characters(vec![".".into()])
+                    .with_edit(CompletionEdit {
+                        offset_encoding: CompletionOffsetEncoding::Utf16,
+                        text_edit: Some(CompletionTextEdit {
+                            range: CompletionRange {
+                                start: CompletionPosition {
+                                    line: 0,
+                                    character: 3,
+                                },
+                                end: CompletionPosition {
+                                    line: 0,
+                                    character: 5,
+                                },
+                            },
+                            new_text: "alpineZ9".into(),
+                        }),
+                        additional_text_edits: Vec::new(),
+                    });
+                workspace.show_completion_items_with_prefix(
+                    vec![item],
+                    "al".into(),
+                    doc_id,
+                    view_id,
+                    false,
+                    Vec::new(),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            match case {
+                "typed" => cx.simulate_input("p"),
+                "backspace" => cx.simulate_keystrokes("backspace"),
+                "commit" => cx.simulate_input("p."),
+                "unrelated" => {
+                    core.update(cx, |core, cx| {
+                        let doc = core.editor.documents.get_mut(&doc_id).unwrap();
+                        let transaction = Transaction::change(
+                            doc.text(),
+                            [(5, 9, Some("EVIL".into()))].into_iter(),
+                        );
+                        doc.apply(&transaction, view_id);
+                        cx.notify();
+                    });
+                    cx.run_until_parked();
+                }
+                "cursor" => {
+                    core.update(cx, |core, _| {
+                        core.editor
+                            .documents
+                            .get_mut(&doc_id)
+                            .unwrap()
+                            .set_selection(view_id, Selection::single(5, 6));
+                    });
+                }
+                _ => unreachable!(),
+            }
+            if case != "commit" {
+                cx.simulate_keystrokes("tab");
+            }
+            let expected = match case {
+                "commit" => "😀:alpineZ9.|TAIL\n",
+                "unrelated" => "😀:al|EVIL\n",
+                "cursor" => original,
+                _ => "😀:alpineZ9|TAIL\n",
+            };
+            core.read_with(cx, |core, _| {
+                assert_eq!(
+                    core.editor.documents[&doc_id].text().to_string(),
+                    expected,
+                    "{case}"
+                );
+            });
+        }
+    }
+
     fn subscribe_application_updates(
         cx: &mut gpui::TestAppContext,
         app: &Entity<Application>,

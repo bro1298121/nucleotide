@@ -64,6 +64,23 @@ The old `nucleotide_ui::global_input` dispatcher has been removed. Do not add a
 second shortcut registry, dismiss-handler registry, or focus-group manager for
 app UI. Terminal byte translation uses `nucleotide_ui::terminal_keys` instead.
 
+The editor registers GPUI's `EntityInputHandler` for native text and input method
+editor (IME) composition. Unbound printable insert-mode keys reach that handler;
+Helix bindings and command modes stay on the raw-key bridge. Native ranges use
+UTF-16 offsets, while document transactions use character offsets.
+
+Preedit text uses temporary Helix transactions and a savepoint. Cancellation
+restores the original document, even if file preview has already switched the
+view to another buffer. Committed text goes through Helix insertion so
+multi-cursor edits, undo and dot-repeat retain their usual semantics. Commands
+and focus loss cancel composition and briefly disable native input across
+backend-observed frames to reject late commits.
+
+GPUI's `unmark_text` finalizes the current preedit, matching Zed. It is not a
+cancellation callback: Wayland sends it before pointer presses, so a click can
+finalize preedit before the ensuing focus loss. Subsequent cancellation must
+not undo text that has already been finalized.
+
 ## Focus
 
 Focusable components should expose or own a `FocusHandle` and render it with
@@ -97,6 +114,40 @@ local Space/Enter handlers for ordinary button clicks.
 as a role registry for major surfaces such as the editor, terminal, picker,
 prompt, diagnostics, and file tree. It should not become a second per-widget
 navigation system.
+
+GPUI owns keyboard focus. Helix's active view, mirrored by `ViewManager` and
+`DocumentView::is_focused`, identifies the active editor split, not the focused
+UI surface. A document's GPUI focus subscription activates its Helix split.
+Helix split transitions move GPUI focus only while the previous editor surface
+still owns it; they must not take focus from the tree, terminal or an overlay.
+
+Perform focus changes in actions, lifecycle subscriptions and explicit opening
+or dismissal transitions, never in `render`. Windowless core events defer their
+transition until the current effect cycle ends. `Workspace` uses
+`on_focus_lost` when a focused surface disappears, while `ModalLayer` restores
+its captured previous focus. Dismissing a completion that never owned focus
+must not move keyboard focus. Workspace mouse bubbling must not override a
+child's focus choice.
+
+## Native editor geometry
+
+`NativeEditorView` prepares each frame in prepaint, once its pane bounds are
+known, before constructing and prepainting `EditorSurface`. Preparation uses
+`prepare_native_editor_frame` to synchronize gutters, soft wrap, scroll extent,
+cursor reveal and surface metrics. `EditorDocumentElement` paints that prepared
+frame with the same immutable layout. Do not synchronize geometry in paint or
+schedule a second render to repair scrollbar geometry.
+
+Scrollbar thumbs and markers use the current prepaint track bounds, not the
+previous frame's stored bounds. The active Helix split publishes its shaped
+cursor anchor during prepaint; completion overlays read it during their own
+prepaint. Inactive splits must not overwrite the active split's anchor. Keep
+per-pane native bounds local: Helix's tree remains authoritative for split
+layout.
+
+Completion content stays in layout flow so its anchor can measure the list and
+documentation panel together. Use deferred drawing for the popup so window-edge
+snapping does not leave it clipped by its editor container.
 
 ## Lists And Menus
 
@@ -157,8 +208,43 @@ Non-editor text fields should use `nucleotide_ui::TextInput`. It owns editing
 state, cursor movement, selection, clipboard actions, marked text / IME,
 submit/cancel events, and token styling.
 
-The Helix-backed editor remains on the Helix input path. The terminal remains on
-the terminal byte path.
+The Helix-backed editor registers `DocumentView` as an `EntityInputHandler`
+through `ElementInputHandler` during document paint. Normal/select keys, insert
+bindings, pending key sequences, callbacks and shortcuts remain on the Helix
+command bridge. Unbound printable insert keys propagate to GPUI's committed-text
+path; neither the document nor the workspace inserts their raw key a second time.
+Native commits use Helix insertion primitives and retain auto-pairs, completion
+hooks, multi-cursors, insert-session undo and counted dot-repeat. Replay records
+which characters were committed text so it doesn't reinterpret them as bindings.
+Committed characters check the workspace's completion commit-character path
+before insertion. Raw preedit keys must not accept or filter a completion.
+Completion sessions retain their original document and prefix range. Acceptance
+may reuse a session after word-prefix typing/deletion only when all text outside
+that prefix is unchanged; LSP edit ranges map through that prefix change. Other
+edits and changes during asynchronous resolution retain strict version checks.
+Helix macro recording/replay remains unsupported by this command bridge;
+dot-repeat is not macro support.
+
+Native ranges use UTF-16 code units and convert through Rope character indices.
+The insert cursor is advertised as a caret, not Helix's one-grapheme block
+selection. Explicit replacement ranges replace text; ordinary commits keep
+Helix's insert-at-each-cursor semantics. Marked text uses temporary Helix
+transactions and a savepoint. Commit restores the savepoint before inserting
+the final text; cancellation restores the original text and selections. Blur,
+window deactivation, pointer selection and command keys cancel pending preedit.
+Application-initiated cancellation also resets OS preedit by disabling native
+input through a backend-observed frame before re-enabling it. Printable keys
+stay on the Helix bridge during that reset. Capture-phase completion commands
+must cancel preedit too, since they bypass the document's raw-key handler.
+Candidate bounds and point queries use the current painted line cache, including
+soft-wrap segments, display-byte maps, scrolling and pane bounds.
+
+Test native composition with an OS input method as well as the handler contract.
+On Linux, GPUI needs Wayland text-input-v3; a nested compositor that exposes only
+text-input-v1 cannot verify this path. Nested Sway with Fcitx5 Pinyin provides a
+working native control. Check saved files and protocol events independently of
+screenshots, and allow key hints and selection paint to settle before captures.
+The terminal remains on the terminal byte path.
 
 ## Resize And Drag
 
@@ -182,6 +268,26 @@ that should receive active drag move/up cleanup while a resize is in progress.
 Use higher-level wrappers like `sidebar_split`, `right_sidebar_split`, and
 `bottom_panel_split` when the component can own both layout and resize
 mechanics.
+
+Paint resize handles after both panes so the full hitbox stays reachable and
+drag initiation runs before editor selection handlers. Measure drag displacement
+from the original mouse-down position, including movement before GPUI's drag
+threshold. Cover both sides of the divider and a first move that leaves its
+hitbox in interaction tests.
+
+Editor selection drags stay with the pane that accepted the initial left-button
+press, even when the pointer leaves its bounds or crosses another pane. GPUI's
+hover-only `on_mouse_move` is not sufficient for this lifecycle: `EditorSurface`
+registers window-level move/up listeners during paint and gates them on its
+per-pane drag state. Other buttons and presses begun elsewhere do not arm it.
+
+After movement begins, holding the pointer near or beyond an edge scrolls the
+existing viewport on a 16 ms executor timer. Speed scales with overshoot and
+elapsed time; viewport limits still apply. Re-entering the centre pauses scroll
+without dropping the selection anchor. Each tick hit-tests the painted line
+cache before scrolling for the next frame, preserving same-frame geometry.
+Release (including outside), editor blur, window deactivation, and overlay focus
+transfer end the drag. A new press is required to resume after cancellation.
 
 ## Layout
 
