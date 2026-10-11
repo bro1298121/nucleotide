@@ -50,8 +50,9 @@ struct AnimState {
 /// A single in-flight scroll tween, or nothing at all.
 ///
 /// Sampling is a pure function of the elapsed time, never an incremental step.
-/// `NativeEditorView` is `RenderOnce` and a frame can run `render` more than
-/// once, so an incremental `pos += velocity` design would double-advance.
+/// `NativeEditorView` advances from `Element::prepaint` and a frame can run
+/// prepaint more than once, so an incremental `pos += velocity` design would
+/// double-advance.
 #[derive(Debug, Clone)]
 pub(crate) struct ScrollAnimation {
     state: Rc<RefCell<Option<AnimState>>>,
