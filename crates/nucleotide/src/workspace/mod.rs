@@ -6415,6 +6415,9 @@ impl Workspace {
             for (index, entry) in self.doc_sidebar_entries.iter().enumerate() {
                 body = body.child(
                     div()
+                        .id(SharedString::from(format!(
+                            "documentation-sidebar-entry-{index}"
+                        )))
                         .flex()
                         .flex_col()
                         .gap(tokens.sizes.space_2)
