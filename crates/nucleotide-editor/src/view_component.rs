@@ -17,7 +17,7 @@ use crate::{
 };
 
 type ScrollCallback = Rc<dyn Fn(&EditorViewport, ViewportScrollUpdate, &mut App)>;
-type PointerCallback = Rc<dyn Fn(EditorSurfacePointerEvent, &mut App) -> bool>;
+type PointerCallback = Rc<dyn Fn(EditorSurfacePointerEvent, &mut App)>;
 type PointerSelectionCallback =
     Rc<dyn Fn(EditorPointerSelectionPhase, EditorSurfacePointerEvent, &mut App) -> bool>;
 type CursorOverlayCallback = Rc<dyn Fn(Option<CursorOverlayPlan>, &mut App)>;
