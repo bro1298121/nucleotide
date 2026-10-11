@@ -128,7 +128,7 @@ jobs:
         run: |
           curl -fSL --retry 5 --retry-all-errors `
             -o zig.tar.xz `
-            https://ziglang.org/download/0.15.2/zig-x86_64-windows-0.15.2.tar.xz
+            https://ziglang.org/download/0.15.2/zig-x86_64-windows-0.15.2.zip
           tar -xf zig.tar.xz
           "$PWD\zig-x86_64-windows-0.15.2" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
