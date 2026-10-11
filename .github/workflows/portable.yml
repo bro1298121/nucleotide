@@ -1,4 +1,4 @@
-name: Portable Linux + macOS
+name: Portable Linux + macOS + Windows
 
 on:
   push:
@@ -116,4 +116,69 @@ jobs:
         with:
           name: nucleotide-macos-aarch64
           path: Nucleotide-aarch64.app.tar.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Zig 0.15.2
+        run: |
+          curl -fSL --retry 5 --retry-all-errors `
+            -o zig.tar.xz `
+            https://ziglang.org/download/0.15.2/zig-x86_64-windows-0.15.2.tar.xz
+          tar -xf zig.tar.xz
+          "$PWD\zig-x86_64-windows-0.15.2" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify Zig
+        run: zig version
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install Velopack CLI
+        run: dotnet tool update -g vpk --version 1.2.0
+
+      - name: Build
+        run: cargo build --release -p nucleotide --bins
+
+      - name: Fetch Helix runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $HELIX_REV = (Select-String -Path Cargo.toml -Pattern 'helix-loader = .*rev = "([0-9a-f]*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          git clone --depth 1 --branch 25.07.1 https://github.com/helix-editor/helix.git helix-temp
+          if ($HELIX_REV) {
+            git -C helix-temp fetch --depth 1 origin $HELIX_REV
+            git -C helix-temp checkout --detach FETCH_HEAD
+          }
+          try {
+            .\scripts\setup-windows-runtime.cmd -RuntimeSource helix-temp\runtime -NuclExe target\release\nucl-grammar.exe
+          } finally {
+            Remove-Item -LiteralPath helix-temp -Recurse -Force
+          }
+
+      - name: Package Velopack
+        shell: pwsh
+        run: .\scripts\package-velopack.ps1 -RequireRemoteHelpers
+
+      - name: Locate portable bundle
+        id: bundle
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -Path . -Recurse -Filter *-Portable.zip -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $zip) { throw "No *-Portable.zip produced by package-velopack.ps1" }
+          "zip_path=$($zip.FullName)" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nucleotide-windows-x86_64
+          path: |
+            ${{ steps.bundle.outputs.zip_path }}
+            **/RELEASES
+            **/*.nupkg
           if-no-files-found: error
