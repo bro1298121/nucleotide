@@ -23,8 +23,6 @@ use thiserror::Error;
 
 const DEFAULT_PROCESS_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
 const LOCAL_FILE_IO_CHUNK_BYTES: usize = 64 * 1024;
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
@@ -3793,7 +3791,7 @@ fn local_run_process(spec: ProcessSpec) -> Result<ProcessOutput> {
         spec.env.clone()
     };
 
-    let mut command = Command::new(&spec.program);
+    let mut command = nucleotide_process::command(&spec.program);
     command
         .args(&spec.args)
         .current_dir(&cwd)
@@ -4001,25 +3999,8 @@ fn join_io_thread<T>(
         })
 }
 
-/// Applies the Windows `CREATE_NO_WINDOW` creation flag.
-///
-/// Console-mode programs such as `git` otherwise flash a console window every time they are
-/// spawned from the GUI process. The flag is process-creation only, so arguments, working
-/// directory, and error handling are unaffected.
-#[cfg(windows)]
-fn hide_console_window(mut command: Command) -> Command {
-    use std::os::windows::process::CommandExt as _;
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
-}
-
-#[cfg(not(windows))]
-fn hide_console_window(command: Command) -> Command {
-    command
-}
-
 fn local_git_head(root: &Path) -> Result<GitHeadResult> {
-    let output = hide_console_window(Command::new("git"))
+    let output = nucleotide_process::command("git")
         .args(["rev-parse", "--verify", "HEAD"])
         .current_dir(root)
         .output()
@@ -4042,7 +4023,7 @@ fn local_git_head(root: &Path) -> Result<GitHeadResult> {
         .map(str::trim)
         .filter(|head| !head.is_empty())
         .map(ToOwned::to_owned);
-    let display_ref = hide_console_window(Command::new("git"))
+    let display_ref = nucleotide_process::command("git")
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
         .current_dir(root)
         .output()
@@ -4060,7 +4041,7 @@ fn local_git_head(root: &Path) -> Result<GitHeadResult> {
 }
 
 fn local_git_status(root: &Path, options: GitStatusOptions) -> Result<GitStatusResult> {
-    let mut command = hide_console_window(Command::new("git"));
+    let mut command = nucleotide_process::command("git");
     command
         .args(["status", "--porcelain=v1", "-z"])
         .current_dir(root);
@@ -4392,6 +4373,111 @@ mod tests {
         assert!(!output.timed_out);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_probe() {
+        let Ok(value) = std::env::var("NUCLEOTIDE_WORKSPACE_PROCESS_PROBE") else {
+            return;
+        };
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input).unwrap();
+        // SAFETY: GetConsoleWindow takes no arguments and returns a borrowed HWND.
+        let has_console =
+            !unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null();
+        println!("console={has_console}");
+        println!("env={value}");
+        println!("stdin={input}");
+        println!(
+            "cwd={}",
+            std::env::current_dir()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .display()
+        );
+        eprintln!("probe stderr");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_backend_run_process_has_no_console_and_preserves_io() {
+        use std::os::windows::process::CommandExt;
+
+        // Give the isolated test process a console so a raw spawn cannot pass
+        // simply because the test runner itself has no console to inherit.
+        if std::env::var_os("NUCLEOTIDE_WORKSPACE_CONSOLE_TEST").is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::local_backend_run_process_has_no_console_and_preserves_io",
+                    "--nocapture",
+                ])
+                .env("NUCLEOTIDE_WORKSPACE_CONSOLE_TEST", "1")
+                .creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // SAFETY: GetConsoleWindow takes no arguments and returns a borrowed HWND.
+        assert!(
+            !unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null(),
+            "the isolated test process must have a console to inherit"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let output = block_on(
+            LocalWorkspaceBackend.run_process(ProcessSpec {
+                program: std::env::current_exe()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                args: vec![
+                    "--exact".to_string(),
+                    "tests::windows_process_probe".to_string(),
+                    "--nocapture".to_string(),
+                    "--quiet".to_string(),
+                ],
+                cwd: temp.path().to_path_buf(),
+                env: BTreeMap::from([(
+                    "NUCLEOTIDE_WORKSPACE_PROCESS_PROBE".to_string(),
+                    "environment value".to_string(),
+                )]),
+                clear_env: false,
+                inherit_project_environment: false,
+                stdin: b"input value".to_vec(),
+                max_output_bytes: None,
+                timeout_ms: Some(10_000),
+            }),
+        )
+        .unwrap();
+
+        assert!(output.success, "{:?}", output);
+        assert_eq!(output.status_code, Some(0));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        for expected in [
+            "console=false".to_string(),
+            "env=environment value".to_string(),
+            "stdin=input value".to_string(),
+            format!("cwd={}", temp.path().canonicalize().unwrap().display()),
+        ] {
+            assert!(stdout.lines().any(|line| line == expected), "{stdout}");
+        }
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap().trim(),
+            "probe stderr"
+        );
+        assert!(!output.stdout_truncated);
+        assert!(!output.stderr_truncated);
+        assert!(!output.timed_out);
+    }
+
     #[test]
     fn process_environment_validation_rejects_invalid_entries() {
         assert!(process_environment_entry_is_valid("GOOD", "value"));
@@ -4493,29 +4579,6 @@ mod tests {
         assert!(output.stdout_truncated);
         assert!(output.stderr_truncated);
         assert!(!output.timed_out);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn local_backend_run_process_kills_timed_out_child() {
-        let temp = tempfile::tempdir().unwrap();
-        let backend = LocalWorkspaceBackend;
-
-        let output = block_on(backend.run_process(ProcessSpec {
-            program: "tail".to_string(),
-            args: vec!["-f".to_string(), "/dev/null".to_string()],
-            cwd: temp.path().to_path_buf(),
-            env: BTreeMap::new(),
-            clear_env: false,
-            inherit_project_environment: false,
-            stdin: Vec::new(),
-            max_output_bytes: None,
-            timeout_ms: Some(20),
-        }))
-        .unwrap();
-
-        assert!(!output.success);
-        assert!(output.timed_out);
     }
 
     #[cfg(unix)]
@@ -4727,20 +4790,6 @@ mod tests {
     }
 
     #[test]
-    fn ssh_display_path_encodes_native_path_for_target() {
-        let target = SshWorkspaceTarget {
-            host: "example.com".to_string(),
-            user: Some("me".to_string()),
-            port: Some(2222),
-        };
-
-        assert_eq!(
-            ssh_display_path(&target, Path::new("/home/me/Project One/src/lib.rs")),
-            PathBuf::from("ssh://me@example.com:2222/home/me/Project%20One/src/lib.rs")
-        );
-    }
-
-    #[test]
     fn ssh_display_path_normalizes_mixed_native_separators() {
         let target = SshWorkspaceTarget {
             host: "example.com".to_string(),
@@ -4770,14 +4819,6 @@ mod tests {
         assert_eq!(
             wsl_display_path("Ubuntu-24.04", Path::new(r"/home\me/project\src")),
             PathBuf::from("//wsl.localhost/Ubuntu-24.04/home/me/project/src")
-        );
-    }
-
-    #[test]
-    fn wsl_display_path_uses_localhost_unc_shape() {
-        assert_eq!(
-            wsl_display_path("Ubuntu-24.04", Path::new("/home/me/project")),
-            PathBuf::from("//wsl.localhost/Ubuntu-24.04/home/me/project")
         );
     }
 

@@ -1,9 +1,10 @@
 // ABOUTME: Per-frame document/view facts for native editor rendering
 // ABOUTME: Builds owned render state from Helix document and view inputs
 
-use std::time::Duration;
+use std::{ops::Range, time::Duration};
 
 use gpui::{Bounds, Font, Hsla, Pixels, TextRun};
+use helix_core::syntax::OverlayHighlights;
 use helix_view::{
     Document, Theme, View, ViewId,
     document::Mode,
@@ -84,6 +85,9 @@ pub struct EditorDocumentFrame {
     pub unwrapped_render_plan: Option<UnwrappedRenderPlan>,
     pub soft_wrap_line_runs: Vec<Vec<TextRun>>,
     pub unwrapped_highlighted_lines: Vec<UnwrappedHighlightedLine>,
+    pub selection_spans: Vec<(Range<usize>, Hsla)>,
+    pub gutter_selection_spans: Vec<(Range<usize>, Hsla)>,
+    pub matching_bracket_background: Option<(Range<usize>, Hsla)>,
     pub cursorcolumn_paint_plans: Vec<RulerPaintPlan>,
     pub frameline_paint_plans: Vec<RulerPaintPlan>,
     pub indent_guide_config: Option<IndentGuidePaintConfig>,
@@ -127,6 +131,68 @@ pub fn editor_document_frame(params: EditorDocumentFrameParams<'_>) -> EditorDoc
     let primary_cursor_col = primary_cursor_idx - line_start;
     let selection = params.document.selection(params.view_id);
     let primary_selection_index = selection.primary_index();
+    let matching_bracket_background = params
+        .is_focused
+        .then(|| {
+            let color = params
+                .theme
+                .get("ui.cursor.match")
+                .bg
+                .and_then(crate::style::helix_color_to_hsla)?;
+            let pos = crate::highlight::matching_bracket_position(params.view, params.document)?;
+            Some((pos..pos + 1, color))
+        })
+        .flatten();
+    let selection_spans = match crate::highlight::selection_overlay_highlights(
+        params.editor_mode,
+        params.document,
+        params.view,
+        params.theme,
+        &params.cursor_shape,
+    ) {
+        OverlayHighlights::Heterogenous { highlights } => highlights
+            .into_iter()
+            .filter_map(|(highlight, range)| {
+                let style = params.theme.highlight(highlight);
+                if crate::cursor_has_reversed_modifier(&style) {
+                    return None;
+                }
+                let color = style.bg?;
+                Some((range, crate::style::helix_color_to_hsla(color)?))
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let gutter_selection_spans = selection
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index == primary_selection_index)
+        .chain(
+            selection
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != primary_selection_index),
+        )
+        .filter_map(|(index, range)| {
+            let range = range.min_width_1(text.slice(..));
+            let start = text.char_to_line(range.from());
+            let end = text.char_to_line(range.to().saturating_sub(1));
+            if start == end {
+                return None;
+            }
+            let scope = if index == primary_selection_index {
+                "ui.selection.primary"
+            } else {
+                "ui.selection"
+            };
+            let color = params
+                .theme
+                .get(scope)
+                .bg
+                .or(params.theme.get("ui.selection").bg)?;
+            Some((start..end + 1, crate::style::helix_color_to_hsla(color)?))
+        })
+        .collect();
     let mut secondary_cursor_lines = selection
         .iter()
         .enumerate()
@@ -224,7 +290,7 @@ pub fn editor_document_frame(params: EditorDocumentFrameParams<'_>) -> EditorDoc
         whitespace_style: params.theme.get("ui.virtual.whitespace"),
     };
 
-    let soft_wrap_line_runs = {
+    let mut soft_wrap_line_runs = {
         let _timer = PerfTimer::new("editor_document_frame.soft_wrap_highlights")
             .with_warn_threshold(Duration::from_millis(6));
         soft_wrap_render_plan
@@ -239,7 +305,7 @@ pub fn editor_document_frame(params: EditorDocumentFrameParams<'_>) -> EditorDoc
             .unwrap_or_default()
     };
 
-    let unwrapped_highlighted_lines = {
+    let mut unwrapped_highlighted_lines = {
         let _timer = PerfTimer::new("editor_document_frame.unwrapped_highlights")
             .with_warn_threshold(Duration::from_millis(6));
         unwrapped_render_plan
@@ -253,6 +319,47 @@ pub fn editor_document_frame(params: EditorDocumentFrameParams<'_>) -> EditorDoc
             })
             .unwrap_or_default()
     };
+
+    if cursor_presentation.block_text.is_some() {
+        let cursor_range = primary_cursor_idx
+            ..helix_core::graphemes::next_grapheme_boundary(text.slice(..), primary_cursor_idx);
+        if let Some(plan) = &soft_wrap_render_plan {
+            for (visual, runs) in plan.visual_lines.iter().zip(&mut soft_wrap_line_runs) {
+                if visual.doc_line == primary_cursor_line
+                    && let Some(start) = visual.line_start_char
+                    && let Some(range) = crate::selection_painter::selection_display_range(
+                        text.slice(..),
+                        start,
+                        visual.text.as_ref(),
+                        &visual.display_map,
+                        visual.text_start_byte_offset,
+                        &cursor_range,
+                    )
+                {
+                    crate::line_text::break_ligatures_in_range(runs, range);
+                }
+            }
+        } else if let Some(plan) = &unwrapped_render_plan {
+            for (line, highlighted) in plan
+                .visible_lines
+                .iter()
+                .zip(&mut unwrapped_highlighted_lines)
+            {
+                if line.line_idx == primary_cursor_line
+                    && let Some(range) = crate::selection_painter::selection_display_range(
+                        text.slice(..),
+                        line.line_start,
+                        highlighted.line_text.display.as_ref(),
+                        &highlighted.line_text.map,
+                        0,
+                        &cursor_range,
+                    )
+                {
+                    crate::line_text::break_ligatures_in_range(&mut highlighted.line_runs, range);
+                }
+            }
+        }
+    }
 
     EditorDocumentFrame {
         gutter_width,
@@ -276,6 +383,9 @@ pub fn editor_document_frame(params: EditorDocumentFrameParams<'_>) -> EditorDoc
         unwrapped_render_plan,
         soft_wrap_line_runs,
         unwrapped_highlighted_lines,
+        selection_spans,
+        gutter_selection_spans,
+        matching_bracket_background,
         cursorcolumn_paint_plans: Vec::new(),
         frameline_paint_plans: Vec::new(),
         indent_guide_config: None,
@@ -654,7 +764,6 @@ mod tests {
             layout: &layout,
             bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(240.0), px(120.0))),
             scroll_line_offset: px(0.0),
-            horizontal_offset: 0,
             visible_lines: &visible_lines[..render_snapshot.last_row.min(visible_lines.len())],
             is_focused: true,
         });

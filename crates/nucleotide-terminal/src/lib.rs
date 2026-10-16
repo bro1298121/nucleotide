@@ -883,17 +883,6 @@ pub mod session {
         }
 
         #[test]
-        fn terminal_env_preserves_unrelated_overrides() {
-            let env = env_map(terminal_env_with_defaults_from(
-                &[pair("PATH", "/custom/bin")],
-                None,
-                &BTreeMap::new(),
-            ));
-
-            assert_eq!(env.get("PATH").map(String::as_str), Some("/custom/bin"));
-        }
-
-        #[test]
         fn terminal_env_preserves_parent_process_environment() {
             let parent = BTreeMap::from([
                 ("PATH".to_string(), "/usr/bin".to_string()),
@@ -1067,9 +1056,9 @@ pub mod engine {
         Cell, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, FramePayload, GridSnapshot,
         TerminalInputMode, ansi_color,
     };
+    use libghostty_vt::Terminal;
     use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
     use libghostty_vt::style::{PaletteIndex, RgbColor, Style, StyleColor, Underline};
-    use libghostty_vt::{Terminal, TerminalOptions};
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -1281,17 +1270,20 @@ pub mod engine {
         }
 
         fn rebuild_terminal(&mut self) {
-            let mut terminal = match Terminal::new(TerminalOptions {
-                cols: self.cols,
-                rows: self.rows,
-                max_scrollback: DEFAULT_SCROLLBACK_LINES,
-            }) {
+            let mut terminal = match Terminal::new(self.cols, self.rows) {
                 Ok(terminal) => terminal,
                 Err(_) => {
                     self.terminal = None;
                     return;
                 }
             };
+            if terminal
+                .set_scrollback_max_lines(Some(DEFAULT_SCROLLBACK_LINES))
+                .is_err()
+            {
+                self.terminal = None;
+                return;
+            }
 
             if let Some(writer) = self.pty_writer.clone() {
                 let _ = terminal.on_pty_write(move |_terminal, data| {

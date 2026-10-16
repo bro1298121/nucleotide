@@ -14,7 +14,7 @@ Run the script from the repository root:
 ```
 
 When `target/release/nucl` is missing, `bundle-mac.sh` runs a default release
-build. Install Zig 0.15.2 first, or run the script from `nix develop`, so the
+build. Install Zig 0.16.0 first, or run the script from `nix develop`, so the
 Ghostty-backed terminal dependency can build.
 
 The script creates `Nucleotide.app`.
@@ -114,7 +114,11 @@ xattr -r -d com.apple.quarantine Nucleotide.app
 Prepare a local runtime directory before bundling:
 
 ```bash
-git clone --depth 1 --branch 25.07.1 https://github.com/helix-editor/helix.git helix-temp
+HELIX_REV="$(sed -n 's/.*helix-loader = .*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml | head -n 1)"
+git init helix-temp
+git -C helix-temp remote add origin https://github.com/helix-editor/helix.git
+git -C helix-temp fetch --depth 1 origin "$HELIX_REV"
+git -C helix-temp checkout --detach FETCH_HEAD
 cp -r helix-temp/runtime ./runtime
 rm -rf helix-temp
 ```
@@ -131,3 +135,8 @@ Build the Linux helper artifacts before bundling:
 
 The Nix development shell includes the required Linux musl Rust targets, Zig,
 and `cargo-zigbuild`.
+
+Use `nix develop -c build-remote-helpers` to select Zig 0.15.2 for helper
+cross-builds. The integrated terminal uses the official Zig 0.16.0 binaries;
+the helpers retain 0.15.2 after their `zstd` dependency failed to link with
+nixpkgs' source-built 0.16.0.

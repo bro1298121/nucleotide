@@ -322,12 +322,16 @@ fn matching_bracket_highlight(
     doc: &Document,
     theme: &Theme,
 ) -> Option<OverlayHighlights> {
-    let syntax = doc.syntax()?;
     let highlight = theme.find_highlight_exact("ui.cursor.match")?;
+    let pos = matching_bracket_position(view, doc)?;
+    Some(OverlayHighlights::single(highlight, pos..pos + 1))
+}
+
+pub(crate) fn matching_bracket_position(view: &View, doc: &Document) -> Option<usize> {
+    let syntax = doc.syntax()?;
     let text = doc.text().slice(..);
     let pos = doc.selection(view.id).primary().cursor(text);
-    let pos = helix_core::match_brackets::find_matching_bracket(syntax, text, pos)?;
-    Some(OverlayHighlights::single(highlight, pos..pos + 1))
+    helix_core::match_brackets::find_matching_bracket(syntax, text, pos)
 }
 
 fn tabstop_highlights(doc: &Document, theme: &Theme) -> Option<OverlayHighlights> {
@@ -642,7 +646,7 @@ fn unwrapped_display_line_text(
 
         match (&grapheme.raw, grapheme.source) {
             (Grapheme::Other { g }, GraphemeSource::VirtualText { highlight }) => {
-                builder.push_virtual(g, highlight, context.tab_width);
+                builder.push_virtual(g, (highlight, grapheme.char_idx), context.tab_width);
             }
             (Grapheme::Tab { .. }, GraphemeSource::Document { codepoints }) if codepoints > 0 => {
                 builder.push_source_char('\t', context.tab_width);
@@ -764,7 +768,7 @@ fn viewport_byte_range(text: RopeSlice<'_>, row: usize, height: u16) -> Range<us
     }
 }
 
-fn selection_overlay_highlights(
+pub(crate) fn selection_overlay_highlights(
     mode: Mode,
     doc: &Document,
     view: &View,
@@ -911,9 +915,10 @@ fn apply_virtual_text_runs(
                             .min(display_len)
             })
             .map(|range| {
+                let (highlight, _) = range.metadata;
                 virtual_text_run(
                     end - start,
-                    range.metadata,
+                    highlight,
                     context.theme,
                     context.default_text_style,
                     context.fg_color,
@@ -1316,7 +1321,16 @@ impl<'t> OverlayHighlighter<'t> {
             };
 
             self.style = collected.into_iter().fold(base, |acc, highlight| {
-                let highlight_style = safe_highlight(self.theme, highlight);
+                let mut highlight_style = safe_highlight(self.theme, highlight);
+                if ["ui.selection", "ui.selection.primary"]
+                    .iter()
+                    .any(|scope| self.theme.find_highlight_exact(scope) == Some(highlight))
+                    && !crate::cursor_has_reversed_modifier(&highlight_style)
+                {
+                    // Selection backgrounds are filled as connected contours by the
+                    // frame painter. Reversed themes retain their per-cell colours.
+                    highlight_style.bg = None;
+                }
                 acc.patch(highlight_style)
             });
             self.update_pos();
@@ -1328,9 +1342,197 @@ impl<'t> OverlayHighlighter<'t> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use gpui::{black, font, px, white};
+    use helix_core::{Rope, Selection, text_annotations::InlineAnnotation};
     use helix_view::view::ViewPosition;
+    use helix_view::{
+        DocumentId,
+        document::{DocumentInlayHints, DocumentInlayHintsId},
+        editor::{Config, GutterConfig},
+        theme,
+    };
 
     use super::*;
+
+    #[test]
+    fn selected_inlay_hints_keep_foreground_and_join_selection_contours() {
+        let loader = Arc::new(ArcSwap::from_pointee(syntax::Loader::default()));
+        let config = Arc::new(ArcSwap::from_pointee(Config::default()));
+        let mut doc = Document::from(Rope::from("éabcdefghi\n"), None, config, loader.clone());
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        doc.ensure_view_init(view.id);
+        let anchors = [1, 2, 4, 8, 9, 10];
+        let mut hints = DocumentInlayHints::empty_with_id(DocumentInlayHintsId {
+            first_line: 0,
+            last_line: 0,
+        });
+        for anchor in anchors {
+            hints
+                .type_inlay_hints
+                .push(InlineAnnotation::new(anchor, format!("H{anchor}")));
+            hints
+                .padding_after_inlay_hints
+                .push(InlineAnnotation::new(anchor, " "));
+        }
+        doc.set_inlay_hints(view.id, hints);
+        let theme = theme::Loader::new(&[]).default_theme(true);
+        let syntax_loader = loader.load();
+        let cursor_shape = Config::default().cursor_shape;
+        let hint_fg = theme
+            .get("ui.virtual.inlay-hint.type")
+            .fg
+            .and_then(helix_color_to_hsla)
+            .unwrap_or(white());
+        let primary_bg = theme
+            .get("ui.selection.primary")
+            .bg
+            .and_then(helix_color_to_hsla);
+        let secondary_bg = theme.get("ui.selection").bg.and_then(helix_color_to_hsla);
+        assert!(primary_bg.is_some());
+        assert!(secondary_bg.is_some());
+
+        for (selection, selected_ranges) in [
+            (Selection::single(2, 9), vec![(2..8, primary_bg)]),
+            (Selection::single(9, 2), vec![(3..9, primary_bg)]),
+            (Selection::single(4, 4), vec![]),
+            (
+                Selection::new(
+                    vec![helix_core::Range::new(1, 5), helix_core::Range::new(7, 10)].into(),
+                    1,
+                ),
+                vec![(1..5, secondary_bg), (7..9, primary_bg)],
+            ),
+        ] {
+            doc.set_selection(view.id, selection);
+            let context = || EditorLineHighlightContext {
+                doc: &doc,
+                view: &view,
+                theme: &theme,
+                syntax_loader: &syntax_loader,
+                editor_mode: Mode::Select,
+                cursor_shape: &cursor_shape,
+                is_view_focused: true,
+                view_position: ViewPosition::default(),
+                fg_color: white(),
+                font: font("monospace"),
+                default_text_style: Style::default(),
+                default_bg: black(),
+                diagnostic_overlay_spans: None,
+                tab_width: 4,
+                display_whitespace: None,
+                whitespace_style: Style::default(),
+            };
+            let line = VisibleLinePlan {
+                line_idx: 0,
+                line_start: 0,
+                line_end: doc.text().len_chars(),
+                y_offset: px(0.0),
+            };
+            let unwrapped = unwrapped_highlighted_lines(UnwrappedHighlightedLinesParams {
+                context: context(),
+                text: doc.text().slice(..),
+                lines: &[line],
+            });
+            let annotations = view.text_annotations(&doc, Some(&theme));
+            let visual_lines = crate::soft_wrap::soft_wrap_visual_lines(
+                doc.text().slice(..),
+                &TextFormat {
+                    soft_wrap: true,
+                    viewport_width: 17,
+                    ..TextFormat::default()
+                },
+                Some(&annotations),
+                0,
+                0,
+                20,
+                None,
+            );
+            let wrapped_runs =
+                soft_wrap_highlighted_line_runs_batch(SoftWrapHighlightedLineRunsBatchParams {
+                    context: context(),
+                    visual_lines: &visual_lines,
+                    wrap_indicator_color: None,
+                });
+            for lines in [
+                unwrapped
+                    .iter()
+                    .map(|line| {
+                        (
+                            line.line_text.display.as_ref(),
+                            &line.line_runs,
+                            &line.line_text.map,
+                            0,
+                            0,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                visual_lines
+                    .iter()
+                    .zip(&wrapped_runs)
+                    .map(|(line, runs)| {
+                        (
+                            line.text.as_ref(),
+                            runs,
+                            &line.display_map,
+                            line.line_start_char.unwrap(),
+                            line.text_start_byte_offset,
+                        )
+                    })
+                    .collect(),
+            ] {
+                for anchor in anchors {
+                    let label = format!("H{anchor}");
+                    let (text, runs, map, char_start, prefix_len) = lines
+                        .iter()
+                        .find(|(text, ..)| text.contains(&label))
+                        .unwrap_or_else(|| panic!("missing {label}"));
+                    let start = text.find(&label).unwrap();
+                    let expected_bg = theme
+                        .get("ui.virtual.inlay-hint.type")
+                        .bg
+                        .and_then(helix_color_to_hsla);
+                    let projected = selected_ranges
+                        .iter()
+                        .filter_map(|(range, _)| {
+                            crate::selection_painter::selection_display_range(
+                                doc.text().slice(..),
+                                *char_start,
+                                text,
+                                map,
+                                *prefix_len,
+                                range,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let is_selected = selected_ranges
+                        .iter()
+                        .any(|(range, _)| range.contains(&anchor));
+                    for byte in start..start + label.len() + 1 {
+                        assert_eq!(
+                            projected.iter().any(|range| range.contains(&byte)),
+                            is_selected,
+                            "hint/padding at anchor {anchor}, byte {byte}"
+                        );
+                    }
+                    let mut offset = 0;
+                    for run in *runs {
+                        if offset < start + label.len() && offset + run.len > start {
+                            assert_eq!(run.background_color, expected_bg, "hint at {anchor}");
+                            assert_eq!(run.color, hint_fg, "hint foreground at {anchor}");
+                        }
+                        if offset <= start + label.len() && offset + run.len > start + label.len() {
+                            assert_eq!(run.background_color, None, "padding at {anchor}");
+                        }
+                        offset += run.len;
+                    }
+                    assert_eq!(offset, text.len());
+                }
+            }
+        }
+    }
 
     #[test]
     fn syntax_window_uses_supplied_view_position_anchor() {

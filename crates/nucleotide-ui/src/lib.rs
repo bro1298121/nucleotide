@@ -41,6 +41,7 @@ pub mod prompt_view;
 pub mod scrollbar;
 pub mod split;
 pub mod state_view;
+pub mod stepper;
 pub mod style_utils;
 pub mod styling;
 pub mod terminal_keys;
@@ -52,7 +53,6 @@ pub mod theme_utils;
 pub mod titlebar;
 pub mod tokens;
 pub mod traits;
-pub mod utils;
 pub mod vcs_icon;
 
 #[cfg(test)]
@@ -127,6 +127,7 @@ pub use split::{
     two_pane_split,
 };
 pub use state_view::{StateView, StateViewTone};
+pub use stepper::Stepper;
 pub use styling::{
     BoxShadow, ColorTheory, ComputedStyle, ContextualColors, ContrastRatios, StyleContext,
     StyleSize, StyleState, StyleVariant, TimingFunction, Transition, TransitionProperty,
@@ -147,7 +148,6 @@ pub use traits::{
     Interactive, KeyboardNavigable, Loadable, Measurable, Slotted, Styled, ThemedContext,
     Tooltipped, Validatable, ValidationState, compute_component_state,
 };
-pub use utils::{ExperimentalFeatures, FeatureFlags, PerformanceFeatures};
 pub use vcs_icon::{VcsIcon, VcsIconRenderer};
 // VcsStatus is now re-exported from nucleotide-types
 

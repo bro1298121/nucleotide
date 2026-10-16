@@ -1118,6 +1118,7 @@ mod tests {
             weight: nucleotide_types::FontWeight::Normal,
             line_height: 20.0,
             features: Default::default(),
+            ligatures: None,
         });
     }
 

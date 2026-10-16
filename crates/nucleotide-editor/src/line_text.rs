@@ -16,8 +16,39 @@ pub fn line_text_without_trailing_newline(line: RopeSlice<'_>) -> String {
     line_text
 }
 
-pub fn shared_line_text_without_trailing_newline(line: RopeSlice<'_>) -> SharedString {
-    SharedString::from(line_text_without_trailing_newline(line))
+/// The block cursor paints its grapheme independently, so do not leave a contextual
+/// ligature spanning that grapheme in the underlying line. Preserve all paint styles.
+pub(crate) fn break_ligatures_in_range(runs: &mut Vec<TextRun>, range: std::ops::Range<usize>) {
+    let disabled = nucleotide_types::font_config::ligature_features(false);
+    let mut offset = 0;
+    let mut split = Vec::with_capacity(runs.len() + 2);
+    for run in runs.drain(..) {
+        let end = offset + run.len;
+        let start = range.start.max(offset);
+        let stop = range.end.min(end);
+        if start >= stop || run.font.features == disabled {
+            split.push(run);
+        } else {
+            if start > offset {
+                split.push(TextRun {
+                    len: start - offset,
+                    ..run.clone()
+                });
+            }
+            let mut cursor_run = run.clone();
+            cursor_run.len = stop - start;
+            cursor_run.font.features = disabled.clone();
+            split.push(cursor_run);
+            if stop < end {
+                split.push(TextRun {
+                    len: end - stop,
+                    ..run
+                });
+            }
+        }
+        offset = end;
+    }
+    *runs = split;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,9 +523,9 @@ fn char_display_width(ch: char) -> usize {
 mod tests {
     use super::{
         DisplayLineText, DisplayLineTextBuilder, DisplayTextMap, DisplayWhitespace,
-        byte_offset_for_char_offset, expand_text_runs_for_display, floor_char_boundary,
+        byte_offset_for_char_offset, expand_text_runs_for_display,
         line_text_without_trailing_newline, normalize_text_runs_for_display_text,
-        shared_line_text_without_trailing_newline, text_run_boundaries, visual_columns_for_text,
+        text_run_boundaries, visual_columns_for_text,
     };
     use gpui::{TextRun, black, font};
     use std::borrow::Cow;
@@ -518,23 +549,9 @@ mod tests {
     }
 
     #[test]
-    fn converts_to_shared_string() {
-        assert_eq!(
-            shared_line_text_without_trailing_newline("abc\n".into()).to_string(),
-            "abc"
-        );
-    }
-
-    #[test]
     fn converts_char_offsets_to_byte_offsets() {
         assert_eq!(byte_offset_for_char_offset("aé𝌆z", 3), "aé𝌆".len());
         assert_eq!(byte_offset_for_char_offset("abc", 99), 3);
-    }
-
-    #[test]
-    fn floors_byte_offsets_to_utf8_boundaries() {
-        assert_eq!(floor_char_boundary("↪abc", 2), 0);
-        assert_eq!(floor_char_boundary("↪abc", "↪".len()), "↪".len());
     }
 
     #[test]

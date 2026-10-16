@@ -2274,6 +2274,11 @@ impl Application {
                         );
 
                         state.register_server(*server_id, server_name, workspace_path);
+                        if let Some(server) = state.servers.get_mut(server_id) {
+                            server.is_remote = self
+                                .helix_lsp_bridge_handle()
+                                .is_some_and(|bridge| bridge.is_remote_server(*server_id));
+                        }
                         state.update_server_status(
                             *server_id,
                             nucleotide_lsp::ServerStatus::Running,
@@ -4212,6 +4217,11 @@ impl Application {
                         );
                     } else if let Some(server) = state.servers.get_mut(id) {
                         server.root_uri = active_server_roots.get(id).cloned().flatten();
+                    }
+                    if let Some(server) = state.servers.get_mut(id) {
+                        server.is_remote = self
+                            .helix_lsp_bridge_handle()
+                            .is_some_and(|bridge| bridge.is_remote_server(*id));
                     }
                     state.update_server_status(
                         *id,
@@ -9796,10 +9806,6 @@ mod tests {
         startup_path_should_open_as_file, str_prefix_at_byte_limit,
         suppress_shadowed_buffer_word_completion_items, syntax_symbol_kind_from_capture_name,
     };
-    use crate::test_utils::test_support::{
-        TestUpdate, create_counting_channel, create_test_diagnostic_events,
-        create_test_document_events,
-    };
     use arc_swap::{ArcSwap, access::Map};
     use futures_util::{FutureExt, stream::FuturesOrdered};
     use gpui::{AppContext, Entity};
@@ -11276,6 +11282,7 @@ mod tests {
                 size: editor_font.size,
                 weight: editor_font.weight,
                 line_height: editor_font.line_height,
+                ligatures: editor_font.ligatures,
             });
             cx.set_global(crate::types::UiFontConfig {
                 family: ui_font.family,
@@ -11338,6 +11345,307 @@ mod tests {
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
         (core, workspace, cx)
+    }
+
+    #[gpui::test]
+    fn external_file_drop_opens_files_only_on_submit(cx: &mut gpui::TestAppContext) {
+        use gpui::{ExternalPaths, FileDropEvent};
+
+        let _runtime = TEST_RUNTIME.enter();
+        let root = tempdir().unwrap();
+        // Windows temp paths can contain 8.3 aliases; Helix expands them.
+        let root_path = helix_stdx::path::canonicalize(root.path());
+        let original = root_path.join("original.txt");
+        let first = root_path.join("\u{e9}cole \u{6771}\u{4eac}.txt");
+        let last = root_path.join("second file.txt");
+        let missing = root_path.join("missing.txt");
+        fs::write(&original, "original\n").unwrap();
+        fs::write(&first, "first dropped document\n").unwrap();
+        fs::write(&last, "second dropped document\n").unwrap();
+        let (core, _workspace, cx) = new_test_workspace(cx, &original);
+        let position = cx.update(|window, cx| {
+            window.draw(cx).clear();
+            let size = window.viewport_size();
+            gpui::point(size.width / 2.0, size.height / 2.0)
+        });
+        let paths = ExternalPaths(
+            [
+                first.clone(),
+                root_path.clone(),
+                missing.clone(),
+                last.clone(),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let initial_count = core.read_with(cx, |core, _| core.editor.documents.len());
+
+        // Entering, moving, and leaving must not open files or leave a stale drag.
+        cx.simulate_event(FileDropEvent::Entered {
+            position,
+            paths: paths.clone(),
+        });
+        cx.simulate_event(FileDropEvent::Pending { position });
+        cx.simulate_event(FileDropEvent::Exited);
+        core.read_with(cx, |core, _| {
+            assert_eq!(core.editor.documents.len(), initial_count);
+            let active = core.editor.tree.get(core.editor.tree.focus).doc;
+            assert_eq!(
+                core.editor.documents[&active].path(),
+                Some(original.as_path())
+            );
+        });
+
+        // Drop over the default sidebar's occluding resize handle first, then
+        // repeat over the editor to verify existing buffers are reused.
+        for position in [gpui::point(gpui::px(240.0), position.y), position] {
+            cx.simulate_event(FileDropEvent::Entered {
+                position,
+                paths: paths.clone(),
+            });
+            cx.update(|window, cx| {
+                window.draw(cx).clear();
+            });
+            cx.simulate_event(FileDropEvent::Submit { position });
+            cx.run_until_parked();
+            core.read_with(cx, |core, _| {
+                assert_eq!(core.editor.documents.len(), initial_count + 2);
+                assert_eq!(core.project_directory.as_deref(), Some(root_path.as_path()));
+                for (path, expected) in [
+                    (&original, "original\n"),
+                    (&first, "first dropped document\n"),
+                    (&last, "second dropped document\n"),
+                ] {
+                    let doc = core
+                        .editor
+                        .documents
+                        .values()
+                        .find(|doc| doc.path() == Some(path))
+                        .unwrap();
+                    assert_eq!(doc.text().to_string(), expected);
+                }
+                let active = core.editor.tree.get(core.editor.tree.focus).doc;
+                assert_eq!(core.editor.documents[&active].path(), Some(last.as_path()));
+            });
+        }
+
+        // A local OS path must never be sent to the remote workspace backend.
+        let local_only = root_path.join("local only.txt");
+        fs::write(&local_only, "local contents\n").unwrap();
+        core.update(cx, |core, _| {
+            core.set_workspace_backend(Arc::new(RemoteIdentityLocalBackend));
+        });
+        cx.simulate_event(FileDropEvent::Entered {
+            position,
+            paths: ExternalPaths([local_only].into_iter().collect()),
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        cx.simulate_event(FileDropEvent::Submit { position });
+        cx.run_until_parked();
+        core.read_with(cx, |core, _| {
+            assert_eq!(core.editor.documents.len(), initial_count + 2);
+            let active = core.editor.tree.get(core.editor.tree.focus).doc;
+            assert_eq!(core.editor.documents[&active].path(), Some(last.as_path()));
+        });
+    }
+
+    #[gpui::test]
+    fn tab_copy_actions_preserve_unicode_paths(cx: &mut gpui::TestAppContext) {
+        use crate::workspace::TabContextMenuIntent;
+        use gpui::{Modifiers, MouseButton};
+
+        let _runtime = TEST_RUNTIME.enter();
+        let root = tempdir().unwrap();
+        let file_name = "\u{e9}cole \u{6771}\u{4eac}.txt";
+        let path = helix_stdx::path::canonicalize(root.path()).join(file_name);
+        fs::write(&path, "clipboard fixture\n").unwrap();
+        let (core, _workspace, cx) = new_test_workspace(cx, &path);
+        let (pane, doc) = core.update(cx, |core, cx| {
+            let mut config = (**core.helix_config_arc.load()).clone();
+            config.editor.bufferline = helix_view::editor::BufferLine::Always;
+            core.helix_config_arc.store(Arc::new(config));
+            let view = core.editor.tree.get(core.editor.tree.focus);
+            let result = (view.id, view.doc);
+            cx.emit(crate::Update::Redraw);
+            result
+        });
+        let tab = Box::leak(format!("pane-tab-{pane:?}-{doc}").into_boxed_str());
+
+        for (intent, expected) in [
+            (TabContextMenuIntent::CopyPath, path.display().to_string()),
+            (
+                TabContextMenuIntent::CopyRelativePath,
+                file_name.to_string(),
+            ),
+        ] {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".into()));
+            cx.update(|window, cx| {
+                window.draw(cx).clear();
+            });
+            let position = cx.debug_bounds(tab).unwrap().center();
+            cx.simulate_mouse_down(position, MouseButton::Right, Modifiers::none());
+            cx.simulate_mouse_up(position, MouseButton::Right, Modifiers::none());
+            cx.run_until_parked();
+            cx.dispatch_action(crate::actions::tab_menus::ContextOperation { intent });
+            cx.run_until_parked();
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(expected)
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn command_prompt_action_accepts_and_executes_native_commands(cx: &mut gpui::TestAppContext) {
+        let _runtime = TEST_RUNTIME.enter();
+        let root = tempdir().unwrap();
+        let path = root.path().join("original.txt");
+        fs::write(&path, "original document\n").unwrap();
+        let (core, _workspace, cx) = new_test_workspace(cx, &path);
+        let before_count = core.read_with(cx, |core, _| core.editor.documents.len());
+
+        cx.dispatch_action(crate::actions::workspace::ShowCommandPrompt);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("n e w enter");
+        cx.run_until_parked();
+
+        core.read_with(cx, |core, _| {
+            assert_eq!(core.editor.documents.len(), before_count + 1);
+            let view = core.editor.tree.get(core.editor.tree.focus);
+            assert!(core.editor.documents[&view.doc].path().is_none());
+            assert!(
+                core.editor.documents[&view.doc]
+                    .text()
+                    .to_string()
+                    .trim()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn opening_directory_closes_file_buffers_but_preserves_scratch(cx: &mut gpui::TestAppContext) {
+        let _runtime = TEST_RUNTIME.enter();
+        let root = tempdir().unwrap();
+        let alpha_path = root.path().join("alpha.txt");
+        let beta_path = root.path().join("beta.txt");
+        let next_directory = root.path().join("next");
+        fs::write(&alpha_path, "alpha\n").unwrap();
+        fs::write(&beta_path, "beta\n").unwrap();
+        fs::create_dir(&next_directory).unwrap();
+        let (core, _workspace, cx) = new_test_workspace(cx, &alpha_path);
+        let scratch = core.update(cx, |core, cx| {
+            // Exercise the common directory-open path without changing the test
+            // process's working directory (which is shared by other tests).
+            core.set_workspace_backend(Arc::new(RemoteIdentityLocalBackend));
+            core.editor.open(&beta_path, Action::VerticalSplit).unwrap();
+            let scratch = core.editor.new_file(Action::VerticalSplit);
+            let view = core.editor.tree.focus;
+            let doc = core.editor.documents.get_mut(&scratch).unwrap();
+            let transaction = Transaction::change(
+                doc.text(),
+                std::iter::once((0, 0, Some("scratch notes".into()))),
+            );
+            doc.apply(&transaction, view);
+            cx.emit(crate::Update::OpenDirectory(next_directory.clone()));
+            scratch
+        });
+        cx.run_until_parked();
+        core.read_with(cx, |core, _| {
+            assert_eq!(core.project_directory.as_ref(), Some(&next_directory));
+            assert_eq!(core.editor.documents.len(), 1);
+            assert_eq!(
+                core.editor.documents[&scratch].text().to_string(),
+                format!(
+                    "scratch notes{}",
+                    helix_core::line_ending::NATIVE_LINE_ENDING.as_str()
+                )
+            );
+            assert!(core.editor.documents[&scratch].is_modified());
+            assert!(
+                core.editor
+                    .tree
+                    .views()
+                    .all(|(view, _)| view.doc == scratch)
+            );
+        });
+
+        // With no existing scratch, closing the last file must still leave
+        // a usable editor containing a fresh scratch buffer.
+        core.update(cx, |core, cx| {
+            assert!(core.editor.close_document(scratch, true).is_ok());
+            let empty_scratch = core.editor.tree.get(core.editor.tree.focus).doc;
+            core.editor.open(&alpha_path, Action::Replace).unwrap();
+            assert!(!core.editor.documents.contains_key(&empty_scratch));
+            cx.emit(crate::Update::OpenDirectory(next_directory.clone()));
+        });
+        cx.run_until_parked();
+        core.read_with(cx, |core, _| {
+            assert_eq!(core.editor.documents.len(), 1);
+            let doc = core.editor.documents.values().next().unwrap();
+            assert!(doc.path().is_none());
+            assert!(!doc.is_modified());
+            assert!(core.editor.tree.views().next().is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn opening_directory_waits_for_unsaved_buffer_confirmation(cx: &mut gpui::TestAppContext) {
+        let _runtime = TEST_RUNTIME.enter();
+        let root = tempdir().unwrap();
+        let alpha_path = root.path().join("alpha.txt");
+        let beta_path = root.path().join("beta.txt");
+        let next_directory = root.path().join("next");
+        fs::write(&alpha_path, "alpha\n").unwrap();
+        fs::write(&beta_path, "beta\n").unwrap();
+        fs::create_dir(&next_directory).unwrap();
+        let (core, workspace, cx) = new_test_workspace(cx, &alpha_path);
+        let dirty = core.update(cx, |core, _| {
+            core.set_workspace_backend(Arc::new(RemoteIdentityLocalBackend));
+            core.editor.open(&beta_path, Action::Load).unwrap();
+            core.editor.tree.get(core.editor.tree.focus).doc
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_editor(window, cx)
+        });
+        cx.simulate_keystrokes("i");
+        cx.simulate_input("changed");
+        cx.simulate_keystrokes("escape");
+        core.update(cx, |_, cx| {
+            cx.emit(crate::Update::OpenDirectory(next_directory.clone()))
+        });
+        cx.run_until_parked();
+        core.read_with(cx, |core, _| {
+            assert_eq!(core.project_directory.as_deref(), Some(root.path()));
+            assert_eq!(core.editor.documents.len(), 2);
+            assert!(core.editor.documents[&dirty].is_modified());
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        core.read_with(cx, |core, _| {
+            assert_eq!(core.project_directory.as_deref(), Some(root.path()));
+            assert_eq!(core.editor.documents.len(), 2);
+        });
+
+        core.update(cx, |_, cx| {
+            cx.emit(crate::Update::OpenDirectory(next_directory.clone()))
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        core.read_with(cx, |core, _| {
+            assert_eq!(core.project_directory.as_ref(), Some(&next_directory));
+            assert_eq!(core.editor.documents.len(), 1);
+            assert!(
+                core.editor
+                    .documents
+                    .values()
+                    .all(|doc| doc.path().is_none())
+            );
+        });
+        assert_eq!(fs::read_to_string(alpha_path).unwrap(), "alpha\n");
     }
 
     #[gpui::test]
@@ -13712,67 +14020,6 @@ language-servers = ["taplo"]
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "println");
-    }
-
-    #[ignore] // Temporarily disabled due to SIGBUS compiler crash
-    #[tokio::test]
-    async fn test_document_change_events_are_batched() {
-        // Test that rapid document changes (like fast typing) are batched
-
-        let (event_tx, mut event_rx, _counter) = create_counting_channel();
-
-        // Simulate rapid typing - 20 document change events
-        let events = create_test_document_events(20);
-        for event in events {
-            let _ = event_tx.send(event);
-        }
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let mut doc_change_count = 0;
-        while let Ok(update) = event_rx.try_recv() {
-            if matches!(update, TestUpdate::DocumentChanged { .. }) {
-                doc_change_count += 1;
-            }
-        }
-
-        // With batching, 20 rapid changes should result in very few updates
-        assert!(
-            doc_change_count <= 3,
-            "Expected 3 or fewer DocumentChanged updates with batching, but got {}",
-            doc_change_count
-        );
-    }
-
-    #[ignore] // Temporarily disabled due to SIGBUS compiler crash
-    #[tokio::test]
-    async fn test_diagnostic_events_are_deduplicated() {
-        // Test that multiple diagnostic events for the same document are deduplicated
-
-        let (event_tx, mut event_rx, _counter) = create_counting_channel();
-
-        // Send 5 diagnostic events for the same document
-        let events = create_test_diagnostic_events(5);
-        for event in events {
-            let _ = event_tx.send(event);
-        }
-
-        // Wait for potential deduplication delay
-        tokio::time::sleep(Duration::from_millis(60)).await;
-
-        let mut diag_count = 0;
-        while let Ok(update) = event_rx.try_recv() {
-            if matches!(update, TestUpdate::DiagnosticsChanged { .. }) {
-                diag_count += 1;
-            }
-        }
-
-        // With deduplication, we should see only 1 diagnostic update
-        assert_eq!(
-            diag_count, 1,
-            "Expected exactly 1 DiagnosticsChanged update with deduplication, but got {}",
-            diag_count
-        );
     }
 
     // Note: Prefix extraction tests require complex setup with Editor and Document

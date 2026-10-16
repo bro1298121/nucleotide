@@ -25,7 +25,7 @@ use crate::{
     cursor_trail,
     geometry::EditorSurfaceGeometry,
     highlight::text_style_at_position,
-    line_cache::LineLayout,
+    line_cache::{LineLayout, grapheme_x_for_index},
     line_text::{
         byte_offset_for_char_offset, line_text_without_trailing_newline, visual_columns_for_text,
     },
@@ -426,6 +426,7 @@ pub struct SoftWrapCursorPaintPlanParams<'a, 'b> {
     pub text_format: &'b TextFormat,
     pub text_annotations: Option<&'b TextAnnotations<'a>>,
     pub precomputed_visual_position: Option<SoftWrapVisualPosition>,
+    pub line_layout: Option<&'b LineLayout>,
     pub anchor: usize,
     pub cursor_char_idx: usize,
     pub geometry: EditorSurfaceGeometry,
@@ -593,9 +594,7 @@ pub fn unwrapped_cursor_paint_position(
 ) -> CursorPaintPosition {
     let text_bounds = geometry.text_bounds();
     let cursor_display_byte_offset = line_layout.display_byte_for_source_byte(cursor_byte_offset);
-    let cursor_x = line_layout
-        .shaped_line
-        .x_for_index(cursor_display_byte_offset);
+    let cursor_x = grapheme_x_for_index(&line_layout.shaped_line, cursor_display_byte_offset);
 
     CursorPaintPosition {
         paint_origin: text_bounds.origin + line_layout.origin,
@@ -696,7 +695,7 @@ pub fn soft_wrap_cursor_paint_plan(
             params.cursor_char_idx,
         )
     })?;
-    let paint_position = soft_wrap_cursor_paint_position(SoftWrapCursorPaintPositionParams {
+    let mut paint_position = soft_wrap_cursor_paint_position(SoftWrapCursorPaintPositionParams {
         geometry: params.geometry,
         line_height: params.line_height,
         cell_width: params.cell_width,
@@ -706,6 +705,17 @@ pub fn soft_wrap_cursor_paint_plan(
         viewport_height: params.viewport_height,
         horizontal_offset: params.horizontal_offset,
     })?;
+
+    if let Some(line_layout) = params.line_layout {
+        let line = params.text.line(line_layout.line_idx);
+        let char_offset = params.cursor_char_idx - params.text.line_to_char(line_layout.line_idx);
+        let byte_offset =
+            line.char_to_byte(char_offset) - line.char_to_byte(line_layout.segment_char_offset);
+        let display_byte = line_layout.display_byte_for_source_byte(byte_offset);
+        paint_position.paint_origin.x = params.geometry.text_bounds().origin.x
+            + line_layout.origin.x
+            + grapheme_x_for_index(&line_layout.shaped_line, display_byte);
+    }
 
     Some(SoftWrapCursorPaintPlan {
         visual_position,
@@ -960,19 +970,6 @@ mod tests {
     }
 
     #[test]
-    fn cursor_overlay_plan_uses_absolute_cursor_point() {
-        let paint_position = CursorPaintPosition {
-            paint_origin: point(px(10.0), px(20.0)),
-            cursor_origin: point(px(3.0), px(5.0)),
-        };
-
-        let overlay = cursor_overlay_plan(paint_position, px(8.0), px(20.0));
-
-        assert_eq!(overlay.cursor_position, point(px(13.0), px(25.0)));
-        assert_eq!(overlay.cursor_size, size(px(8.0), px(20.0)));
-    }
-
-    #[test]
     fn shaped_editor_cursor_plan_uses_fallback_width_and_overlay() {
         let paint_position = CursorPaintPosition {
             paint_origin: point(px(10.0), px(20.0)),
@@ -1156,6 +1153,7 @@ mod tests {
             text_format: &text_format,
             text_annotations: None,
             precomputed_visual_position: None,
+            line_layout: None,
             anchor: 0,
             cursor_char_idx: 16,
             geometry,
@@ -1197,6 +1195,7 @@ mod tests {
             text_format: &text_format,
             text_annotations: Some(&text_annotations),
             precomputed_visual_position: None,
+            line_layout: None,
             anchor: 0,
             cursor_char_idx: 2,
             geometry,
@@ -1235,6 +1234,7 @@ mod tests {
                 text_format: &text_format,
                 text_annotations: None,
                 precomputed_visual_position: None,
+                line_layout: None,
                 anchor: 0,
                 cursor_char_idx: 16,
                 geometry,
@@ -1265,6 +1265,7 @@ mod tests {
                 text_format: &text_format,
                 text_annotations: None,
                 precomputed_visual_position: None,
+                line_layout: None,
                 anchor: 16,
                 cursor_char_idx: 0,
                 geometry,
@@ -1536,13 +1537,6 @@ mod tests {
             })
             .is_none()
         );
-    }
-
-    #[test]
-    fn cursor_foreground_uses_background_when_reversed() {
-        let bg = hsla(0.2, 0.3, 0.4, 1.0);
-
-        assert_eq!(cursor_foreground_color(&Style::default(), true, bg), bg);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use gpui::{
 use std::ops::Range;
 
 use crate::{
-    line_cache::{LineLayout, LineLayoutCache},
+    line_cache::{LineLayout, LineLayoutCache, grapheme_x_for_index},
     line_plan::UnwrappedLinePaintPlan,
     line_text::{DisplayLineText, normalize_text_runs_for_display_text},
     soft_wrap::SoftWrapLinePaintPlan,
@@ -83,8 +83,8 @@ pub fn paint_line_backgrounds(
     line_height: Pixels,
 ) {
     for (range, bg_color) in text_run_background_ranges(runs) {
-        let start_x = shaped_line.x_for_index(range.start);
-        let end_x = shaped_line.x_for_index(range.end);
+        let start_x = grapheme_x_for_index(shaped_line, range.start);
+        let end_x = grapheme_x_for_index(shaped_line, range.end);
 
         let bg_bounds = Bounds {
             origin: point(origin.x + start_x, origin.y),
@@ -102,18 +102,6 @@ fn text_run_background_ranges(runs: &[TextRun]) -> impl Iterator<Item = (Range<u
         run.background_color
             .map(|background| (start..byte_offset, background))
     })
-}
-
-pub fn paint_editor_line(
-    window: &mut Window,
-    cx: &mut App,
-    shaped_line: &ShapedLine,
-    runs: &[TextRun],
-    origin: Point<Pixels>,
-    line_height: Pixels,
-) -> Result<()> {
-    paint_line_backgrounds(window, shaped_line, runs, origin, line_height);
-    shaped_line.paint(origin, line_height, TextAlign::Left, None, window, cx)
 }
 
 pub struct UnwrappedEditorLinePaintParams<'a, 'b> {
@@ -153,13 +141,15 @@ pub fn paint_unwrapped_editor_line(
             params.viewport_width,
             line_runs,
         );
-        paint_editor_line(
-            window,
-            cx,
-            &shaped_line,
-            line_runs,
+        // The frame paints run backgrounds and connected selection contours
+        // before any glyphs, including curves that cross row boundaries.
+        shaped_line.paint(
             params.plan.text_origin,
             params.line_height,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
         )?;
         shaped_line
     };
@@ -187,7 +177,11 @@ pub fn paint_soft_wrap_editor_line(
     params: SoftWrapEditorLinePaintParams<'_, '_>,
 ) -> Result<Option<LineLayout>> {
     if params.plan.visual.text.is_empty() {
-        return Ok(None);
+        // Empty document rows still need geometry for pointer hit testing.
+        return Ok(soft_wrap_layout_for_painted_line(
+            params.plan,
+            ShapedLine::default(),
+        ));
     }
 
     let text_system = window.text_system().clone();
@@ -201,13 +195,13 @@ pub fn paint_soft_wrap_editor_line(
         params.viewport_width,
         line_runs,
     );
-    paint_editor_line(
-        window,
-        cx,
-        &shaped_line,
-        line_runs,
+    shaped_line.paint(
         params.plan.text_origin,
         params.line_height,
+        TextAlign::Left,
+        None,
+        window,
+        cx,
     )?;
 
     Ok(soft_wrap_layout_for_painted_line(params.plan, shaped_line))
@@ -217,7 +211,7 @@ fn soft_wrap_layout_for_painted_line(
     plan: SoftWrapLinePaintPlan<'_>,
     shaped_line: ShapedLine,
 ) -> Option<LineLayout> {
-    if plan.visual.text.is_empty() || plan.visual.is_phantom_line {
+    if plan.visual.is_phantom_line {
         return None;
     }
 
@@ -355,16 +349,6 @@ mod tests {
     #[test]
     fn soft_wrap_layout_skips_phantom_visual_lines() {
         let visual = soft_wrap_visual("phantom", true);
-
-        assert!(
-            soft_wrap_layout_for_painted_line(soft_wrap_plan(&visual), ShapedLine::default())
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn soft_wrap_layout_skips_empty_visual_lines() {
-        let visual = soft_wrap_visual("", false);
 
         assert!(
             soft_wrap_layout_for_painted_line(soft_wrap_plan(&visual), ShapedLine::default())

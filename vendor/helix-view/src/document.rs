@@ -16,7 +16,7 @@ use helix_event::TaskController;
 use helix_lsp::util::lsp_pos_to_pos;
 use helix_stdx::faccess::{copy_metadata, readonly};
 use helix_vcs::{DiffHandle, DiffProviderRegistry};
-use once_cell::sync::OnceCell;
+use std::sync::OnceLock;
 use thiserror;
 
 use ::parking_lot::Mutex;
@@ -189,12 +189,12 @@ pub struct Document {
 
     path: Option<PathBuf>,
     lsp_url: Option<helix_lsp::Url>,
-    relative_path: OnceCell<Option<PathBuf>>,
+    relative_path: OnceLock<Option<PathBuf>>,
     /// Lazily-computed workspace root for this document (the ancestor that contains a `.git` /
     /// `.svn` / `.jj` / `.helix`). Avoids per-call `find_workspace_in` ancestor walks for hot
     /// consumers like the statusline trust indicator, LSP launch, and DAP launch. Taken in
     /// `set_path` so save-as recomputes.
-    workspace_root: OnceCell<PathBuf>,
+    workspace_root: OnceLock<PathBuf>,
     encoding: &'static encoding::Encoding,
     has_bom: bool,
 
@@ -786,6 +786,12 @@ async fn save_to_local_path(
 
     // Assume it is a hardlink to prevent data loss if the metadata cant be read (e.g. on certain Windows configurations)
     let is_hardlink = helix_stdx::faccess::hardlink_count(&write_path).unwrap_or(2) > 1;
+    let is_symlink = match tokio::fs::symlink_metadata(&write_path).await {
+        Ok(meta) => meta.is_symlink(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => return Err(err.into()),
+    };
+    let must_copy = is_hardlink || is_symlink;
     let backup = if path.exists() && atomic_save {
         let path_ = write_path.clone();
         // hacks: we use tempfile to handle the complex task of creating
@@ -797,7 +803,7 @@ async fn save_to_local_path(
             let mut builder = tempfile::Builder::new();
             builder.prefix(path_.file_name()?).suffix(".bck");
 
-            let backup_path = if is_hardlink {
+            let backup_path = if must_copy {
                 builder
                     .make_in(path_.parent()?, |backup| std::fs::copy(&path_, backup))
                     .ok()?
@@ -821,7 +827,20 @@ async fn save_to_local_path(
     let write_result: anyhow::Result<_> = async {
         let mut dst = tokio::fs::File::create(&write_path).await?;
         to_writer(&mut dst, save.encoding_with_bom_info, &save.text).await?;
-        dst.sync_all().await?;
+        // Ignore ENOTSUP/EOPNOTSUPP (Operation not supported) errors from sync_all()
+        // This is known to occur on SMB filesystems on macOS where fsync is not supported
+        match dst.sync_all().await {
+            Ok(_) => (),
+            Err(err) if err.kind() == io::ErrorKind::Unsupported => (),
+            // Some extra OS errors are thrown on macOS for example if fsync is not
+            // available for this filesystem. NOTE: on macOS, ENOTSUP and EOPNOTSUPP are
+            // not the same code, so we need to suppress the unreachable_patterns lint on
+            // Unix generally.
+            #[allow(unreachable_patterns)]
+            #[cfg(unix)]
+            Err(err) if matches!(err.raw_os_error(), Some(libc::ENOTSUP | libc::EOPNOTSUPP)) => {}
+            Err(err) => return Err(err.into()),
+        }
         Ok(())
     }
     .await;
@@ -832,7 +851,7 @@ async fn save_to_local_path(
     };
 
     if let Some(backup) = backup {
-        if is_hardlink {
+        if must_copy {
             let mut delete = true;
             if write_result.is_err() {
                 // Restore backup
@@ -901,8 +920,8 @@ impl Document {
             active_snippet: None,
             path: None,
             lsp_url: None,
-            relative_path: OnceCell::new(),
-            workspace_root: OnceCell::new(),
+            relative_path: OnceLock::new(),
+            workspace_root: OnceLock::new(),
             encoding,
             has_bom,
             text,
@@ -2836,6 +2855,61 @@ mod test {
         assert_eq!(doc.file_version(), Some(&[5, 6, 7, 8][..]));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_preserves_symlink_chain_and_hardlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let hardlink = dir.path().join("hardlink.txt");
+        let intermediate = dir.path().join("intermediate.txt");
+        let link = dir.path().join("link.txt");
+        symlink("target.txt", &intermediate).unwrap();
+        symlink("intermediate.txt", &link).unwrap();
+
+        // Exercise the symlink-only case first: a hardlink would mask the
+        // missing symlink safeguard by forcing the backup-copy branch.
+        for with_hardlink in [false, true] {
+            std::fs::write(&target, "original\n").unwrap();
+            if with_hardlink {
+                std::fs::hard_link(&target, &hardlink).unwrap();
+            }
+            let mut config = Config::default();
+            config.atomic_save = true;
+            let mut doc = Document::from(
+                Rope::from("replacement\n"),
+                None,
+                Arc::new(ArcSwap::from_pointee(config)),
+                Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+            );
+            doc.set_path(Some(&link));
+
+            let event = doc
+                .save(Option::<PathBuf>::None, true)
+                .unwrap()
+                .await
+                .unwrap();
+            assert_eq!(event.path, link);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "replacement\n");
+            assert_eq!(
+                std::fs::read_link(&link).unwrap(),
+                Path::new("intermediate.txt")
+            );
+            assert_eq!(
+                std::fs::read_link(&intermediate).unwrap(),
+                Path::new("target.txt")
+            );
+            if with_hardlink {
+                assert_eq!(std::fs::read_to_string(&hardlink).unwrap(), "replacement\n");
+            }
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                if with_hardlink { 4 } else { 3 }
+            );
+        }
+    }
+
     #[test]
     fn lsp_url_override_keeps_document_uri_display_backed() {
         let display_path = Path::new("ssh://example.test/home/me/main.rs");
@@ -3003,9 +3077,7 @@ mod test {
             #[test]
             fn $name() {
                 let encoding = encoding::Encoding::for_label($label_override.as_bytes()).unwrap();
-                let Some((path, ref_path)) = optional_encoding_fixture_paths($label, "in") else {
-                    return;
-                };
+                let (path, ref_path) = encoding_fixture_paths($label, "in");
 
                 let mut file = std::fs::File::open(path).unwrap();
                 let text = from_reader(&mut file, Some(encoding.into()))
@@ -3026,9 +3098,7 @@ mod test {
             #[test]
             fn $name() {
                 let encoding = encoding::Encoding::for_label($label_override.as_bytes()).unwrap();
-                let Some((path, ref_path)) = optional_encoding_fixture_paths($label, "out") else {
-                    return;
-                };
+                let (path, ref_path) = encoding_fixture_paths($label, "out");
 
                 let text = Rope::from_str(&std::fs::read_to_string(path).unwrap());
                 let mut buf: Vec<u8> = Vec::new();
@@ -3043,20 +3113,12 @@ mod test {
         };
     }
 
-    fn optional_encoding_fixture_paths(label: &str, suffix: &str) -> Option<(PathBuf, PathBuf)> {
+    fn encoding_fixture_paths(label: &str, suffix: &str) -> (PathBuf, PathBuf) {
         let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/encoding");
         let path = base_path.join(format!("{label}_{suffix}.txt"));
         let ref_path = base_path.join(format!("{label}_{suffix}_ref.txt"));
 
-        if path.exists() && ref_path.exists() {
-            Some((path, ref_path))
-        } else {
-            eprintln!(
-                "skipping encoding fixture test: missing {}",
-                base_path.display()
-            );
-            None
-        }
+        (path, ref_path)
     }
 
     decode!(big5_decode, "big5");

@@ -30,9 +30,9 @@ use gpui::MenuItem;
 use gpui::prelude::{FluentBuilder, StyledImage};
 use gpui::{
     Anchor, App, AppContext, BorrowAppContext, Bounds, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    ScrollHandle, SharedString, Size, StatefulInteractiveElement, Styled, Subscription, TextStyle,
+    FocusHandle, Focusable, FontFeatures, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
+    Render, ScrollHandle, SharedString, Size, StatefulInteractiveElement, Styled, Subscription, TextStyle,
     Window, WindowAppearance, canvas, div, img, point, px, relative, svg,
 };
 use helix_core::syntax::config::LanguageServerFeature;
@@ -83,6 +83,7 @@ use crate::types::{
 };
 use crate::updates::{UpdateController, UpdateControllerEvent, UpdateDialog};
 use crate::utils;
+use crate::utils::reveal_in_file_manager_label;
 use crate::{Core, Input, InputEvent};
 use nucleotide_env::EnvironmentOrigin;
 use nucleotide_events::run::{ResolvedTask, RunId, RunStatus};
@@ -1614,72 +1615,6 @@ fn tab_bar_height_for_editor(
     }
 }
 
-#[cfg(test)]
-fn move_ordered_item_to_target_index<T: Copy + Eq>(
-    items: &mut Vec<T>,
-    source: T,
-    target: Option<T>,
-) -> bool {
-    if target == Some(source) {
-        return false;
-    }
-
-    let Some(source_index) = items.iter().position(|item| *item == source) else {
-        return false;
-    };
-
-    if target.is_none() && source_index + 1 == items.len() {
-        return false;
-    }
-
-    let Some(target_index) = target
-        .map(|target| items.iter().position(|item| *item == target))
-        .unwrap_or(Some(items.len()))
-    else {
-        return false;
-    };
-
-    if target_index == source_index {
-        return false;
-    }
-
-    let item = items.remove(source_index);
-    let insert_index = target_index.min(items.len());
-    items.insert(insert_index, item);
-    true
-}
-
-#[cfg(test)]
-fn dropped_tab_pin_state<T: Copy + Eq + Hash>(
-    items: &[T],
-    source: T,
-    target: Option<T>,
-    pinned_items: &HashSet<T>,
-) -> Option<bool> {
-    resolved_dropped_tab_pin_state(items, source, target, pinned_items, None)
-}
-
-#[cfg(test)]
-fn resolved_dropped_tab_pin_state<T: Copy + Eq + Hash>(
-    items: &[T],
-    source: T,
-    target: Option<T>,
-    pinned_items: &HashSet<T>,
-    forced_pin_state: Option<bool>,
-) -> Option<bool> {
-    if target == Some(source) || !items.contains(&source) {
-        return None;
-    }
-
-    if let Some(target) = target
-        && !items.contains(&target)
-    {
-        return None;
-    }
-
-    forced_pin_state.or_else(|| Some(target.is_some_and(|target| pinned_items.contains(&target))))
-}
-
 fn active_unpinned_tab_scroll_index<T: Copy + Eq + Hash>(
     ordered_items: &[T],
     pinned_items: &HashSet<T>,
@@ -1713,49 +1648,6 @@ fn zed_style_tab_order<T: Copy + Eq + Hash>(
         .partition(|item| pinned_items.contains(item));
     pinned.extend(unpinned);
     pinned
-}
-
-#[cfg(test)]
-fn change_tab_pin_state<T: Copy + Eq + Hash>(
-    ordered_items: &mut Vec<T>,
-    pinned_items: &mut HashSet<T>,
-    item: T,
-    should_pin: bool,
-) -> bool {
-    if pinned_items.contains(&item) == should_pin {
-        return false;
-    }
-
-    let mut display_order = zed_style_tab_order(ordered_items, pinned_items);
-    let Some(item_index) = display_order
-        .iter()
-        .position(|candidate| *candidate == item)
-    else {
-        return false;
-    };
-
-    let pinned_count = display_order
-        .iter()
-        .filter(|candidate| pinned_items.contains(candidate))
-        .count();
-    let Some(destination_index) = (if should_pin {
-        Some(pinned_count.min(item_index))
-    } else {
-        pinned_count.checked_sub(1)
-    }) else {
-        return false;
-    };
-
-    if should_pin {
-        pinned_items.insert(item);
-    } else {
-        pinned_items.remove(&item);
-    }
-
-    let item = display_order.remove(item_index);
-    display_order.insert(destination_index, item);
-    *ordered_items = display_order;
-    true
 }
 
 fn unpin_all_tabs<T: Eq + Hash>(pinned_items: &mut HashSet<T>) -> bool {
@@ -1800,26 +1692,6 @@ fn should_unpreview_retained_tab_after_close_others(is_preview: bool) -> bool {
     is_preview
 }
 
-fn reveal_in_file_manager_label(is_remote: bool) -> &'static str {
-    if cfg!(target_os = "macos") && !is_remote {
-        "Reveal in Finder"
-    } else if cfg!(target_os = "windows") && !is_remote {
-        "Reveal in File Explorer"
-    } else {
-        "Reveal in File Manager"
-    }
-}
-
-#[cfg(test)]
-fn tab_bar_end_button_icon_paths() -> [&'static str; 2] {
-    ["icons/plus.svg", "icons/columns-2.svg"]
-}
-
-#[cfg(test)]
-fn tab_bar_end_button_tooltips() -> [&'static str; 2] {
-    ["New File", "Split Pane"]
-}
-
 #[derive(Clone, Copy)]
 struct MaxTabsDocument<T> {
     id: T,
@@ -1844,6 +1716,9 @@ enum PendingUnsavedClose<T> {
     },
     Batch {
         doc_ids: Vec<T>,
+    },
+    OpenDirectory {
+        path: PathBuf,
     },
 }
 
@@ -3925,6 +3800,7 @@ impl Workspace {
         let unavailable = LspStatusSummary {
             server_id: None,
             server_name: "LSP:".to_string(),
+            is_remote: false,
             kind: LspStatusKind::Unavailable,
             title: "No servers".to_string(),
             message: None,
@@ -3991,6 +3867,16 @@ impl Workspace {
                     .justify_center()
                     .child(state_icon),
             );
+
+        if summary.is_remote && density != StatusBarDensity::Compact {
+            content = content.child(
+                svg()
+                    .path("icons/monitor.svg")
+                    .size(px(13.0))
+                    .text_color(status_bar_tokens.text_secondary)
+                    .flex_shrink_0(),
+            );
+        }
 
         if density != StatusBarDensity::Compact {
             let percentage = summary
@@ -4235,43 +4121,6 @@ impl Workspace {
         ProjectTreeContextMenuIntent::common_file_operations()
     }
 
-    #[cfg(test)]
-    fn tab_context_menu_intents(
-        has_file_path: bool,
-        has_project_panel_path: bool,
-        has_terminal_directory: bool,
-    ) -> Vec<TabContextMenuIntent> {
-        let mut intents = vec![
-            TabContextMenuIntent::Close,
-            TabContextMenuIntent::CloseOthers,
-            TabContextMenuIntent::CloseLeft,
-            TabContextMenuIntent::CloseRight,
-            TabContextMenuIntent::CloseClean,
-            TabContextMenuIntent::CloseAll,
-        ];
-
-        if has_file_path {
-            intents.extend([
-                TabContextMenuIntent::ToggleReadOnly,
-                TabContextMenuIntent::CopyPath,
-                TabContextMenuIntent::CopyRelativePath,
-                TabContextMenuIntent::RevealInOs,
-            ]);
-        }
-
-        intents.push(TabContextMenuIntent::TogglePin);
-
-        if has_project_panel_path {
-            intents.push(TabContextMenuIntent::RevealInProjectPanel);
-        }
-
-        if has_terminal_directory {
-            intents.push(TabContextMenuIntent::OpenInTerminal);
-        }
-
-        intents
-    }
-
     fn tab_context_menu_entries(
         has_file_path: bool,
         has_project_panel_path: bool,
@@ -4392,18 +4241,6 @@ impl Workspace {
         }
         let handler = Self::tab_bar_split_menu_handler(intent);
         handler(self, cx);
-    }
-
-    #[cfg(test)]
-    fn tab_bar_new_menu_intents() -> &'static [TabBarNewMenuIntent] {
-        &[
-            TabBarNewMenuIntent::NewFile,
-            TabBarNewMenuIntent::OpenFile,
-            TabBarNewMenuIntent::SearchProject,
-            TabBarNewMenuIntent::SearchSymbols,
-            TabBarNewMenuIntent::NewTerminal,
-            TabBarNewMenuIntent::NewCenterTerminal,
-        ]
     }
 
     fn tab_bar_new_menu_entries() -> &'static [TabBarNewMenuEntry] {
@@ -5458,9 +5295,7 @@ impl Workspace {
     fn tab_cm_action_copy_path(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
         if let Some(path) = self.tab_document_path(tab_id, cx) {
             let text = path.display().to_string();
-            if !Self::copy_to_clipboard_impl(&text) {
-                nucleotide_logging::warn!(path=%text, "Failed to copy tab path to clipboard");
-            }
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
             let event = nucleotide_events::workspace::Event::FileOpRequested {
                 intent: nucleotide_events::workspace::FileOpIntent::CopyPath {
                     path,
@@ -5474,12 +5309,7 @@ impl Workspace {
     fn tab_cm_action_copy_relative_path(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
         if let Some(path) = self.tab_document_path(tab_id, cx) {
             let text = self.relative_tab_path_text(&path);
-            if !Self::copy_to_clipboard_impl(&text) {
-                nucleotide_logging::warn!(
-                    path=%text,
-                    "Failed to copy tab relative path to clipboard"
-                );
-            }
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
             let event = nucleotide_events::workspace::Event::FileOpRequested {
                 intent: nucleotide_events::workspace::FileOpIntent::CopyPath {
                     path,
@@ -6247,6 +6077,9 @@ impl Workspace {
                 activation_target,
             } => self.force_close_single_tab_document(doc_id, activation_target, cx),
             PendingUnsavedClose::Batch { doc_ids } => self.force_close_tab_documents(doc_ids, cx),
+            PendingUnsavedClose::OpenDirectory { path } => {
+                self.open_directory_after_confirmation(&path, cx)
+            }
         }
     }
 
@@ -7139,9 +6972,7 @@ impl Workspace {
             }
             ProjectTreeContextMenuIntent::CopyPath => {
                 let text = path.display().to_string();
-                if !Self::copy_to_clipboard_impl(&text) {
-                    nucleotide_logging::warn!(path=%text, "Failed to copy path to clipboard");
-                }
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
                 let event = nucleotide_events::workspace::Event::FileOpRequested {
                     intent: nucleotide_events::workspace::FileOpIntent::CopyPath {
                         path,
@@ -7159,9 +6990,7 @@ impl Workspace {
                 } else {
                     path.display().to_string()
                 };
-                if !Self::copy_to_clipboard_impl(&text) {
-                    nucleotide_logging::warn!(path=%text, "Failed to copy relative path to clipboard");
-                }
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
                 let event = nucleotide_events::workspace::Event::FileOpRequested {
                     intent: nucleotide_events::workspace::FileOpIntent::CopyPath {
                         path,
@@ -7179,82 +7008,6 @@ impl Workspace {
                 };
                 self.core.read(cx).dispatch_workspace_event(event);
             }
-        }
-    }
-
-    /// Best-effort clipboard copy using platform tools
-    fn copy_to_clipboard_impl(text: &str) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            use std::io::Write;
-            let mut child = match std::process::Command::new("pbcopy")
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(_) => return false,
-            };
-            if let Some(stdin) = &mut child.stdin
-                && stdin.write_all(text.as_bytes()).is_err()
-            {
-                return false;
-            }
-            let _ = child.wait();
-            return true;
-        }
-        #[cfg(target_os = "windows")]
-        {
-            use std::io::Write;
-            let mut child = match nucleotide_process::command("cmd")
-                .args(["/C", "clip"])
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(_) => return false,
-            };
-            if let Some(stdin) = &mut child.stdin {
-                if stdin.write_all(text.as_bytes()).is_err() {
-                    return false;
-                }
-            }
-            let _ = child.wait();
-            return true;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::io::Write;
-            // Try wl-copy (Wayland)
-            if let Ok(mut child) = std::process::Command::new("wl-copy")
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-            {
-                if let Some(stdin) = &mut child.stdin {
-                    if stdin.write_all(text.as_bytes()).is_ok() {
-                        let _ = child.wait();
-                        return true;
-                    }
-                }
-            }
-            // Fallback to xclip
-            if let Ok(mut child) = std::process::Command::new("xclip")
-                .args(["-selection", "clipboard"])
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-            {
-                if let Some(stdin) = &mut child.stdin {
-                    if stdin.write_all(text.as_bytes()).is_ok() {
-                        let _ = child.wait();
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }
-        #[allow(unreachable_code)]
-        {
-            // Other platforms: not implemented
-            false
         }
     }
 
@@ -9512,6 +9265,49 @@ impl Workspace {
     }
 
     fn handle_open_directory(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let modified_names = self
+            .core
+            .read(cx)
+            .editor
+            .documents
+            .values()
+            .filter(|doc| doc.path().is_some() && doc.is_modified())
+            .map(|doc| doc.display_name().into_owned())
+            .collect::<Vec<_>>();
+        if !modified_names.is_empty() {
+            self.request_unsaved_close(
+                PendingUnsavedClose::OpenDirectory {
+                    path: path.to_path_buf(),
+                },
+                modified_names,
+                cx,
+            );
+            return;
+        }
+
+        self.open_directory_after_confirmation(path, cx);
+    }
+
+    fn open_directory_after_confirmation(&mut self, path: &Path, cx: &mut Context<Self>) {
+        // Scratch buffers have no path and belong to the editor, not the project.
+        let doc_ids = self
+            .core
+            .read(cx)
+            .editor
+            .documents
+            .values()
+            .filter(|doc| doc.path().is_some())
+            .map(|doc| doc.id())
+            .collect::<Vec<_>>();
+        self.force_close_tab_documents(doc_ids, cx);
+        for tab in &self.image_tabs {
+            self.pinned_documents.remove(&TabId::Image(tab.id));
+        }
+        self.image_tabs.clear();
+        self.active_image_tab_id = None;
+        self.invalidate_tab_bar_documents();
+        self.update_document_views(cx);
+
         // Find the workspace root from this directory and update working directory
         let workspace_backend = self.core.read(cx).workspace_backend.clone();
         let workspace_identity = workspace_backend.identity();
@@ -10096,6 +9892,19 @@ impl Workspace {
         );
     }
 
+    /// Open the active local Helix config, including a custom --config path.
+    pub fn open_helix_settings_file(&mut self, cx: &mut Context<Self>) {
+        self.finish_open_file_internal(
+            &helix_loader::config_file(),
+            true,
+            false,
+            None,
+            None,
+            settings_file_open_backend(),
+            cx,
+        );
+    }
+
     fn apply_workspace_config(&mut self, config: &crate::config::Config, cx: &mut Context<Self>) {
         let preview_tabs_enabled = config.gui.preview_tabs.enabled;
         let file_tree_config = file_tree_config_from_gui(&config.gui);
@@ -10125,6 +9934,7 @@ impl Workspace {
         editor_font_config.weight = editor_font.weight;
         editor_font_config.line_height = editor_font.line_height;
         editor_font_config.features = editor_font.features.clone();
+        editor_font_config.ligatures = editor_font.ligatures;
 
         let ui_font_config = cx.global_mut::<crate::types::UiFontConfig>();
         ui_font_config.family = ui_font.family.clone();
@@ -14328,7 +14138,8 @@ impl Workspace {
 
     fn show_command_prompt(&mut self, cx: &mut Context<Self>) {
         let prompt = crate::prompt::Prompt::native(":", "", |_| {}).with_cancel(|| {});
-        cx.emit(crate::Update::Prompt(prompt));
+        self.core
+            .update(cx, |_, cx| cx.emit(crate::Update::Prompt(prompt)));
     }
 
     fn show_open_remote_prompt(&mut self, cx: &mut Context<Self>) {
@@ -14885,7 +14696,30 @@ impl Workspace {
                     .family
                     .clone()
                     .into(),
-                font_features: editor_font.features.to_gpui_font_features(),
+                // The `ligatures` shorthand supplies the base liga/clig/calt
+                // group; tags named explicitly in `features` then override it,
+                // so the finer-grained key wins.
+                font_features: {
+                    let mut tags = editor_font
+                        .ligatures
+                        .map_or_else(
+                            FontFeatures::default,
+                            nucleotide_types::font_config::ligature_features,
+                        )
+                        .tag_value_list()
+                        .to_vec();
+                    // Mirror FontFeatureSettings::to_gpui_font_features: keep only
+                    // four-character ASCII alphanumeric tags and map bool -> u32.
+                    for (tag, enabled) in &editor_font.features.0 {
+                        if tag.len() == 4 && tag.chars().all(|c| c.is_ascii_alphanumeric()) {
+                            match tags.iter_mut().find(|(existing, _)| existing == tag) {
+                                Some(entry) => entry.1 = u32::from(*enabled),
+                                None => tags.push((tag.clone(), u32::from(*enabled))),
+                            }
+                        }
+                    }
+                    FontFeatures(Arc::new(tags))
+                },
                 font_fallbacks: None,
                 font_size: px(editor_font.size).into(),
                 line_height: gpui::phi(), // Use golden ratio for optimal line height
@@ -15592,7 +15426,32 @@ impl Render for Workspace {
             .h_full()
             .relative() // Anchor for absolute-positioned resize hitboxes
             .when(!native_sidebar_enabled, |root| root.bg(bg_color))
-            .focusable();
+            .focusable()
+            .capture_drop(
+                cx.listener(|workspace, paths: &gpui::ExternalPaths, window, cx| {
+                    // OS drops contain local paths, never paths on a remote host.
+                    if !matches!(
+                        workspace.core.read(cx).workspace_backend.identity(),
+                        WorkspaceIdentity::Local
+                    ) {
+                        workspace.set_run_status(
+                            "Local file drops are not supported in remote workspaces",
+                            Severity::Warning,
+                            cx,
+                        );
+                        return;
+                    }
+                    let mut opened = false;
+                    for path in paths.paths().iter().filter(|path| path.is_file()) {
+                        workspace.handle_open_file(path, cx);
+                        opened = true;
+                    }
+                    if opened {
+                        workspace.focus_editor(window, cx);
+                    }
+                    cx.stop_propagation();
+                }),
+            );
 
         // Always add global key handling - the workspace should always capture key events
         // regardless of focus state or overlay presence for global shortcuts to work
@@ -15794,6 +15653,12 @@ impl Render for Workspace {
             },
         ));
 
+        workspace_div = workspace_div.on_action(cx.listener(
+            move |workspace, _: &crate::actions::editor::OpenHelixSettings, _window, cx| {
+                workspace.open_helix_settings_file(cx)
+            },
+        ));
+
         // Reload configuration action - reload nucleotide.toml without restart
         workspace_div = workspace_div.on_action(cx.listener(
             move |workspace, _: &crate::actions::editor::ReloadConfiguration, _window, cx| {
@@ -15872,6 +15737,156 @@ impl Render for Workspace {
                 );
             },
         ));
+
+        use crate::application::editor_input::{EditorSemanticAction, NativeLspNavigationRequest};
+        workspace_div = workspace_div
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::text_input::Cut, window, cx| {
+                    workspace.send_editor_semantic_action(EditorSemanticAction::Cut, window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::text_input::SelectAll, window, cx| {
+                    workspace.send_editor_semantic_action(
+                        EditorSemanticAction::SelectAll,
+                        window,
+                        cx,
+                    );
+                },
+            ))
+            .on_action(
+                cx.listener(|workspace, _: &crate::actions::editor::Find, window, cx| {
+                    workspace.send_editor_semantic_action(EditorSemanticAction::Find, window, cx);
+                }),
+            )
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::editor::FindNext, window, cx| {
+                    workspace.send_editor_semantic_action(
+                        EditorSemanticAction::FindNext,
+                        window,
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::editor::FindPrevious, window, cx| {
+                    workspace.send_editor_semantic_action(
+                        EditorSemanticAction::FindPrevious,
+                        window,
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::editor::FindInProject, _, cx| {
+                    workspace.start_global_search(cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::editor::ExpandSelection, window, cx| {
+                    workspace.send_editor_semantic_action(
+                        EditorSemanticAction::ExpandSelection,
+                        window,
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::editor::ShrinkSelection, window, cx| {
+                    workspace.send_editor_semantic_action(
+                        EditorSemanticAction::ShrinkSelection,
+                        window,
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::editor::SelectNextOccurrence, window, cx| {
+                    workspace.send_editor_semantic_action(
+                        EditorSemanticAction::SelectNextOccurrence,
+                        window,
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::editor::SelectPreviousOccurrence, window, cx| {
+                    workspace.send_editor_semantic_action(
+                        EditorSemanticAction::SelectPreviousOccurrence,
+                        window,
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::editor::SplitSelectionOnNewline, window, cx| {
+                    workspace.send_editor_semantic_action(
+                        EditorSemanticAction::SplitSelectionOnNewline,
+                        window,
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::editor::MergeSelections, window, cx| {
+                    workspace.send_editor_semantic_action(
+                        EditorSemanticAction::MergeSelections,
+                        window,
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::editor::NextDiagnostic, window, cx| {
+                    workspace.send_editor_semantic_action(
+                        EditorSemanticAction::NextDiagnostic,
+                        window,
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::editor::PreviousDiagnostic, window, cx| {
+                    workspace.send_editor_semantic_action(
+                        EditorSemanticAction::PreviousDiagnostic,
+                        window,
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::workspace::ShowSymbolPicker, _, cx| {
+                    workspace
+                        .core
+                        .update(cx, |core, cx| core.trigger_lsp_symbol_picker(false, cx));
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::workspace::ShowWorkspaceSymbolPicker, _, cx| {
+                    workspace
+                        .core
+                        .update(cx, |core, cx| core.trigger_lsp_symbol_picker(true, cx));
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::workspace::GoToDefinition, _, cx| {
+                    workspace.core.update(cx, |core, cx| {
+                        core.trigger_lsp_navigation(NativeLspNavigationRequest::GotoDefinition, cx)
+                    });
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::workspace::FindReferences, _, cx| {
+                    workspace.core.update(cx, |core, cx| {
+                        core.trigger_lsp_navigation(NativeLspNavigationRequest::GotoReference, cx)
+                    });
+                },
+            ))
+            .on_action(cx.listener(
+                |workspace, _: &crate::actions::editor::ResetFontSize, _, cx| {
+                    workspace.reset_font_size(cx);
+                },
+            ));
 
         // Font size actions
         workspace_div = workspace_div.on_action(cx.listener(
@@ -16145,6 +16160,12 @@ impl Render for Workspace {
         workspace_div = workspace_div.on_action(cx.listener(
             move |_, _: &crate::actions::help::OpenTutorial, _window, cx| {
                 load_tutor(core.clone(), handle.clone(), cx)
+            },
+        ));
+
+        workspace_div = workspace_div.on_action(cx.listener(
+            |_, _: &crate::actions::help::Documentation, _, cx| {
+                cx.open_url("https://github.com/iainh/nucleotide/tree/main/docs");
             },
         ));
 
@@ -16705,12 +16726,29 @@ impl Render for Workspace {
                                     .text_color(dd_tokens.item_text)
                                     .child(
                                         div()
+                                            .flex_1()
                                             .min_w_0()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(server.name.clone()),
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .child(server.name.clone()),
+                                            )
+                                            .when(server.is_remote, |name| {
+                                                name.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_size(ui_theme.tokens.sizes.text_xs)
+                                                        .text_color(dd_tokens.item_text_secondary)
+                                                        .child("Remote"),
+                                                )
+                                            }),
                                     )
                                     .child(
                                         div()
@@ -16965,15 +17003,16 @@ impl Render for Workspace {
                     .focus_handle(self.statusbar_lsp_logs_focus.clone())
                     .disabled(!logs_enabled)
                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                        if Self::copy_to_clipboard_impl(&log_path_for_click) {
-                            this.push_editor_status_notification(
-                                EditorStatus {
-                                    status: "Copied LSP traffic log directory".to_string(),
-                                    severity: Severity::Info,
-                                },
-                                cx,
-                            );
-                        }
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                            log_path_for_click.clone(),
+                        ));
+                        this.push_editor_status_notification(
+                            EditorStatus {
+                                status: "Copied LSP traffic log directory".to_string(),
+                                severity: Severity::Info,
+                            },
+                            cx,
+                        );
                     }));
 
                 let footer = div()
@@ -19961,20 +20000,6 @@ mod tests {
     }
 
     #[test]
-    fn file_tree_context_menu_items_follow_sidebar_intent_order() {
-        let actual: Vec<_> = Workspace::context_menu_intents()
-            .iter()
-            .map(|intent| intent.label())
-            .collect();
-        let expected: Vec<_> = ProjectTreeContextMenuIntent::common_file_operations()
-            .iter()
-            .map(|intent| intent.label())
-            .collect();
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
     fn tab_bar_layout_height_matches_rendered_row_count() {
         let row_height = px(32.0);
 
@@ -20025,32 +20050,6 @@ mod tests {
     }
 
     #[test]
-    fn tab_context_menu_items_match_zed_close_actions() {
-        let unpinned_labels = Workspace::tab_context_menu_intents(false, false, false)
-            .iter()
-            .map(|intent| intent.label(false, false))
-            .collect::<Vec<_>>();
-        let pinned_labels = Workspace::tab_context_menu_intents(false, false, false)
-            .iter()
-            .map(|intent| intent.label(true, false))
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            unpinned_labels,
-            vec![
-                "Close",
-                "Close Others",
-                "Close Left",
-                "Close Right",
-                "Close Clean",
-                "Close All",
-                "Pin Tab"
-            ]
-        );
-        assert_eq!(pinned_labels.last(), Some(&"Unpin Tab"));
-    }
-
-    #[test]
     fn tab_context_menu_entries_match_zed_grouping() {
         let labels = Workspace::tab_context_menu_entries(false, false, false)
             .iter()
@@ -20075,6 +20074,15 @@ mod tests {
                 "Pin Tab"
             ]
         );
+
+        let pinned_label = Workspace::tab_context_menu_entries(false, false, false)
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                TabContextMenuEntry::Action(intent) => Some(intent.label(true, false)),
+                TabContextMenuEntry::Separator => None,
+            });
+        assert_eq!(pinned_label, Some("Unpin Tab"));
     }
 
     #[test]
@@ -20108,31 +20116,6 @@ mod tests {
                 reveal_label,
                 "|",
                 "Pin Tab"
-            ]
-        );
-    }
-
-    #[test]
-    fn tab_context_menu_intents_add_zed_readonly_toggle_for_file_tabs() {
-        let labels = Workspace::tab_context_menu_intents(true, false, false)
-            .iter()
-            .map(|intent| intent.label(false, false))
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            labels,
-            vec![
-                "Close",
-                "Close Others",
-                "Close Left",
-                "Close Right",
-                "Close Clean",
-                "Close All",
-                "Make File Read-Only",
-                "Copy Path",
-                "Copy Relative Path",
-                reveal_in_file_manager_label(false),
-                "Pin Tab",
             ]
         );
     }
@@ -20238,6 +20221,10 @@ mod tests {
             );
         }
         assert_eq!(reveal_in_file_manager_label(true), "Reveal in File Manager");
+        assert_eq!(
+            ProjectTreeContextMenuIntent::RevealInOs.label(),
+            TabContextMenuIntent::RevealInOs.label(false, false)
+        );
     }
 
     #[test]
@@ -20456,26 +20443,6 @@ mod tests {
     }
 
     #[test]
-    fn tab_bar_new_menu_items_match_zed_new_actions() {
-        let labels = Workspace::tab_bar_new_menu_intents()
-            .iter()
-            .map(|intent| intent.label())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            labels,
-            vec![
-                "New File",
-                "Open File",
-                "Search Project",
-                "Search Symbols",
-                "New Terminal",
-                "New Center Terminal"
-            ]
-        );
-    }
-
-    #[test]
     fn tab_bar_new_menu_entries_match_zed_grouping() {
         let labels = Workspace::tab_bar_new_menu_entries()
             .iter()
@@ -20498,19 +20465,6 @@ mod tests {
                 "New Center Terminal"
             ]
         );
-    }
-
-    #[test]
-    fn tab_bar_end_buttons_follow_zed_new_split_order() {
-        assert_eq!(
-            tab_bar_end_button_icon_paths(),
-            ["icons/plus.svg", "icons/columns-2.svg"]
-        );
-    }
-
-    #[test]
-    fn tab_bar_end_button_tooltips_describe_actions() {
-        assert_eq!(tab_bar_end_button_tooltips(), ["New File", "Split Pane"]);
     }
 
     #[test]
@@ -20585,106 +20539,6 @@ mod tests {
     }
 
     #[test]
-    fn move_ordered_item_to_target_index_moves_items_to_target_positions() {
-        let mut items = vec!['a', 'b', 'c', 'd'];
-
-        assert!(move_ordered_item_to_target_index(
-            &mut items,
-            'c',
-            Some('a')
-        ));
-        assert_eq!(items, vec!['c', 'a', 'b', 'd']);
-
-        assert!(move_ordered_item_to_target_index(
-            &mut items,
-            'a',
-            Some('d')
-        ));
-        assert_eq!(items, vec!['c', 'b', 'd', 'a']);
-    }
-
-    #[test]
-    fn move_ordered_item_to_target_index_moves_items_to_end() {
-        let mut items = vec!['a', 'b', 'c', 'd'];
-
-        assert!(move_ordered_item_to_target_index(&mut items, 'b', None));
-        assert_eq!(items, vec!['a', 'c', 'd', 'b']);
-    }
-
-    #[test]
-    fn move_ordered_item_to_target_index_reports_no_ops() {
-        let mut items = vec!['a', 'b', 'c', 'd'];
-
-        assert!(!move_ordered_item_to_target_index(
-            &mut items,
-            'a',
-            Some('a')
-        ));
-        assert_eq!(items, vec!['a', 'b', 'c', 'd']);
-
-        assert!(!move_ordered_item_to_target_index(&mut items, 'd', None));
-        assert!(!move_ordered_item_to_target_index(
-            &mut items,
-            'x',
-            Some('a')
-        ));
-        assert!(!move_ordered_item_to_target_index(
-            &mut items,
-            'a',
-            Some('x')
-        ));
-        assert_eq!(items, vec!['a', 'b', 'c', 'd']);
-    }
-
-    #[test]
-    fn dropped_tab_pin_state_follows_target_region() {
-        let items = ['a', 'b', 'c', 'd'];
-        let pinned = HashSet::from(['a', 'b']);
-
-        assert_eq!(
-            dropped_tab_pin_state(&items, 'c', Some('a'), &pinned),
-            Some(true)
-        );
-        assert_eq!(
-            dropped_tab_pin_state(&items, 'a', Some('c'), &pinned),
-            Some(false)
-        );
-        assert_eq!(
-            dropped_tab_pin_state(&items, 'a', None, &pinned),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn dropped_tab_pin_state_reports_invalid_drops() {
-        let items = ['a', 'b', 'c', 'd'];
-        let pinned = HashSet::from(['a', 'b']);
-
-        assert_eq!(dropped_tab_pin_state(&items, 'a', Some('a'), &pinned), None);
-        assert_eq!(dropped_tab_pin_state(&items, 'x', Some('a'), &pinned), None);
-        assert_eq!(dropped_tab_pin_state(&items, 'a', Some('x'), &pinned), None);
-    }
-
-    #[test]
-    fn resolved_dropped_tab_pin_state_honours_forced_row_targets() {
-        let items = ['a', 'b', 'c', 'd'];
-        let pinned = HashSet::from(['a', 'b']);
-
-        assert_eq!(
-            resolved_dropped_tab_pin_state(&items, 'c', None, &pinned, Some(true)),
-            Some(true)
-        );
-        assert_eq!(
-            resolved_dropped_tab_pin_state(&items, 'a', None, &pinned, Some(false)),
-            Some(false)
-        );
-        assert_eq!(
-            resolved_dropped_tab_pin_state(&items, 'a', Some('a'), &pinned, Some(false)),
-            None
-        );
-    }
-
-    #[test]
     fn active_unpinned_tab_scroll_index_ignores_pinned_tabs() {
         let items = ['a', 'b', 'c', 'd', 'e'];
         let pinned = HashSet::from(['b', 'd']);
@@ -20720,74 +20574,6 @@ mod tests {
         assert!(!should_scroll_active_tab(false, Some('a'), Some('a')));
         assert!(!should_scroll_active_tab(false, Some('a'), None));
         assert!(!should_scroll_active_tab(true, Some('a'), Some('b')));
-    }
-
-    #[test]
-    fn change_tab_pin_state_pins_tabs_left_to_right_without_reordering() {
-        let mut items = vec!['a', 'b', 'c'];
-        let mut pinned = HashSet::new();
-
-        assert!(change_tab_pin_state(&mut items, &mut pinned, 'a', true));
-        assert_eq!(items, vec!['a', 'b', 'c']);
-        assert_eq!(zed_style_tab_order(&items, &pinned), vec!['a', 'b', 'c']);
-
-        assert!(change_tab_pin_state(&mut items, &mut pinned, 'b', true));
-        assert_eq!(items, vec!['a', 'b', 'c']);
-        assert_eq!(zed_style_tab_order(&items, &pinned), vec!['a', 'b', 'c']);
-
-        assert!(change_tab_pin_state(&mut items, &mut pinned, 'c', true));
-        assert_eq!(items, vec!['a', 'b', 'c']);
-        assert_eq!(zed_style_tab_order(&items, &pinned), vec!['a', 'b', 'c']);
-    }
-
-    #[test]
-    fn change_tab_pin_state_pins_tabs_right_to_left_at_pinned_boundary() {
-        let mut items = vec!['a', 'b', 'c'];
-        let mut pinned = HashSet::new();
-
-        assert!(change_tab_pin_state(&mut items, &mut pinned, 'c', true));
-        assert_eq!(items, vec!['c', 'a', 'b']);
-        assert_eq!(zed_style_tab_order(&items, &pinned), vec!['c', 'a', 'b']);
-
-        assert!(change_tab_pin_state(&mut items, &mut pinned, 'b', true));
-        assert_eq!(items, vec!['c', 'b', 'a']);
-        assert_eq!(zed_style_tab_order(&items, &pinned), vec!['c', 'b', 'a']);
-
-        assert!(change_tab_pin_state(&mut items, &mut pinned, 'a', true));
-        assert_eq!(items, vec!['c', 'b', 'a']);
-        assert_eq!(zed_style_tab_order(&items, &pinned), vec!['c', 'b', 'a']);
-    }
-
-    #[test]
-    fn change_tab_pin_state_unpins_tabs_to_start_of_unpinned_region() {
-        let mut items = vec!['a', 'b', 'c', 'd'];
-        let mut pinned = HashSet::from(['a', 'b']);
-
-        assert!(change_tab_pin_state(&mut items, &mut pinned, 'a', false));
-        assert_eq!(items, vec!['b', 'a', 'c', 'd']);
-        assert_eq!(
-            zed_style_tab_order(&items, &pinned),
-            vec!['b', 'a', 'c', 'd']
-        );
-
-        assert!(change_tab_pin_state(&mut items, &mut pinned, 'b', false));
-        assert_eq!(items, vec!['b', 'a', 'c', 'd']);
-        assert_eq!(
-            zed_style_tab_order(&items, &pinned),
-            vec!['b', 'a', 'c', 'd']
-        );
-    }
-
-    #[test]
-    fn change_tab_pin_state_reports_no_ops() {
-        let mut items = vec!['a', 'b'];
-        let mut pinned = HashSet::from(['a']);
-
-        assert!(!change_tab_pin_state(&mut items, &mut pinned, 'a', true));
-        assert!(!change_tab_pin_state(&mut items, &mut pinned, 'b', false));
-        assert!(!change_tab_pin_state(&mut items, &mut pinned, 'x', true));
-        assert_eq!(items, vec!['a', 'b']);
-        assert_eq!(pinned, HashSet::from(['a']));
     }
 
     #[test]
@@ -21107,21 +20893,6 @@ mod tests {
     }
 
     #[test]
-    fn max_tabs_close_candidates_close_oldest_clean_unpinned_tabs() {
-        let documents = [
-            max_tab_doc('a', 0, false, false, false),
-            max_tab_doc('b', 1, false, false, false),
-            max_tab_doc('c', 2, false, false, false),
-            max_tab_doc('d', 3, false, false, true),
-        ];
-
-        let close_candidates =
-            max_tabs_close_candidates(&documents, std::num::NonZeroUsize::new(2));
-
-        assert_eq!(close_candidates, vec!['a', 'b']);
-    }
-
-    #[test]
     fn max_tabs_settings_change_target_allows_active_settings_tab_over_cap() {
         let documents = [
             max_tab_doc('a', 0, false, false, false),
@@ -21213,18 +20984,6 @@ mod tests {
             .fragments(text.slice(..))
             .map(|fragment| fragment.into_owned())
             .collect()
-    }
-
-    #[test]
-    fn test_workspace_project_change_detection() {
-        let workspace = TestWorkspace::new();
-
-        // Test that project root change is detected
-        let old_root = Some(PathBuf::from("/old/path"));
-        let new_root = PathBuf::from("/new/path");
-
-        assert!(workspace.is_project_change(&old_root, &new_root));
-        assert!(!workspace.is_project_change(&Some(new_root.clone()), &new_root));
     }
 
     #[test]
@@ -21386,33 +21145,6 @@ mod tests {
     }
 
     #[test]
-    fn global_search_matches_uses_open_document_text() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("buffer.txt");
-        std::fs::write(&path, "saved text\n").unwrap();
-        let open_documents = vec![(path.clone(), Rope::from("unsaved needle\nsaved text\n"))];
-
-        let matches = global_search_matches(
-            temp_dir.path(),
-            "needle",
-            true,
-            &default_file_picker_config(),
-            &open_documents,
-            10,
-        )
-        .unwrap();
-
-        assert_eq!(
-            matches,
-            vec![GlobalSearchMatch {
-                path,
-                line: 0,
-                line_text: "unsaved needle".to_string(),
-            }]
-        );
-    }
-
-    #[test]
     fn global_search_matches_excludes_open_documents_from_disk_search() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("buffer.txt");
@@ -21558,23 +21290,6 @@ mod tests {
         assert_eq!(labels, vec![".hidden"]);
     }
 
-    #[test]
-    fn file_picker_preview_from_backend_reads_bounded_text() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("large.txt");
-        std::fs::write(
-            &path,
-            "a".repeat(FILE_PICKER_PREVIEW_MAX_BYTES as usize + 128),
-        )
-        .unwrap();
-
-        let backend = local_workspace_backend();
-        let preview = file_picker_preview_text_from_backend(backend.as_ref(), &path);
-
-        assert!(preview.starts_with(&"a".repeat(FILE_PICKER_PREVIEW_MAX_BYTES as usize)));
-        assert!(preview.contains("[File truncated - showing first 10KB"));
-    }
-
     #[tokio::test]
     async fn file_picker_preview_from_backend_async_reads_bounded_text() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -21614,22 +21329,5 @@ mod tests {
         assert!(preview.contains("Directory:"));
         assert!(preview.contains("README.md"));
         assert!(preview.contains("src/"));
-    }
-
-    // Helper struct for testing workspace functionality
-    struct TestWorkspace {
-        _current_project_root: Option<PathBuf>,
-    }
-
-    impl TestWorkspace {
-        fn new() -> Self {
-            Self {
-                _current_project_root: None,
-            }
-        }
-
-        fn is_project_change(&self, old_root: &Option<PathBuf>, new_root: &PathBuf) -> bool {
-            old_root.as_ref() != Some(new_root)
-        }
     }
 }

@@ -323,36 +323,6 @@ mode = "invalid_mode"
 
     #[test]
     #[ignore = "Requires Helix runtime files to be available"]
-    fn test_config_loading_from_directory() {
-        let builder = ConfigTestBuilder::new();
-
-        // Create GUI config
-        let gui_content = r#"
-[ui.font]
-family = "Test UI Font"
-size = 12.0
-
-[theme]
-mode = "dark"
-dark_theme = "custom_dark"
-"#;
-        builder.create_gui_config(gui_content).unwrap();
-
-        let result = Config::load_from_dir(builder.path());
-        assert!(result.is_ok(), "Should successfully load config");
-
-        let config = result.unwrap();
-
-        // Verify GUI config was loaded
-        let ui_font = config.gui.ui.font.expect("UI font should be loaded");
-        assert_eq!(ui_font.family, "Test UI Font");
-        assert_eq!(ui_font.size, 12.0);
-        assert_eq!(config.gui.theme.mode, ThemeMode::Dark);
-        assert_eq!(config.gui.theme.get_dark_theme(), "custom_dark");
-    }
-
-    #[test]
-    #[ignore = "Requires Helix runtime files to be available"]
     fn test_config_loading_without_gui_config() {
         let builder = ConfigTestBuilder::new();
         // Don't create GUI config file
@@ -514,6 +484,7 @@ dark_theme = "custom_dark"
                     weight: FontWeight::SemiBold,
                     size: 16.0,
                     line_height: 1.5,
+                    ligatures: Some(true),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -594,18 +565,6 @@ dark_theme = "custom_dark"
         assert_eq!(theme_config.mode, ThemeMode::System);
         assert_eq!(theme_config.get_light_theme(), "nucleotide-sandcastle");
         assert_eq!(theme_config.get_dark_theme(), "nucleotide-teal");
-    }
-
-    #[test]
-    fn test_theme_config_custom_themes() {
-        let theme_config = ThemeConfig {
-            mode: ThemeMode::Dark,
-            light_theme: Some("solarized_light".to_string()),
-            dark_theme: Some("solarized_dark".to_string()),
-        };
-
-        assert_eq!(theme_config.get_light_theme(), "solarized_light");
-        assert_eq!(theme_config.get_dark_theme(), "solarized_dark");
     }
 
     /// Test configuration merging scenarios

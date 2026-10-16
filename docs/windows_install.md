@@ -32,7 +32,7 @@ tasks when the app starts.
 
 ## Build Locally
 
-Install Rust stable, Zig 0.15.2, the .NET 8 SDK, and the Velopack CLI, then
+Install Rust stable, Zig 0.16.0, the .NET 8 SDK, and the Velopack CLI, then
 prepare the runtime resources that the package will embed:
 
 ```powershell
@@ -73,6 +73,28 @@ for updates. The packaging script rejects any generated `Setup.exe` or MSI.
 build Windows tree-sitter grammar DLLs there, copies Nucleotide themes, and
 removes grammar source checkouts before bundling.
 
+### Windows ARM64 builds
+
+The native ARM64 Windows Zig 0.16.0 compiler crashes during compilation
+([upstream issue](https://codeberg.org/ziglang/zig/issues/31865)). Use the
+installer below to download checksum-verified x64 Zig, correct a missing
+ARM64 alignment cast in its Windows debug support and add it to the current
+session's `PATH`. Use the x64 Rust host toolchain under Windows emulation:
+
+```powershell
+.\scripts\install-windows-arm64-zig.ps1 -Destination target\build-tools\zig-x64
+rustup toolchain install 1.96.0-x86_64-pc-windows-msvc --force-non-host --profile minimal --target aarch64-pc-windows-msvc
+cargo +1.96.0-x86_64-pc-windows-msvc check --workspace --all-targets --locked --target aarch64-pc-windows-msvc
+cargo +1.96.0-x86_64-pc-windows-msvc build --release -p nucleotide --bins --locked --target aarch64-pc-windows-msvc
+```
+
+Install the MSVC ARM64 build tools and Windows SDK for linking. Both host
+toolchains must be x64: with native ARM64 Rust, the Ghostty build script omits
+the Zig target argument, so x64 Zig would build an x64 library instead. The
+explicit Cargo target above produces ARM64 binaries in
+`target\aarch64-pc-windows-msvc\release`. CI uses the same workaround for its
+Windows ARM64 workspace check. Published Windows bundles still target x64.
+
 ## Configuration
 
 Nucleotide uses Helix's Windows config directory:
@@ -83,6 +105,25 @@ $env:APPDATA\helix\nucleotide.toml
 
 GUI-specific settings live in `nucleotide.toml`; editor settings continue to use
 Helix's `config.toml` in the same directory.
+
+## Keyboard shortcuts
+
+Non-editor text fields support `Ctrl+Z` to undo and either `Ctrl+Y` or
+`Ctrl+Shift+Z` to redo. In pickers, `Ctrl+Shift+P` toggles the preview;
+`Ctrl+P` and `Ctrl+N` continue to select the previous and next results.
+These shortcuts do not change Helix's modal editor bindings.
+
+## Clipboard
+
+Path-copy commands in the file tree and tab menus, and the LSP log-directory
+button, use the native clipboard. Non-ASCII paths are preserved without relying
+on command-line clipboard tools or their code-page settings.
+
+## Background tools
+
+Local workspace commands and Git queries run without attaching a console
+window. Commands launched intentionally in the terminal panel still use that
+terminal.
 
 ## Logs
 

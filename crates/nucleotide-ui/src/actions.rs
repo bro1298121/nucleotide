@@ -98,6 +98,7 @@ pub mod editor {
             ReconnectRemote,
             CancelRemoteConnection,
             OpenSettings,
+            OpenHelixSettings,
             ReloadConfiguration,
             Save,
             SaveAs,
@@ -109,6 +110,19 @@ pub mod editor {
             Paste,
             IncreaseFontSize,
             DecreaseFontSize,
+            ResetFontSize,
+            Find,
+            FindNext,
+            FindPrevious,
+            FindInProject,
+            ExpandSelection,
+            ShrinkSelection,
+            SelectNextOccurrence,
+            SelectPreviousOccurrence,
+            SplitSelectionOnNewline,
+            MergeSelections,
+            NextDiagnostic,
+            PreviousDiagnostic,
         ]
     );
 }
@@ -116,7 +130,16 @@ pub mod editor {
 pub mod help {
     use super::actions;
 
-    actions!(help, [About, OpenTutorial, ThemeDebug, ComponentGallery,]);
+    actions!(
+        help,
+        [
+            About,
+            OpenTutorial,
+            Documentation,
+            ThemeDebug,
+            ComponentGallery,
+        ]
+    );
 }
 
 pub mod updates {
@@ -140,6 +163,10 @@ pub mod workspace {
             NewFile,
             NewWindow,
             ShowCommandPrompt,
+            ShowSymbolPicker,
+            ShowWorkspaceSymbolPicker,
+            GoToDefinition,
+            FindReferences,
             ShowRunnables,
             RunNearest,
             RunFileTests,

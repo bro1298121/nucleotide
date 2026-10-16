@@ -31,8 +31,12 @@ Currently, Nucleotide provides a native GUI wrapper around Helix with:
 
 ### From Source
 
-Install Rust stable and Zig 0.15.2 first. Zig is required to build the
+Install Rust stable and Zig 0.16.0 first. Zig is required to build the
 Ghostty-backed integrated terminal.
+
+The Rust bindings are pinned to an upstream Git revision with Zig 0.16 support
+until that update is released on crates.io. The Nix Ghostty source pin matches
+the bindings' native library revision; update them together.
 
 ```bash
 cargo build --release
@@ -57,18 +61,18 @@ the only install artifact is a portable `*-Portable.zip` bundle; extract the
 entire bundle to a writable directory and launch `Nucleotide.exe`. The release
 also includes the feed and packages used by the in-app updater.
 
-Install Rust stable, Zig 0.15.2, the .NET 8 SDK, and the Velopack CLI before
+Install Rust stable, Zig 0.16.0, the .NET 8 SDK, and the Velopack CLI before
 building a Windows portable package locally.
 
 ```powershell
 cargo build --release -p nucleotide --bins
-git clone --depth 1 --branch 25.07.1 https://github.com/helix-editor/helix.git helix-temp
+.\scripts\clone-helix-runtime.ps1 -Destination helix-temp
 try {
   .\scripts\setup-windows-runtime.cmd -RuntimeSource helix-temp\runtime -NuclExe target\release\nucl-grammar.exe
 } finally {
   Remove-Item -LiteralPath helix-temp -Recurse -Force
 }
-dotnet tool update -g vpk --version 1.2.0
+dotnet tool update -g vpk --version 1.2.161
 .\scripts\package-velopack.ps1 -RequireRemoteHelpers
 ```
 
@@ -91,13 +95,19 @@ This will set up automatic `cargo fmt` checks before each commit.
 ## Configuration
 
 Nucleotide uses Helix's platform config directory. It looks for
-`nucleotide.toml` there and falls back to Helix's `config.toml` for editor
-settings.
+`nucleotide.toml` there for GUI settings and loads Helix's `config.toml`
+separately for editor settings and keybindings.
 
 - Linux/macOS: commonly `~/.config/helix/nucleotide.toml`
 - Windows: `%APPDATA%\helix\nucleotide.toml`
 
-See `docs/examples/nucleotide.example.toml` for a sample GUI configuration.
+Copy the [complete annotated example](docs/examples/nucleotide.example.toml)
+to that location for all supported GUI parameters, descriptions, accepted
+values and defaults. Optional overrides remain commented out to preserve
+platform defaults. Settings that are parsed but not yet wired to runtime
+behaviour are labelled in the example. Save the file, then choose
+**Settings > Reload Configuration** (under **Nucleotide** on macOS/Linux or
+**File** on Windows), or restart Nucleotide.
 
 ## License
 

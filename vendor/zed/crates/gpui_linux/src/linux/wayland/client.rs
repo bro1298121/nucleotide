@@ -109,6 +109,25 @@ const MIN_KEYCODE: u32 = 8;
 
 const UNKNOWN_KEYBOARD_LAYOUT_NAME: SharedString = SharedString::new_static("unknown");
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImeCursorRectangle {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl From<Bounds<Pixels>> for ImeCursorRectangle {
+    fn from(bounds: Bounds<Pixels>) -> Self {
+        Self {
+            x: bounds.origin.x.as_f32() as i32,
+            y: bounds.origin.y.as_f32() as i32,
+            width: bounds.size.width.as_f32() as i32,
+            height: bounds.size.height.as_f32() as i32,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Globals {
     pub qh: QueueHandle<WaylandClientStatePtr>,
@@ -229,6 +248,7 @@ pub(crate) struct WaylandClientState {
     pre_edit_text: Option<String>,
     ime_pre_edit: Option<String>,
     composing: bool,
+    last_ime_cursor_rectangle: Option<ImeCursorRectangle>,
     // Surface to Window mapping
     windows: HashMap<ObjectId, WaylandWindowStatePtr>,
     // Output to scale mapping
@@ -321,25 +341,25 @@ impl WaylandClientStatePtr {
         let client = self.get_client();
         let mut state = client.borrow_mut();
         state.ime_enabled = Some(true);
+        state.last_ime_cursor_rectangle = None;
         let Some(text_input) = state.text_input.take() else {
             return;
         };
 
         text_input.enable();
         text_input.set_content_type(ContentHint::None, ContentPurpose::Normal);
+        let mut cursor_rectangle = None;
         if let Some(window) = state.keyboard_focused_window.clone() {
             drop(state);
             if let Some(area) = window.get_ime_area() {
-                text_input.set_cursor_rectangle(
-                    f32::from(area.origin.x) as i32,
-                    f32::from(area.origin.y) as i32,
-                    f32::from(area.size.width) as i32,
-                    f32::from(area.size.height) as i32,
-                );
+                let area = ImeCursorRectangle::from(area);
+                text_input.set_cursor_rectangle(area.x, area.y, area.width, area.height);
+                cursor_rectangle = Some(area);
             }
             state = client.borrow_mut();
         }
         text_input.commit();
+        state.last_ime_cursor_rectangle = cursor_rectangle;
         state.text_input = Some(text_input);
     }
 
@@ -361,19 +381,26 @@ impl WaylandClientStatePtr {
 
     pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let client = self.get_client();
-        let state = client.borrow_mut();
-        if state.composing || state.text_input.is_none() || state.pre_edit_text.is_some() {
+        let mut state = client.borrow_mut();
+        if state.composing || state.pre_edit_text.is_some() {
             return;
         }
 
-        let text_input = state.text_input.as_ref().unwrap();
+        let Some(text_input) = state.text_input.as_ref() else {
+            return;
+        };
+        let rectangle = ImeCursorRectangle::from(bounds);
+        if state.last_ime_cursor_rectangle == Some(rectangle) {
+            return;
+        }
         text_input.set_cursor_rectangle(
-            bounds.origin.x.as_f32() as i32,
-            bounds.origin.y.as_f32() as i32,
-            bounds.size.width.as_f32() as i32,
-            bounds.size.height.as_f32() as i32,
+            rectangle.x,
+            rectangle.y,
+            rectangle.width,
+            rectangle.height,
         );
         text_input.commit();
+        state.last_ime_cursor_rectangle = Some(rectangle);
     }
 
     pub fn handle_keyboard_layout_change(&self) {
@@ -678,6 +705,7 @@ impl WaylandClient {
             pre_edit_text: None,
             ime_pre_edit: None,
             composing: false,
+            last_ime_cursor_rectangle: None,
             outputs: HashMap::default(),
             in_progress_outputs,
             wl_outputs,
@@ -1728,14 +1756,21 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                     drop(state);
                     window.handle_ime(ImeInput::SetMarkedText(text));
                     if let Some(area) = window.get_ime_area() {
-                        text_input.set_cursor_rectangle(
-                            f32::from(area.origin.x) as i32,
-                            f32::from(area.origin.y) as i32,
-                            f32::from(area.size.width) as i32,
-                            f32::from(area.size.height) as i32,
-                        );
-                        if last_serial == serial {
-                            text_input.commit();
+                        let mut state = client.borrow_mut();
+                        let rectangle = ImeCursorRectangle::from(area);
+                        if last_serial != serial
+                            || state.last_ime_cursor_rectangle != Some(rectangle)
+                        {
+                            text_input.set_cursor_rectangle(
+                                rectangle.x,
+                                rectangle.y,
+                                rectangle.width,
+                                rectangle.height,
+                            );
+                            if last_serial == serial {
+                                text_input.commit();
+                                state.last_ime_cursor_rectangle = Some(rectangle);
+                            }
                         }
                     }
                 } else {

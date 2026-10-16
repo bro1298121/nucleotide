@@ -116,13 +116,35 @@ pub struct EditorFontConfig {
     pub size: f32,
     pub weight: FontWeight,
     pub line_height: f32,
-    /// OpenType features applied to the editor font (for example programming ligatures).
+    /// OpenType features applied to the font, keyed by four-character feature tag.
+    ///
+    /// `features = { calt = true, liga = true, clig = true }` enables the common
+    /// programming-ligature tags. Defaults to no overrides.
     #[serde(default)]
     pub features: FontFeatureSettings,
+
+    /// Editor ligatures: unset preserves the font and platform defaults.
+    ///
+    /// This is the coarse shorthand for the `liga` / `clig` / `calt` group.
+    /// Any tag named explicitly in `features` wins over this flag, so the two
+    /// keys compose instead of fighting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ligatures: Option<bool>,
 }
 
 #[cfg(feature = "gpui-bridge")]
 impl gpui::Global for EditorFontConfig {}
+
+/// Control optional Latin ligatures without disabling required script shaping.
+#[cfg(feature = "gpui-bridge")]
+pub fn ligature_features(enabled: bool) -> FontFeatures {
+    FontFeatures(std::sync::Arc::new(
+        ["liga", "clig", "calt"]
+            .into_iter()
+            .map(|tag| (tag.to_owned(), u32::from(enabled)))
+            .collect(),
+    ))
+}
 
 #[cfg(feature = "gpui-bridge")]
 impl From<Font> for gpui::Font {

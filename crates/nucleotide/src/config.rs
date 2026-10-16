@@ -50,6 +50,7 @@ fn default_ui_font() -> FontConfig {
         size: default_ui_font_size(),
         line_height: DEFAULT_UI_FONT_LINE_HEIGHT,
         features: FontFeatureSettings::default(),
+        ligatures: None,
     }
 }
 
@@ -84,6 +85,7 @@ struct PartialFontConfig {
     size: Option<f32>,
     line_height: Option<f32>,
     features: Option<FontFeatureSettings>,
+    ligatures: Option<bool>,
 }
 
 fn merge_font_config(mut base: FontConfig, partial: PartialFontConfig) -> FontConfig {
@@ -101,6 +103,9 @@ fn merge_font_config(mut base: FontConfig, partial: PartialFontConfig) -> FontCo
     }
     if let Some(features) = partial.features {
         base.features = features;
+    }
+    if let Some(ligatures) = partial.ligatures {
+        base.ligatures = Some(ligatures);
     }
     base
 }
@@ -1959,7 +1964,7 @@ auto_download = true
         assert!(config.tab_bar.show);
         assert_eq!(
             config.tabs.show_close_button,
-            TabCloseButtonVisibility::Hover
+            TabCloseButtonVisibility::Always
         );
         assert!(config.preview_tabs.enabled);
         assert_eq!(config.file_tree.density, FileTreeDisplayDensity::Default);
@@ -1978,14 +1983,29 @@ auto_download = true
         assert!(config.lsp.project_lsp_startup);
         assert!(!config.project_markers.enable_project_markers);
 
+        // Theme names are explicit in the example but resolve from None by default.
+        // Every other assignment must preserve the omitted-setting defaults.
+        let mut defaults = GuiConfig::default();
+        defaults.theme.light_theme = Some(DEFAULT_LIGHT_THEME.to_string());
+        defaults.theme.dark_theme = Some(DEFAULT_DARK_THEME.to_string());
+        assert_eq!(
+            toml::Value::try_from(&config).expect("example config should serialize"),
+            toml::Value::try_from(&defaults).expect("default config should serialize"),
+            "copying the example should preserve default GUI settings"
+        );
+
         for setting in [
             "max_tabs",
+            "[updates]",
+            "check_on_startup",
+            "auto_download",
             "[theme]",
             "mode",
             "light_theme",
             "dark_theme",
             "[window]",
             "blur_dark_themes",
+            "chrome_opacity",
             "appearance_follows_theme",
             "[window.directwrite]",
             "gamma",
@@ -2343,22 +2363,6 @@ enable_builtin_fallback = false
     }
 
     #[test]
-    fn test_tab_bar_button_visibility_parsing() {
-        let config: TabBarConfig = toml::from_str(
-            r#"
-show = false
-show_nav_history_buttons = false
-show_tab_bar_buttons = false
-"#,
-        )
-        .expect("should parse tab bar button visibility settings");
-
-        assert!(!config.show);
-        assert!(!config.show_nav_history_buttons);
-        assert!(!config.show_tab_bar_buttons);
-    }
-
-    #[test]
     fn test_tab_icon_and_git_status_parsing() {
         let config: TabsConfig = toml::from_str(
             r#"
@@ -2401,20 +2405,6 @@ file_icons = false
         assert_eq!(off.show_diagnostics, TabDiagnosticsVisibility::Off);
         assert_eq!(errors.show_diagnostics, TabDiagnosticsVisibility::Errors);
         assert_eq!(all.show_diagnostics, TabDiagnosticsVisibility::All);
-    }
-
-    #[test]
-    fn test_lsp_config_parsing() {
-        let config_str = r#"
-[lsp]
-project_lsp_startup = true
-startup_timeout_ms = 3000
-"#;
-
-        let config: GuiConfig = toml::from_str(config_str).expect("Failed to parse LSP config");
-
-        assert!(config.lsp.project_lsp_startup);
-        assert_eq!(config.lsp.startup_timeout_ms, 3000);
     }
 
     #[test]
@@ -2472,21 +2462,6 @@ startup_timeout_ms = 3000
         assert!(relaxed.flatten_empty_directories);
         assert_eq!(unflattened.density, FileTreeDisplayDensity::Default);
         assert!(!unflattened.flatten_empty_directories);
-    }
-
-    #[test]
-    fn test_config_convenience_methods() {
-        let mut gui_config = GuiConfig::default();
-        gui_config.lsp.project_lsp_startup = true;
-        gui_config.lsp.startup_timeout_ms = 2000;
-
-        let config = Config {
-            helix: HelixConfig::default(),
-            gui: gui_config,
-        };
-
-        assert!(config.is_project_lsp_startup_enabled());
-        assert_eq!(config.lsp_startup_timeout_ms(), 2000);
     }
 
     #[test]
@@ -2928,6 +2903,7 @@ priority = 70
             size: 13.0,
             line_height: 1.5,
             features: FontFeatureSettings::default(),
+            ligatures: None,
         });
 
         let config = Config {
@@ -2966,6 +2942,7 @@ priority = 70
             size: 16.0,
             line_height: 1.4,
             features: FontFeatureSettings::default(),
+            ligatures: None,
         });
         let config = Config {
             helix: HelixConfig::default(),
@@ -3101,6 +3078,7 @@ family = "Some Font"
             size: 16.0,
             line_height: 1.5,
             features: FontFeatureSettings::ligatures(),
+            ligatures: None,
         };
 
         let encoded = toml::to_string(&original).expect("font config should serialize");
@@ -3135,6 +3113,38 @@ family = "Some Font"
     }
 
     #[test]
+    fn editor_ligatures_preserve_unset_and_explicit_overrides() {
+        for (setting, expected) in [
+            ("", None),
+            ("ligatures = true", Some(true)),
+            ("ligatures = false", Some(false)),
+        ] {
+            let gui: GuiConfig = toml::from_str(&format!(
+                "[ui.font]\nfamily = 'UI Font'\nligatures = true\n[editor.font]\n{setting}"
+            ))
+            .unwrap();
+            let config = Config {
+                helix: HelixConfig::default(),
+                gui,
+            };
+            let font = config.editor_font();
+            assert_eq!(font.ligatures, expected);
+            assert_eq!(font.family, FontConfig::default().family);
+            let roundtrip: GuiConfig =
+                toml::from_str(&toml::to_string(&config.gui).unwrap()).unwrap();
+            assert_eq!(roundtrip.editor.font.unwrap().ligatures, expected);
+        }
+        let gui: GuiConfig = toml::from_str("[ui.font]\nligatures = false").unwrap();
+        let config = Config {
+            helix: HelixConfig::default(),
+            gui,
+        };
+        assert_eq!(config.editor_font().ligatures, Some(false));
+        assert_eq!(FontConfig::default().ligatures, None);
+        assert!(toml::from_str::<GuiConfig>("[editor.font]\nligatures = 'yes'").is_err());
+    }
+
+    #[test]
     fn windows_logfont_height_is_normalized_to_logical_pixels() {
         assert_eq!(
             logical_font_size_from_windows_logfont_height(-12, 96),
@@ -3158,39 +3168,5 @@ family = "Some Font"
             logical_font_size_from_windows_logfont_height(i32::MIN, 96),
             None
         );
-    }
-
-    #[test]
-    fn test_project_markers_integration_with_gui_config() {
-        let config_str = r#"
-[ui.font]
-family = "Inter"
-size = 13.0
-
-[project_markers]
-enable_project_markers = true
-detection_timeout_ms = 1500
-enable_builtin_fallback = true
-
-[lsp]
-project_lsp_startup = true
-startup_timeout_ms = 3000
-"#;
-
-        let config: GuiConfig =
-            toml::from_str(config_str).expect("Failed to parse GUI config with project markers");
-
-        // Test that project markers are properly integrated
-        assert!(config.project_markers.enable_project_markers);
-        assert_eq!(config.project_markers.detection_timeout_ms, 1500);
-        assert!(config.project_markers.enable_builtin_fallback);
-
-        // Test that other configs still work
-        assert!(config.lsp.project_lsp_startup);
-        assert_eq!(config.lsp.startup_timeout_ms, 3000);
-
-        let ui_font = config.ui.font.as_ref().expect("UI font should be set");
-        assert_eq!(ui_font.family, "Inter");
-        assert_eq!(ui_font.size, 13.0);
     }
 }

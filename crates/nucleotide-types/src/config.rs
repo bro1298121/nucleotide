@@ -59,6 +59,14 @@ pub struct FontConfig {
     /// programming-ligature tags. Defaults to no overrides.
     #[serde(default)]
     pub features: FontFeatureSettings,
+
+    /// Editor ligatures: unset preserves the font and platform defaults.
+    ///
+    /// This is the coarse shorthand for the `liga` / `clig` / `calt` group.
+    /// Any tag named explicitly in `features` wins over this flag, so the two
+    /// keys compose instead of fighting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ligatures: Option<bool>,
 }
 
 impl Default for FontConfig {
@@ -69,6 +77,7 @@ impl Default for FontConfig {
             size: default_font_size(),
             line_height: default_line_height(),
             features: FontFeatureSettings::default(),
+            ligatures: None,
         }
     }
 }
