@@ -8,21 +8,32 @@ on:
 permissions:
   contents: read
 
+# Superseded runs are pure waste: every job here compiles the Ghostty native
+# library and two musl cross-builds from scratch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          # Matches rust-toolchain.toml. Keep the two in sync.
+          toolchain: 1.98.0
 
-      - name: Install Zig 0.16.0
-        run: |
-          set -euo pipefail
-          curl -fSL --retry 5 --retry-all-errors \
-            -o zig.tar.xz \
-            https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
-          tar -xf zig.tar.xz
-          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+      # setup-zig puts zig on PATH itself. The previous hand-rolled
+      # curl + tar + GITHUB_PATH install is what let a stale 0.15.2 directory
+      # name survive a 0.16.0 bump unnoticed, on all three platforms.
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.16.0
+          use-cache: false
 
       - name: Verify Zig
         run: zig version
@@ -85,19 +96,20 @@ jobs:
   macos:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          # Matches rust-toolchain.toml. Keep the two in sync.
+          toolchain: 1.98.0
           targets: aarch64-apple-darwin
 
-      - name: Install Zig 0.16.0
-        run: |
-          set -euo pipefail
-          curl -fSL --retry 5 --retry-all-errors \
-            -o zig.tar.xz \
-            https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
-          tar -xf zig.tar.xz
-          echo "$PWD/zig-aarch64-macos-0.16.0" >> "$GITHUB_PATH"
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.16.0
+          use-cache: false
 
       - name: Verify Zig
         run: zig version
@@ -139,16 +151,19 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          # Matches rust-toolchain.toml. Keep the two in sync.
+          toolchain: 1.98.0
 
-      - name: Install Zig 0.16.0
-        run: |
-          curl -fSL --retry 5 --retry-all-errors `
-            -o zig.tar.xz `
-            https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip
-          tar -xf zig.tar.xz
-          "$PWD\zig-x86_64-windows-0.16.0" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.16.0
+          use-cache: false
 
       - name: Verify Zig
         run: zig version
@@ -164,20 +179,38 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Fetch Helix runtime
+      - name: Prepare bundled runtime
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $HELIX_REV = (Select-String -Path Cargo.toml -Pattern 'helix-loader = .*rev = "([0-9a-f]*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          git clone --depth 1 --branch 25.07.1 https://github.com/helix-editor/helix.git helix-temp
-          if ($HELIX_REV) {
-            git -C helix-temp fetch --depth 1 origin $HELIX_REV
-            git -C helix-temp checkout --detach FETCH_HEAD
-          }
+          # clone-helix-runtime.ps1 reads the pinned rev out of Cargo.toml, so
+          # this job and the repo pin cannot drift the way an inlined clone can.
+          .\scripts\clone-helix-runtime.ps1 -Destination helix-temp
           try {
-            .\scripts\setup-windows-runtime.cmd -RuntimeSource helix-temp\runtime -NuclExe target\release\nucl-grammar.exe
+            .\scripts\setup-windows-runtime.ps1 -RuntimeSource helix-temp\runtime -NuclExe target\release\nucl-grammar.exe -AllowGrammarFailures
           } finally {
             Remove-Item -LiteralPath helix-temp -Recurse -Force
+          }
+
+      - name: Verify grammar DLLs
+        shell: pwsh
+        run: |
+          $grammarDlls = Get-ChildItem `
+            -Path crates\nucleotide\runtime\grammars `
+            -Filter *.dll `
+            -File
+
+          if ($grammarDlls.Count -eq 0) {
+            throw "Windows package runtime does not contain any grammar DLLs."
+          }
+
+          Write-Host "Windows package runtime contains $($grammarDlls.Count) grammar DLL(s)."
+
+          # The fetch step writes the tree-sitter grammar sources next to the
+          # DLLs. They must not ship: they are large, and only the built DLLs
+          # are loaded at runtime.
+          $grammarSources = "crates\nucleotide\runtime\grammars\sources"
+          if (Test-Path $grammarSources) {
+            throw "Windows package runtime must not contain grammar sources: $grammarSources"
           }
 
       # Produced by the linux job; package-velopack.ps1 -RequireRemoteHelpers
