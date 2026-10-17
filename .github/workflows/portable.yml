@@ -3,6 +3,10 @@ name: Portable Linux + macOS + Windows
 on:
   push:
     branches: [main]
+  schedule:
+    # everyday 22:00 run (UTC+8 Timezone)
+    - cron: '0 22 * * *'
+      timezone: 'Asia/Shanghai'
   workflow_dispatch:
 
 permissions:
@@ -84,13 +88,15 @@ jobs:
           cp -r helix-temp/runtime/* nucleotide-linux/share/nucleotide/runtime/
           rm -rf helix-temp
 
-      - name: Tarball
-        run: tar -czf nucleotide-linux-x86_64.tar.gz nucleotide-linux
+      - name: Rename tarball with nightly suffix
+        run: |
+          DATE_TAG="$(TZ=Asia/Shanghai date +'%Y%m%d')"
+          mv nucleotide-linux-x86_64.tar.gz "nucleotide_fork-Nightly${DATE_TAG}-linux-x86_64.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
           name: nucleotide-linux-x86_64
-          path: nucleotide-linux-x86_64.tar.gz
+          path: nucleotide_fork-Nightly*-linux-x86_64.tar.gz
           if-no-files-found: error
 
   macos:
@@ -140,12 +146,16 @@ jobs:
           set -euo pipefail
           NUCL_BINARY="target/aarch64-apple-darwin/release/nucl" \
           ./scripts/bundle-mac.sh
-          tar -czf Nucleotide-aarch64.app.tar.gz Nucleotide.app
+
+      - name: Rename tarball with nightly suffix
+        run: |
+          DATE_TAG="$(TZ=Asia/Shanghai date +'%Y%m%d')"
+          mv Nucleotide-aarch64.app.tar.gz "nucleotide_fork-Nightly${DATE_TAG}-macos-aarch64.app.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
           name: nucleotide-macos-aarch64
-          path: Nucleotide-aarch64.app.tar.gz
+          path: nucleotide_fork-Nightly*-macos-aarch64.app.tar.gz
           if-no-files-found: error
 
   windows:
@@ -225,13 +235,15 @@ jobs:
         shell: pwsh
         run: .\scripts\package-velopack.ps1 -RequireRemoteHelpers
 
-      - name: Locate portable bundle
-        id: bundle
+      - name: Rename portable zip with nightly suffix
         shell: pwsh
         run: |
           $zip = Get-ChildItem -Path . -Recurse -Filter *-Portable.zip -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $zip) { throw "No *-Portable.zip produced by package-velopack.ps1" }
-          "zip_path=$($zip.FullName)" >> $env:GITHUB_OUTPUT
+          $dateTag = Get-Date -Format 'yyyyMMdd'
+          $newName = "nucleotide_fork-Nightly${dateTag}-windows-x86_64-portable.zip"
+          Move-Item -LiteralPath $zip.FullName -Destination $newName -Force
+          "zip_path=$((Resolve-Path $newName).Path)" >> $env:GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
         with:
@@ -241,3 +253,55 @@ jobs:
             **/RELEASES
             **/*.nupkg
           if-no-files-found: error
+
+  publish-nightly:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nucleotide-linux-x86_64
+          path: dist/linux
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nucleotide-macos-aarch64
+          path: dist/macos
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nucleotide-windows-x86_64
+          path: dist/windows
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist/final
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/final/ \;
+
+      - name: Publish nightly pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="nightly"
+          DATE_TAG="$(TZ=Asia/Shanghai date +'%Y%m%d')"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes
+            git push origin ":refs/tags/${TAG}" || true
+          fi
+
+          gh release create "$TAG" \
+            --prerelease \
+            --target "${{ github.sha }}" \
+            --title "nucleotide_fork-Nightly${DATE_TAG}" \
+            --notes "Automated nightly build from ${{ github.sha }}." \
+            dist/final/*.tar.gz dist/final/*.zip || true
