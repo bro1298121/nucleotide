@@ -155,6 +155,73 @@ look = "theme"
 # Invalid tags (not exactly four ASCII alphanumeric characters) are ignored.
 # features = { calt = true, liga = true, clig = true }
 
+[editor]
+# Animate editor viewport scrolling (eased page/row jumps). Default: true.
+# smooth_scrolling = true
+
+# Smooth mouse-wheel scrolling, including a short glide after a gesture stops.
+# Default: true.
+#
+# While you are scrolling, each notch eases onto an accumulated destination over
+# about 80ms, so the view catches up to your intent instead of snapping notch by
+# notch. Notches keep stacking while it eases, so N notches of X still travel
+# N * X: the easing changes how it gets there, not how far.
+#
+# Once the wheel goes quiet a small extra glide is added on top, proportional to
+# the travel the gesture accumulated, which is what makes a flick carry. A long
+# gesture therefore overshoots its own input by roughly a quarter; a single
+# deliberate notch does not glide at all.
+#
+# There is no horizontal easing: horizontal wheel scrolling is always 1:1 and
+# instant, and h and l move within a line so they never scroll the viewport.
+# Setting this to false leaves the wheel exactly 1:1 and instant, with no glide.
+#
+# Wheel easing and the glide are both tweened, so this also requires
+# smooth_scrolling = true.
+# wheel_glide = true
+
+# Animate the cursor with a short trail whenever it moves or the view scrolls.
+# Default: true.
+#
+# Turning this off snaps the cursor to its new position immediately, with no
+# residual trail. It is independent of smooth_scrolling: the trail animates the
+# cursor, while smooth_scrolling animates the viewport.
+# cursor_trail = true
+
+# How far the cursor trail stretches behind the cursor as it moves.
+# Range: 0.0..=1.0. Default: 0.9.
+#
+# The scale runs backwards from intuition: larger means MORE trail. At 1.0 the
+# leading edge of the cursor snaps onto each new cell while the trailing edge
+# draws the full smear behind it; at 0.0 every corner moves together and there
+# is no smear at all, just a smooth ease. Setting 0.1 expecting a subtle trail
+# gives you a nearly invisible one. Out-of-range values are clamped.
+# cursor_trail_size = 0.9
+
+# How long the cursor trail takes to settle after the cursor moves, in
+# SECONDS. Range: > 0, at most 0.5. Default: 0.120.
+#
+# Seconds, not milliseconds: 0.120 is 120 ms, the same number as the built-in
+# constant, so the two cannot drift apart. Values above 0.5 are clamped down
+# to 0.5.
+# cursor_animation_length = 0.120
+
+# How long the trail takes to settle for short hops (typing, moving a couple
+# of cells or less), in SECONDS. Range: > 0, at most cursor_animation_length.
+# Default: 0.035.
+#
+# Short hops repeat on every keystroke, so this stays small enough that the
+# cursor does not linger behind the character you just typed. Values above
+# cursor_animation_length are clamped down to it: a short hop must never
+# animate slower than a long jump.
+# cursor_short_animation_length = 0.035
+
+# Start with every workspace region hidden except the editor: no titlebar,
+# tab bar, status bar, file tree, documentation sidebar or terminal panel.
+# F8 toggles it at runtime and restores whatever was visible before.
+# Default: false.
+# zen_mode = false
+
 # Coarse editor ligature shorthand. Unset preserves font/platform defaults.
 # Set true to enable or false to disable the liga, clig and calt substitutions
 # as a group. For per-tag control use the "features" map above; any tag named

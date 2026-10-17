@@ -880,11 +880,11 @@ use nucleotide::actions::{
         SelectNextOccurrence, SelectPreviousOccurrence, ShrinkSelection, SplitSelectionOnNewline,
     },
     help::{About, Documentation, OpenTutorial},
-    window::{Minimize, Zoom},
+    window::{Minimize, ToggleFullscreen, Zoom},
     workspace::{
         RunFileTests, RunLast, RunNearest, ShowRunnables, SplitPaneDown, SplitPaneLeft,
         SplitPaneRight, SplitPaneUp, ToggleDocumentation, ToggleFileTree, TogglePreviewTab,
-        ToggleTerminal, UnpinAllTabs,
+        ToggleTerminal, ToggleZenMode, UnpinAllTabs,
     },
 };
 #[cfg(debug_assertions)]
@@ -967,6 +967,7 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::action("Toggle File Tree", ToggleFileTree),
             MenuItem::action("Toggle Documentation", ToggleDocumentation),
             MenuItem::action("Toggle Terminal", ToggleTerminal),
+            MenuItem::action("Toggle Zen Mode", ToggleZenMode),
             MenuItem::separator(),
             MenuItem::submenu(Menu::new("Editor Layout").items([
                 MenuItem::action("Split Right", SplitPaneRight),
@@ -1013,6 +1014,8 @@ fn app_menus() -> Vec<Menu> {
                 },
                 Zoom,
             ),
+            MenuItem::separator(),
+            MenuItem::action("Toggle Fullscreen", ToggleFullscreen),
         ]),
         #[cfg(debug_assertions)]
         Menu::new("Debug").items([

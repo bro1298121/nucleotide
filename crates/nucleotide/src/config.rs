@@ -278,6 +278,14 @@ pub struct EditorGuiConfig {
     /// `cursor_animation_length`. Default: 0.035.
     #[serde(default = "default_cursor_short_animation_length")]
     pub cursor_short_animation_length: f32,
+
+    /// Start with every workspace region hidden except the editor.
+    ///
+    /// Zen mode hides the app titlebar, tab bar, status bar, file tree,
+    /// documentation sidebar and terminal panel, and gives the editor the whole
+    /// window. F8 toggles it at runtime; this only sets the initial state.
+    #[serde(default)]
+    pub zen_mode: bool,
 }
 
 impl Default for EditorGuiConfig {
@@ -290,6 +298,7 @@ impl Default for EditorGuiConfig {
             cursor_trail_size: 0.9,
             cursor_animation_length: 0.120,
             cursor_short_animation_length: 0.035,
+            zen_mode: false,
         }
     }
 }
@@ -1207,6 +1216,11 @@ impl Config {
     /// read site so runtime reloads apply without a restart.
     pub fn editor_cursor_short_animation_length(&self) -> f32 {
         self.gui.editor.cursor_short_animation_length
+    }
+
+    /// Whether zen mode starts enabled, hiding every workspace region except the editor.
+    pub fn editor_zen_mode(&self) -> bool {
+        self.gui.editor.zen_mode
     }
 
     /// Get the UI chrome style used by nucleotide-ui.
@@ -3110,6 +3124,24 @@ family = "Some Font"
 
         assert_eq!(tags, vec!["calt"]);
         assert_eq!(features.is_calt_enabled(), Some(true));
+    }
+
+    #[test]
+    fn editor_zen_mode_setting_parses_and_defaults_to_false() {
+        let enabled: GuiConfig =
+            toml::from_str("[editor]\nzen_mode = true").expect("zen mode config should parse");
+        let config = Config {
+            helix: HelixConfig::default(),
+            gui: enabled,
+        };
+        assert!(config.editor_zen_mode());
+
+        let omitted: GuiConfig = toml::from_str("").expect("empty config should parse");
+        let config = Config {
+            helix: HelixConfig::default(),
+            gui: omitted,
+        };
+        assert!(!config.editor_zen_mode());
     }
 
     #[test]

@@ -159,6 +159,7 @@ pub mod workspace {
             ToggleFileTree,
             ToggleDocumentation,
             ToggleTerminal,
+            ToggleZenMode,
             ShowFileFinder,
             NewFile,
             NewWindow,
@@ -184,7 +185,10 @@ pub mod workspace {
 pub mod window {
     use super::actions;
 
-    actions!(window, [Hide, HideOthers, ShowAll, Minimize, Zoom,]);
+    actions!(
+        window,
+        [Hide, HideOthers, ShowAll, Minimize, Zoom, ToggleFullscreen,]
+    );
 }
 
 pub mod focus {

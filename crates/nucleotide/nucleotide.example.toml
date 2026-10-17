@@ -216,6 +216,12 @@ look = "theme"
 # animate slower than a long jump.
 # cursor_short_animation_length = 0.035
 
+# Start with every workspace region hidden except the editor: no titlebar,
+# tab bar, status bar, file tree, documentation sidebar or terminal panel.
+# F8 toggles it at runtime and restores whatever was visible before.
+# Default: false.
+# zen_mode = false
+
 # Coarse editor ligature shorthand. Unset preserves font/platform defaults.
 # Set true to enable or false to disable the liga, clig and calt substitutions
 # as a group. For per-tag control use the "features" map above; any tag named

@@ -1073,6 +1073,15 @@ pub struct Workspace {
     // Unsaved close confirmation modal state
     close_confirm_open: bool,
     close_confirm: Option<UnsavedCloseConfirmation<DocumentId>>,
+    // Zen mode hides all window chrome (app titlebar, tab bar, status bar, file
+    // tree, documentation sidebar, and terminal panel), leaving only the editor.
+    // Zen is purely a window-chrome concern and is completely independent of the
+    // window's fullscreen state: zen code never calls `toggle_fullscreen`.
+    zen_mode: bool,
+    // Visibility captured when entering zen, restored when leaving it.
+    zen_saved_file_tree: bool,
+    zen_saved_doc_sidebar: bool,
+    zen_saved_terminal: bool,
     // Terminal panel state
     terminal_panel_visible: bool,
     terminal_id: Option<TerminalId>,
@@ -3075,6 +3084,32 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    /// Toggle zen mode, which hides all window chrome — the app titlebar, tab
+    /// bar, status bar, file tree, documentation sidebar, and terminal panel —
+    /// leaving only the editor visible.
+    ///
+    /// Zen is a window-chrome concern only and is completely independent of the
+    /// window's fullscreen state; this method never calls `toggle_fullscreen`.
+    /// Entering zen snapshots the file tree / documentation sidebar / terminal
+    /// visibility and forces them off; leaving zen restores exactly those saved
+    /// values.
+    pub fn toggle_zen_mode(&mut self, cx: &mut Context<Self>) {
+        self.zen_mode = !self.zen_mode;
+        if self.zen_mode {
+            self.zen_saved_file_tree = self.show_file_tree;
+            self.zen_saved_doc_sidebar = self.doc_sidebar_visible;
+            self.zen_saved_terminal = self.terminal_panel_visible;
+            self.show_file_tree = false;
+            self.doc_sidebar_visible = false;
+            self.terminal_panel_visible = false;
+        } else {
+            self.show_file_tree = self.zen_saved_file_tree;
+            self.doc_sidebar_visible = self.zen_saved_doc_sidebar;
+            self.terminal_panel_visible = self.zen_saved_terminal;
+        }
+        cx.notify();
     }
 
     fn toggle_terminal_panel(&mut self, cx: &mut Context<Self>) {
@@ -5860,6 +5895,10 @@ impl Workspace {
             delete_confirm_was_directory: false,
             close_confirm_open: false,
             close_confirm: None,
+            zen_mode: false,
+            zen_saved_file_tree: false,
+            zen_saved_doc_sidebar: false,
+            zen_saved_terminal: false,
             terminal_panel_visible: false,
             terminal_id: None,
             next_terminal_id: 1,
@@ -7136,6 +7175,29 @@ impl Workspace {
             self.toggle_terminal_panel(cx);
             cx.stop_propagation();
             return;
+        }
+
+        // Fullscreen (F11) and zen mode (F8) are intercepted here, alongside the
+        // fallback-shortcut interception above and before the embedded-terminal
+        // early return below, so both work in insert and normal mode and even
+        // while the terminal has focus. They are matched on the raw translated
+        // key code because neither key is part of the semantic fallback shortcut
+        // table consulted by `resolve_fallback_shortcut`.
+        if key.modifiers == KeyModifiers::NONE {
+            match key.code {
+                KeyCode::F(11) => {
+                    // Fullscreen is entirely independent of zen mode.
+                    window.toggle_fullscreen();
+                    cx.stop_propagation();
+                    return;
+                }
+                KeyCode::F(8) => {
+                    self.toggle_zen_mode(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
         }
 
         // If embedded terminal is focused, route all keys to it and stop here.
@@ -10022,6 +10084,17 @@ impl Workspace {
             self.enforce_max_tabs_to_target(settings_change_target, protected_doc_id, cx);
         }
 
+        // Apply the configured zen-mode default. This runs both at startup and on a
+        // live "Reload Configuration". `toggle_zen_mode` flips state, so we only
+        // ever call it when the current state is still `false`. That keeps a reload
+        // from yanking a user out of a zen session they toggled into by hand: if
+        // the config default is `true` and we are already in zen, calling toggle
+        // here would flip zen *off*. The tradeoff is that manually leaving zen while
+        // the config still says `true` is respected until the next full restart.
+        if config.editor_zen_mode() && !self.zen_mode {
+            self.toggle_zen_mode(cx);
+        }
+
         cx.notify();
     }
 
@@ -10904,7 +10977,8 @@ impl Workspace {
         );
         let tab_count = self.pane_tabs.panes[&pane_id].tabs.len();
 
-        let should_show_tabs = core.config.gui.tab_bar.show
+        let should_show_tabs = !self.zen_mode
+            && core.config.gui.tab_bar.show
             && match bufferline_config {
                 BufferLine::Never => false,
                 BufferLine::Always => true,
@@ -14776,7 +14850,7 @@ impl Workspace {
     fn renders_app_titlebar(&self, cx: &Context<Self>) -> bool {
         let gui_config = &self.core.read(cx).config.gui;
         should_render_app_titlebar(
-            self.titlebar.is_some(),
+            self.titlebar.is_some() && !self.zen_mode,
             self.show_file_tree,
             self.file_tree_width,
             macos_system_sidebar_enabled(gui_config),
@@ -14792,6 +14866,13 @@ impl Workspace {
     }
 
     fn visible_tab_bar_height(&self, cx: &Context<Self>) -> Pixels {
+        // Zen hides the tab bar, so the height reported to `WorkspaceLayoutInfo`
+        // must be zero too. Overlays anchor their fallback position to
+        // `title_bar_height + tab_bar_height` and would otherwise sit one tab bar
+        // too low while zen is on.
+        if self.zen_mode {
+            return px(0.0);
+        }
         let core = self.core.read(cx);
         let editor = &core.editor;
         let tabs = self
@@ -15137,7 +15218,7 @@ impl Render for Workspace {
         let bg_color = self.cached_bg_color;
         let native_sidebar_enabled = macos_system_sidebar_enabled(&self.core.read(cx).config.gui);
         let rendered_titlebar = should_render_app_titlebar(
-            self.titlebar.is_some(),
+            self.titlebar.is_some() && !self.zen_mode,
             self.show_file_tree,
             self.file_tree_width,
             native_sidebar_enabled,
@@ -15161,7 +15242,14 @@ impl Render for Workspace {
         // Compute the editor content dimensions before reading Helix view areas,
         // so split panes use the current tree layout in this render pass.
         let ui_theme = cx.global::<nucleotide_ui::Theme>();
-        let status_bar_height = ui_theme.tokens.sizes.statusbar_height;
+        // Zen mode hides the status bar entirely, so it must contribute no height.
+        // Otherwise `rows` below would be computed one status bar too tall and the
+        // last line of the document would be unscrollable.
+        let status_bar_height = if self.zen_mode {
+            px(0.0)
+        } else {
+            ui_theme.tokens.sizes.statusbar_height
+        };
         let titlebar_height = self.rendered_titlebar_height(window, cx);
         let tab_bar_height = self.visible_tab_bar_height(cx);
         let viewport_h = window.viewport_size().height;
@@ -15366,7 +15454,7 @@ impl Render for Workspace {
                         }
                     })
                     .when(
-                        !self.info_hidden && !self.info.read(cx).is_empty(),
+                        !self.zen_mode && !self.info_hidden && !self.info.read(cx).is_empty(),
                         |this| this.child(self.info.clone()),
                     )
                     .child(self.key_hints.clone())
@@ -15993,6 +16081,14 @@ impl Render for Workspace {
             },
         ));
 
+        // Toggle zen mode action (menu entry for F8).
+        workspace_div = workspace_div.on_action(cx.listener(
+            move |workspace, _: &crate::actions::workspace::ToggleZenMode, _window, cx| {
+                info!("ToggleZenMode action triggered from menu");
+                workspace.toggle_zen_mode(cx);
+            },
+        ));
+
         workspace_div = workspace_div.on_action(cx.listener(
             move |workspace, _: &crate::actions::workspace::ToggleDocumentation, _window, cx| {
                 info!("ToggleDocumentation action triggered from menu");
@@ -16152,7 +16248,13 @@ impl Render for Workspace {
                 cx.listener(move |_, _: &crate::actions::window::Zoom, window, _cx| {
                     window.zoom_window();
                 }),
-            );
+            )
+            .on_action(cx.listener(
+                move |_, _: &crate::actions::window::ToggleFullscreen, window, _cx| {
+                    // F11 / menu fullscreen toggle. Independent of zen mode.
+                    window.toggle_fullscreen();
+                },
+            ));
 
         // Help and test actions
         let handle = self.handle.clone();
@@ -16527,7 +16629,11 @@ impl Render for Workspace {
                             .min_h(px(0.0)) // allow vertical shrink in flex column
                             .child(content_area),
                     )
-                    .child(self.render_unified_status_bar(window, cx)), // Unified bottom status bar pinned at bottom
+                    // Zen mode hides the status bar entirely, so omit it rather
+                    // than rendering a zero-height placeholder.
+                    .when(!self.zen_mode, |this| {
+                        this.child(self.render_unified_status_bar(window, cx))
+                    }),
             )
             // Add Linux client-side resize hitboxes so the window can be resized
             .map(|root| {
