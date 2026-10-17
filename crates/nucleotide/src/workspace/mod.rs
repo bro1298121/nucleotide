@@ -1078,6 +1078,11 @@ pub struct Workspace {
     // Zen is purely a window-chrome concern and is completely independent of the
     // window's fullscreen state: zen code never calls `toggle_fullscreen`.
     zen_mode: bool,
+    // Pending fullscreen toggle requested by the F11 semantic shortcut.
+    // `execute_semantic_shortcut` has no `Window`, and this gpui version has no
+    // `cx.dispatch()`, so the request is parked here and consumed on the next
+    // render pass, which is the first place a `Window` is available.
+    pending_fullscreen_toggle: bool,
     // Visibility captured when entering zen, restored when leaving it.
     zen_saved_file_tree: bool,
     zen_saved_doc_sidebar: bool,
@@ -5896,6 +5901,7 @@ impl Workspace {
             close_confirm_open: false,
             close_confirm: None,
             zen_mode: false,
+            pending_fullscreen_toggle: false,
             zen_saved_file_tree: false,
             zen_saved_doc_sidebar: false,
             zen_saved_terminal: false,
@@ -7177,29 +7183,6 @@ impl Workspace {
             return;
         }
 
-        // Fullscreen (F11) and zen mode (F8) are intercepted here, alongside the
-        // fallback-shortcut interception above and before the embedded-terminal
-        // early return below, so both work in insert and normal mode and even
-        // while the terminal has focus. They are matched on the raw translated
-        // key code because neither key is part of the semantic fallback shortcut
-        // table consulted by `resolve_fallback_shortcut`.
-        if key.modifiers == KeyModifiers::NONE {
-            match key.code {
-                KeyCode::F(11) => {
-                    // Fullscreen is entirely independent of zen mode.
-                    window.toggle_fullscreen();
-                    cx.stop_propagation();
-                    return;
-                }
-                KeyCode::F(8) => {
-                    self.toggle_zen_mode(cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                _ => {}
-            }
-        }
-
         // If embedded terminal is focused, route all keys to it and stop here.
         // Terminal visibility alone must not steal editor input.
         if self.terminal_is_focused(window, cx) {
@@ -7374,6 +7357,11 @@ impl Workspace {
                 cx.notify();
             }
             Intent::ToggleTerminal => self.toggle_terminal_panel(cx),
+            Intent::ToggleZenMode => self.toggle_zen_mode(cx),
+            Intent::ToggleFullscreen => {
+                self.pending_fullscreen_toggle = true;
+                cx.notify();
+            }
         }
     }
 
@@ -15111,6 +15099,14 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Apply a fullscreen toggle requested via the F11 semantic shortcut. The
+        // shortcut has no `Window`, so it parks the request here; consume it first
+        // so this frame already lays out against the new window size.
+        if self.pending_fullscreen_toggle {
+            self.pending_fullscreen_toggle = false;
+            window.toggle_fullscreen();
+        }
+
         let window_is_active = window.is_window_active();
         if window_is_active && !self.window_was_active {
             self.update_controller

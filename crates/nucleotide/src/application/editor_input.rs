@@ -2399,6 +2399,10 @@ pub fn resolve_fallback_shortcut(
             Some(EditorFallback(Editor::PreviousBuffer))
         }
         (KeyCode::F(4), KeyModifiers::CONTROL) if desktop => Some(Workspace(Intent::CloseFile)),
+        (KeyCode::F(11), KeyModifiers::NONE) if desktop => {
+            Some(Workspace(Intent::ToggleFullscreen))
+        }
+        (KeyCode::F(8), KeyModifiers::NONE) if desktop => Some(Workspace(Intent::ToggleZenMode)),
         (KeyCode::Insert, KeyModifiers::CONTROL) if desktop => Some(EditorFallback(Editor::Copy)),
         (KeyCode::Insert, KeyModifiers::SHIFT) if desktop => Some(EditorFallback(Editor::Paste)),
         (KeyCode::Delete, KeyModifiers::SHIFT) if desktop => Some(EditorFallback(Editor::Cut)),
@@ -2949,6 +2953,28 @@ mod tests {
         canonicalize_key(&mut key);
         assert_eq!(key.code, KeyCode::Char('R'));
         assert_eq!(key.modifiers, KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn platform_function_keys_toggle_zen_and_fullscreen() {
+        use crate::types::SemanticShortcutIntent as Intent;
+
+        assert_eq!(
+            resolve_fallback_shortcut(
+                Mode::Normal,
+                KeyEvent::from_str("F11").unwrap(),
+                TargetPlatform::Linux,
+            ),
+            Some(FallbackShortcut::Workspace(Intent::ToggleFullscreen))
+        );
+        assert_eq!(
+            resolve_fallback_shortcut(
+                Mode::Normal,
+                KeyEvent::from_str("F8").unwrap(),
+                TargetPlatform::Windows,
+            ),
+            Some(FallbackShortcut::Workspace(Intent::ToggleZenMode))
+        );
     }
 
     #[test]
