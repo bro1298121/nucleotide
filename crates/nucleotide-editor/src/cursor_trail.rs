@@ -574,12 +574,13 @@ impl CursorTrail {
         });
         if destination_changed {
             trace!(
-                "TRAILDIAG 4 retarget origin={:?} cell_width={:?} line_height={:?} corner0_cur={:?} corner0_prev={:?}",
+                "TRAILDIAG 4 retarget origin={:?} cell_width={:?} line_height={:?} corner0_cur={:?} corner0_prev={:?} last_advance={:?}",
                 origin,
                 cell_width,
                 line_height,
                 self.corners[0].current_position,
-                self.corners[0].previous_destination
+                self.corners[0].previous_destination,
+                self.last_advance
             );
             self.retarget(origin, cell_width, line_height);
         }
@@ -593,15 +594,25 @@ impl CursorTrail {
             .last_advance
             .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
         let animating = self.integrate(elapsed);
+        let needs_frames_before_clear = self.needs_frames();
         self.last_advance = if animating { Some(now) } else { None };
         let first_corner_origin = self.corners[0].current_position;
         trace!(
-            "TRAILDIAG 3 exit=normal destination_changed={} shift={:?} first_origin={:?} animating={} self.last_scroll={:?}",
+            "TRAILDIAG 3 exit=normal destination_changed={} shift={:?} first_origin={:?} animating={} self.last_scroll={:?} elapsed=?elapsed needs_frames_before_clear={} last_advance_before_clear=?",
             destination_changed,
             shift,
             first_corner_origin,
             animating,
-            self.last_scroll
+            self.last_scroll,
+            elapsed,
+            needs_frames_before_clear,
+            self.last_advance
+        );
+        trace!(
+            "TRAILDIAG 5 post-integrate animating={} needs_frames={} self.last_advance={:?}",
+            animating,
+            self.needs_frames(),
+            self.last_advance
         );
         animating
     }
