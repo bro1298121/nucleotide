@@ -41,6 +41,7 @@ use std::{
 
 use gpui::{Bounds, Hsla, PathBuilder, Pixels, Point, Size, Window, point, px, size};
 use helix_view::graphics::CursorKind;
+use nucleotide_logging::trace;
 
 /// Default full-animation length in seconds.
 ///
@@ -486,7 +487,18 @@ impl CursorTrail {
         scroll: Point<Pixels>,
         now: Instant,
     ) -> bool {
+        trace!(
+            "TRAILDIAG 1 observe-in kind=?kind hollow={} rect.origin={:?} rect.size={:?} scroll={:?} enabled={} shape_identity={:?} last_scroll={:?}",
+            hollow,
+            rect.origin,
+            rect.size,
+            scroll,
+            self.enabled,
+            self.shape_identity,
+            self.last_scroll
+        );
         if !self.enabled {
+            trace!("TRAILDIAG 2 exit=disabled");
             self.reset();
             return false;
         }
@@ -497,6 +509,11 @@ impl CursorTrail {
             // A hidden cursor (or a degenerate rect) paints nothing, so there
             // is nothing to trail: snap now so no stale smear is drawn when a
             // cursor reappears somewhere else.
+            trace!(
+                "TRAILDIAG 2 exit=degenerate kind=?kind width={} height={}",
+                width,
+                height
+            );
             self.reset();
             return false;
         }
@@ -517,6 +534,13 @@ impl CursorTrail {
             // upstream #3484: Neovide's fork only snaps `current_position`
             // here and leaves the springs armed, which makes the next real
             // move start from a stale velocity.
+            trace!(
+                "TRAILDIAG 2 exit=shape-changed old={:?} new={:?} origin={:?} scroll={:?}",
+                self.shape_identity,
+                identity,
+                origin,
+                scroll
+            );
             self.snap_to(origin, width, height, hollow, scroll);
             self.shape_identity = Some(identity);
             self.color = color;
@@ -549,6 +573,14 @@ impl CursorTrail {
             corner.get_destination(origin) != corner.previous_destination
         });
         if destination_changed {
+            trace!(
+                "TRAILDIAG 4 retarget origin={:?} cell_width={:?} line_height={:?} corner0_cur={:?} corner0_prev={:?}",
+                origin,
+                cell_width,
+                line_height,
+                self.corners[0].current_position,
+                self.corners[0].previous_destination
+            );
             self.retarget(origin, cell_width, line_height);
         }
 
@@ -562,6 +594,15 @@ impl CursorTrail {
             .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
         let animating = self.integrate(elapsed);
         self.last_advance = if animating { Some(now) } else { None };
+        let first_corner_origin = self.corners[0].current_position;
+        trace!(
+            "TRAILDIAG 3 exit=normal destination_changed={} shift={:?} first_origin={:?} animating={} self.last_scroll={:?}",
+            destination_changed,
+            shift,
+            first_corner_origin,
+            animating,
+            self.last_scroll
+        );
         animating
     }
 
