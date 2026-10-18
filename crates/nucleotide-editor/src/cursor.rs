@@ -663,7 +663,9 @@ pub fn unwrapped_cursor_paint_plan(
         });
     }
 
-    if params.cursor_at_trailing_newline && params.cursor_char_idx >= params.text.len_chars() {
+    if params.cursor_at_trailing_newline
+        && params.cursor_char_idx >= params.text.len_chars()
+    {
         let y_offset = params.line_height * cursor_viewport_position.viewport_row as f32
             - params.scroll_line_offset;
 
@@ -1471,12 +1473,13 @@ mod tests {
     }
 
     #[test]
-    fn unwrapped_cursor_paint_plan_uses_phantom_line_for_trailing_newline() {
+    fn unwrapped_cursor_paint_plan_uses_line_layout_for_trailing_newline_line() {
         let geometry = EditorSurfaceGeometry::new(
             Bounds::new(point(px(100.0), px(40.0)), size(px(500.0), px(300.0))),
             4,
             px(8.0),
         );
+        let layout = LineLayout::unwrapped(1, ShapedLine::default(), px(20.0));
         let plan = unwrapped_cursor_paint_plan(UnwrappedCursorPaintPlanParams {
             text: "one\n".into(),
             geometry,
@@ -1486,18 +1489,14 @@ mod tests {
                 line: 1,
                 viewport_row: 1,
             }),
-            line_layout: None,
+            line_layout: Some(&layout),
             line_height: px(20.0),
             scroll_line_offset: px(0.0),
         })
-        .expect("phantom cursor plan");
+        .expect("cursor plan");
 
-        assert_eq!(
-            plan.source,
-            UnwrappedCursorPaintPlanSource::PhantomTrailingNewline
-        );
+        assert_eq!(plan.source, UnwrappedCursorPaintPlanSource::LineLayout);
         assert_eq!(plan.paint_position.paint_origin, point(px(132.0), px(61.0)));
-        assert!(plan.line_position.is_none());
     }
 
     #[test]

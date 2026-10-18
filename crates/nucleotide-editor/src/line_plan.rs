@@ -152,7 +152,7 @@ pub fn unwrapped_visible_line_plans(
             continue;
         }
 
-        if line_start >= viewport.end_char || line_end < anchor_char {
+        if line_start > viewport.end_char || line_end < anchor_char {
             y_offset += line_height;
             continue;
         }
@@ -233,15 +233,21 @@ fn line_bounds(text: RopeSlice<'_>, line_idx: usize, total_lines: usize) -> (usi
     (line_start, line_end)
 }
 
-fn is_phantom_line(text: RopeSlice<'_>, line_idx: usize, viewport: LineViewportPlan) -> bool {
-    let (line_start, line_end) = line_bounds(text, line_idx, viewport.total_lines);
-    let line_is_empty = line_start >= line_end;
-
-    (viewport.cursor_at_end
-        && viewport.file_ends_with_newline
-        && line_idx == viewport.total_lines - 1)
-        || line_idx >= viewport.total_lines
-        || (line_idx == viewport.total_lines - 1 && line_is_empty && viewport.total_lines > 1)
+/// Whether a line is past the end of the document and therefore has no geometry.
+///
+/// The empty line that follows a final newline is a **real** line in Helix's row
+/// model: `len_lines()` counts it, the cursor can rest on it, and it is where the
+/// cursor sits at end of file. Treating it as phantom left it without a
+/// `LineLayout`, which is why the cursor on that row was painted by the separate
+/// phantom cursor plan (appearing one row below the text) and why clicks on it
+/// were clamped away by `find_line_at_clamped_position` onto the line above.
+///
+/// Only rows genuinely at or past `total_lines` have no geometry. Note the caller
+/// iterates `first_row..last_row`, and `last_row` can exceed `total_lines` when
+/// the scroll range has headroom below the last line, so this check still has work
+/// to do.
+fn is_phantom_line(_text: RopeSlice<'_>, line_idx: usize, viewport: LineViewportPlan) -> bool {
+    line_idx >= viewport.total_lines
 }
 
 #[cfg(test)]
@@ -314,15 +320,35 @@ mod tests {
     }
 
     #[test]
-    fn skips_trailing_phantom_line_without_consuming_vertical_space() {
-        let text = "alpha\n";
-        let viewport = line_viewport_plan(text.into(), 0, 2, text.chars().count());
+    fn does_not_plan_extra_trailing_line_for_document_without_newline() {
+        let text = "alpha";
+        let viewport = line_viewport_plan(text.into(), 0, 1, text.chars().count());
         let plans = unwrapped_visible_line_plans(text.into(), viewport, px(14.0), px(0.0), None);
 
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].line_idx, 0);
         assert_eq!((plans[0].line_start, plans[0].line_end), (0, 5));
         assert_eq!(plans[0].y_offset, px(0.0));
+    }
+
+    #[test]
+    fn plans_trailing_empty_line_for_document_ending_with_newline() {
+        let text = "alpha\n";
+        let line_height = px(14.0);
+        let viewport = line_viewport_plan(text.into(), 0, 2, text.chars().count());
+        let plans = unwrapped_visible_line_plans(text.into(), viewport, line_height, px(0.0), None);
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].line_idx, 0);
+        assert_eq!((plans[0].line_start, plans[0].line_end), (0, 5));
+        assert_eq!(plans[0].y_offset, px(0.0));
+        assert_eq!(plans[1].line_idx, 1);
+        assert!(plans[1].line_end >= plans[1].line_start);
+        assert_ne!(
+            (plans[1].line_start, plans[1].line_end),
+            (usize::MAX, usize::MAX)
+        );
+        assert_eq!(plans[1].y_offset, plans[0].y_offset + line_height);
     }
 
     #[test]
