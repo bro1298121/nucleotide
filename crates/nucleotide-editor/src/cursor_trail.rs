@@ -598,7 +598,7 @@ impl CursorTrail {
         self.last_advance = if animating { Some(now) } else { None };
         let first_corner_origin = self.corners[0].current_position;
         trace!(
-            "TRAILDIAG 3 exit=normal destination_changed={} shift={:?} first_origin={:?} animating={} self.last_scroll={:?} elapsed=?elapsed needs_frames_before_clear={} last_advance_before_clear=?",
+            "TRAILDIAG 3 exit=normal destination_changed={} shift={:?} first_origin={:?} animating={} self.last_scroll={:?} elapsed={:?} needs_frames_before_clear={} last_advance_before_clear={:?}",
             destination_changed,
             shift,
             first_corner_origin,
