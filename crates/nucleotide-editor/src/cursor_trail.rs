@@ -41,7 +41,7 @@ use std::{
 
 use gpui::{Bounds, Hsla, PathBuilder, Pixels, Point, Size, Window, point, px, size};
 use helix_view::graphics::CursorKind;
-use nucleotide_logging::trace;
+
 
 /// Default full-animation length in seconds.
 ///
@@ -265,15 +265,35 @@ impl TrailCorner {
     }
 }
 
+/// Tolerance for cursor shape size changes. Float equality on computed widths/heights
+/// is not stable: the measured case showed `9.846153` vs `9.846154` (one f32 ULP),
+/// which would incorrectly treat the same cursor as a shape change and snap the trail.
+/// 0.01 px is well above float noise (~1e-6 near 10px) while still far below any
+/// perceptually or semantically meaningful cursor size change.
+const SHAPE_EPSILON_PX: f32 = 0.01;
+
 /// Immutable identity of the cursor shape being trailed. Any change snaps the
 /// trail (forced-immediate reset), which covers mode changes (Block ↔ Bar),
 /// focus changes (hollow block), and resize / font changes (width/height).
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// **Note on equality:** `width` and `height` are compared with a small epsilon
+/// rather than exact `PartialEq` to avoid spurious shape-change snaps caused by
+/// floating point drift (e.g. `9.846153` vs `9.846154` observed in practice).
+#[derive(Debug, Clone, Copy)]
 struct CursorShapeIdentity {
     kind: CursorKind,
     hollow: bool,
     width: f32,
     height: f32,
+}
+
+impl PartialEq for CursorShapeIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.hollow == other.hollow
+            && (self.width - other.width).abs() <= SHAPE_EPSILON_PX
+            && (self.height - other.height).abs() <= SHAPE_EPSILON_PX
+    }
 }
 
 /// The whole trail: four spring corners plus the paint-parity state the
@@ -487,18 +507,7 @@ impl CursorTrail {
         scroll: Point<Pixels>,
         now: Instant,
     ) -> bool {
-        trace!(
-            "TRAILDIAG 1 observe-in kind=?kind hollow={} rect.origin={:?} rect.size={:?} scroll={:?} enabled={} shape_identity={:?} last_scroll={:?}",
-            hollow,
-            rect.origin,
-            rect.size,
-            scroll,
-            self.enabled,
-            self.shape_identity,
-            self.last_scroll
-        );
         if !self.enabled {
-            trace!("TRAILDIAG 2 exit=disabled");
             self.reset();
             return false;
         }
@@ -509,11 +518,6 @@ impl CursorTrail {
             // A hidden cursor (or a degenerate rect) paints nothing, so there
             // is nothing to trail: snap now so no stale smear is drawn when a
             // cursor reappears somewhere else.
-            trace!(
-                "TRAILDIAG 2 exit=degenerate kind=?kind width={} height={}",
-                width,
-                height
-            );
             self.reset();
             return false;
         }
@@ -534,13 +538,6 @@ impl CursorTrail {
             // upstream #3484: Neovide's fork only snaps `current_position`
             // here and leaves the springs armed, which makes the next real
             // move start from a stale velocity.
-            trace!(
-                "TRAILDIAG 2 exit=shape-changed old={:?} new={:?} origin={:?} scroll={:?}",
-                self.shape_identity,
-                identity,
-                origin,
-                scroll
-            );
             self.snap_to(origin, width, height, hollow, scroll);
             self.shape_identity = Some(identity);
             self.color = color;
@@ -573,15 +570,6 @@ impl CursorTrail {
             corner.get_destination(origin) != corner.previous_destination
         });
         if destination_changed {
-            trace!(
-                "TRAILDIAG 4 retarget origin={:?} cell_width={:?} line_height={:?} corner0_cur={:?} corner0_prev={:?} last_advance={:?}",
-                origin,
-                cell_width,
-                line_height,
-                self.corners[0].current_position,
-                self.corners[0].previous_destination,
-                self.last_advance
-            );
             self.retarget(origin, cell_width, line_height);
         }
 
@@ -594,26 +582,7 @@ impl CursorTrail {
             .last_advance
             .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
         let animating = self.integrate(elapsed);
-        let needs_frames_before_clear = self.needs_frames();
         self.last_advance = if animating { Some(now) } else { None };
-        let first_corner_origin = self.corners[0].current_position;
-        trace!(
-            "TRAILDIAG 3 exit=normal destination_changed={} shift={:?} first_origin={:?} animating={} self.last_scroll={:?} elapsed={:?} needs_frames_before_clear={} last_advance_before_clear={:?}",
-            destination_changed,
-            shift,
-            first_corner_origin,
-            animating,
-            self.last_scroll,
-            elapsed,
-            needs_frames_before_clear,
-            self.last_advance
-        );
-        trace!(
-            "TRAILDIAG 5 post-integrate animating={} needs_frames={} self.last_advance={:?}",
-            animating,
-            self.needs_frames(),
-            self.last_advance
-        );
         animating
     }
 
@@ -1103,6 +1072,56 @@ mod tests {
         let mut diagonal = installed_trail(t0);
         observe_block(&mut diagonal, screen(108.0, 120.0), no_scroll(), t0);
         assert!((diagonal.corners[0].animation_length - 0.120).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cursor_shape_identity_tolerates_float_noise() {
+        let base = CursorShapeIdentity {
+            kind: CursorKind::Block,
+            hollow: false,
+            width: 9.846153,
+            height: 26.0,
+        };
+        let ulp = CursorShapeIdentity {
+            kind: CursorKind::Block,
+            hollow: false,
+            width: 9.846154,
+            height: 26.0,
+        };
+        assert_eq!(base, ulp, "1 ULP difference should be ignored");
+        assert_eq!(Some(base), Some(ulp), "Option comparison delegates to tolerant eq");
+
+        let meaningful_width = CursorShapeIdentity {
+            kind: CursorKind::Block,
+            hollow: false,
+            width: 9.846153 + 0.5,
+            height: 26.0,
+        };
+        assert_ne!(base, meaningful_width, "meaningful width change should snap");
+
+        let meaningful_height = CursorShapeIdentity {
+            kind: CursorKind::Block,
+            hollow: false,
+            width: 9.846153,
+            height: 26.0 + 1.0,
+        };
+        assert_ne!(base, meaningful_height, "meaningful height change should snap");
+
+        let kind_change = CursorShapeIdentity {
+            kind: CursorKind::Bar,
+            hollow: false,
+            width: 9.846153,
+            height: 26.0,
+        };
+        assert_ne!(base, kind_change, "kind change must snap");
+
+        let hollow_change = CursorShapeIdentity {
+            kind: CursorKind::Block,
+            hollow: true,
+            width: 9.846153,
+            height: 26.0,
+        };
+        assert_ne!(base, hollow_change, "hollow change must snap");
     }
 
     // ------------------------------------------------------------------
