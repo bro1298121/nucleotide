@@ -15297,6 +15297,23 @@ impl Render for Workspace {
 
         let rows = (editor_content_h_px / line_h_value).floor().max(1.0) as u16;
         let cols = (editor_content_w_px / char_w_value).floor().max(1.0) as u16;
+        trace!(
+            rows = rows,
+            cols = cols,
+            editor_content_h_px = editor_content_h_px,
+            available_h = available_h,
+            content_max_h = ?content_max_h,
+            line_h_value = line_h_value,
+            char_w_value = char_w_value,
+            status_bar_height = ?status_bar_height,
+            titlebar_height = ?titlebar_height,
+            tab_bar_height = ?tab_bar_height,
+            viewport_h = ?viewport_h,
+            zen_mode = self.zen_mode,
+            terminal_panel_visible = self.terminal_panel_visible,
+            show_file_tree = self.show_file_tree,
+            "CURSORDIAG 5 helix-viewport"
+        );
         let desired_size = (cols, rows);
 
         if self

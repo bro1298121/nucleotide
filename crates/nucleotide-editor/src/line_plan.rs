@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use gpui::{Bounds, Pixels, Point, point, size};
 use helix_core::RopeSlice;
+use nucleotide_logging::trace;
 
 use crate::EditorSurfaceGeometry;
 
@@ -177,6 +178,14 @@ pub fn unwrapped_visible_line_plans(
                 .unwrap_or(0) as f32;
     }
 
+    trace!(
+        plan_count = plans.len(),
+        first_line_idx = ?plans.first().map(|plan| plan.line_idx),
+        first_y_offset = ?plans.first().map(|plan| plan.y_offset),
+        last_line_idx = ?plans.last().map(|plan| plan.line_idx),
+        last_y_offset = ?plans.last().map(|plan| plan.y_offset),
+        "CURSORDIAG 4 line-plans"
+    );
     plans
 }
 

@@ -19,6 +19,7 @@ use helix_view::{
     view::ViewPosition,
 };
 use nucleotide_logging::error;
+use nucleotide_logging::trace;
 
 use crate::{
     cursor_has_reversed_modifier,
@@ -617,6 +618,21 @@ pub fn phantom_line_cursor_paint_position(
 pub fn unwrapped_cursor_paint_plan(
     params: UnwrappedCursorPaintPlanParams<'_>,
 ) -> Option<UnwrappedCursorPaintPlan> {
+    trace!(
+        cursor_viewport_line = ?params.cursor_viewport_position.map(|position| position.line),
+        cursor_viewport_row = ?params
+            .cursor_viewport_position
+            .map(|position| position.viewport_row),
+        line_layout_present = params.line_layout.is_some(),
+        line_layout_line_idx = ?params.line_layout.map(|layout| layout.line_idx),
+        line_layout_origin = ?params.line_layout.map(|layout| layout.origin),
+        cursor_at_trailing_newline = params.cursor_at_trailing_newline,
+        cursor_char_idx = params.cursor_char_idx,
+        text_len_chars = params.text.len_chars(),
+        scroll_line_offset = ?params.scroll_line_offset,
+        line_height = ?params.line_height,
+        "CURSORDIAG 2 cursor-plan-in"
+    );
     let cursor_viewport_position = params.cursor_viewport_position?;
     let cursor_line = cursor_viewport_position.line;
 
@@ -635,6 +651,11 @@ pub fn unwrapped_cursor_paint_plan(
             line_position.cursor_byte_offset,
         );
 
+        trace!(
+            paint_origin = ?paint_position.paint_origin,
+            cursor_origin = ?paint_position.cursor_origin,
+            "CURSORDIAG 3 cursor-plan-out branch=LineLayout"
+        );
         return Some(UnwrappedCursorPaintPlan {
             source: UnwrappedCursorPaintPlanSource::LineLayout,
             paint_position,
@@ -646,6 +667,14 @@ pub fn unwrapped_cursor_paint_plan(
         let y_offset = params.line_height * cursor_viewport_position.viewport_row as f32
             - params.scroll_line_offset;
 
+        trace!(
+            y_offset = ?y_offset,
+            paint_origin = ?phantom_line_cursor_paint_position(params.geometry, y_offset)
+                .paint_origin,
+            cursor_origin = ?phantom_line_cursor_paint_position(params.geometry, y_offset)
+                .cursor_origin,
+            "CURSORDIAG 3 cursor-plan-out branch=PhantomTrailingNewline"
+        );
         return Some(UnwrappedCursorPaintPlan {
             source: UnwrappedCursorPaintPlanSource::PhantomTrailingNewline,
             paint_position: phantom_line_cursor_paint_position(params.geometry, y_offset),
@@ -653,6 +682,7 @@ pub fn unwrapped_cursor_paint_plan(
         });
     }
 
+    trace!("CURSORDIAG 3 cursor-plan-out branch=None");
     None
 }
 

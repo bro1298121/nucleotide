@@ -9,6 +9,7 @@ use gpui::{
     LayoutId, ParentElement as _, Pixels, Size, Style, Styled as _, TextStyle, Window, div,
     relative,
 };
+use nucleotide_logging::trace;
 
 use crate::{
     CursorOverlayPlan, EditorDocumentElement, EditorLayout, EditorScrollbarMarker, EditorSurface,
@@ -331,6 +332,19 @@ where
 
         let mut layout = EditorTextMetrics::resolve(cx.text_system(), &self.text_style)
             .layout_for_bounds(bounds);
+        let scroll_position = self.editor_state.viewport().scroll_position();
+        trace!(
+            rows = layout.rows,
+            columns = layout.columns,
+            line_height = ?layout.line_height,
+            font_size = ?layout.font_size,
+            cell_width = ?layout.cell_width,
+            bounds_h = ?bounds.size.height,
+            bounds_w = ?bounds.size.width,
+            scroll_x = ?scroll_position.x,
+            scroll_y = ?scroll_position.y,
+            "CURSORDIAG 1 element-layout"
+        );
         // Prepare before constructing the surface: its scrollbars and input must
         // see the same geometry that the document will paint in this frame.
         let frame = (self.prepare)(&mut self.editor_state, bounds, &mut layout, window, cx);
