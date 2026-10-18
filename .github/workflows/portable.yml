@@ -88,6 +88,11 @@ jobs:
           cp -r helix-temp/runtime/* nucleotide-linux/share/nucleotide/runtime/
           rm -rf helix-temp
 
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          tar -czf nucleotide-linux-x86_64.tar.gz nucleotide-linux
+
       - name: Rename tarball with nightly suffix
         run: |
           DATE_TAG="$(TZ=Asia/Shanghai date +'%Y%m%d')"
@@ -146,6 +151,11 @@ jobs:
           set -euo pipefail
           NUCL_BINARY="target/aarch64-apple-darwin/release/nucl" \
           ./scripts/bundle-mac.sh
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          tar -czf Nucleotide-aarch64.app.tar.gz Nucleotide.app
 
       - name: Rename tarball with nightly suffix
         run: |
