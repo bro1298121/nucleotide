@@ -10,7 +10,7 @@ This guide is based on the checked-in workspace manifest, toolchain/CI configura
 - GPUI is path-vendored under `vendor/zed`. Helix dependencies use the revision and patches in the root `Cargo.toml`; use those manifests and `Cargo.lock` rather than guessing dependency versions.
 - `target/`, `runtime/`, `.helix/`, and packaging output are generated or ignored. Do not commit them. Runtime sources must contain at least `queries/` and `themes/` when a script or bundled app needs them.
 
-Zig `0.15.2` is required to build the Ghostty-backed terminal. The Nix flake (`nix develop`, or `nix develop .#ci` for the CI environment) supplies the pinned Rust/Zig toolchain and native dependencies; Windows builds need Zig installed separately.
+Zig `0.16.0` is required to build the Ghostty-backed terminal. The Nix flake (`nix develop`, or `nix develop .#ci` for the CI environment) supplies the pinned Rust/Zig toolchain and native dependencies; Windows builds need Zig installed separately.
 
 ## Common commands
 
